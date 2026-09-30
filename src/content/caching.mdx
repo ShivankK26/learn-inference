@@ -1,0 +1,202 @@
+import PrefixCache from "@/components/widgets/PrefixCache";
+import KVTiers from "@/components/widgets/KVTiers";
+import CacheRouting from "@/components/widgets/CacheRouting";
+
+<TLDR>
+  Every engine already uses the KV cache *within* a request. The big win comes from reusing it *between* requests:
+  if a new prompt starts with the same tokens as an earlier one, you can skip prefill for that shared start. Getting
+  the most out of that means ordering your prompts well, finding room to store the cache, and sending each user back
+  to the server that holds their cache.
+</TLDR>
+
+## From "within a request" to "between requests"
+
+You met the KV cache in [Attention and the KV cache](/learn/attention-and-kv-cache): during prefill the engine saves
+the keys and values for every input token, then adds one entry per token during decode. Every inference engine does
+this by default, one request at a time. Without it, LLMs would be unbearably slow.
+
+But notice what happens when two requests share a lot of text. The second request recomputes KV entries that the first
+one already worked out. **Reusing KV cache across requests** removes that waste, and it's one of the highest-leverage
+optimizations in inference.
+
+<Note kind="deeper">
+  A theme of this chapter: **the more traffic you have, the more optimizations become worth it.** Several ideas below
+  (and in the next two lessons), like cache-aware routing, only pay off when many GPUs serve the same model. Tuning
+  them is also never one-and-done. Real traffic keeps changing, so the best settings keep changing too.
+</Note>
+
+## Prefix caching
+
+The book's example uses two short prompts, each about four tokens long, along the lines of:
+
+- "Weather in Paris?"
+- "Weather in Tokyo?"
+
+Both start with **"Weather in"**. With **prefix caching**, the second request reads the KV cache for those first two
+tokens instead of computing them, and only runs prefill on the rest. Skipping prefill work means a faster
+<Term def="Time to first token: how long until the first piece of the answer appears.">TTFT</Term>.
+
+This is also why pay-per-token APIs charge less for **"cache hit"** input tokens than for "cache miss" tokens: a
+cached token costs almost no compute. On your own deployments, the same trick lowers latency and raises throughput,
+which saves money.
+
+Two tokens don't matter much. But in many real workloads, the shared start is **thousands** of tokens long:
+
+| Workload | What's repeated at the start of every request |
+|---|---|
+| **Agents, chatbots, RAG, tool calls** | Long, complex system prompts and tool definitions |
+| **Code completion & generation** | The same thousands of lines of code as context |
+| **Documents & retrieval** | The document being summarized or questioned |
+| **Multi-turn chat** | Every earlier message, re-sent each turn, so the savings grow every turn |
+
+### The prefix stops at the first difference
+
+Here's the catch. Reuse runs from the very first token **until the first token that differs**, and then stops. In the
+weather example, both prompts end in "?", but that question mark comes *after* the difference (Paris vs. Tokyo), so it
+isn't read from the cache.
+
+The book's second figure shows the flip side: two prompts where only the **first** token differs and the next three
+are identical. The savings there are **zero**. Try it:
+
+<PrefixCache />
+
+The practical rule: **put the parts that change as late in the prompt as possible.** Fixed instructions go first; the
+user's question goes last. How you arrange context decides how much TTFT you save.
+
+### Why only prefixes?
+
+Because LLMs are autoregressive, every token affects how the model represents *every token after it*. Change one
+early token and the model's internal view of the rest of the sequence changes too, even if the text looks identical
+to a human. So a matching chunk in the *middle* of a prompt usually can't simply be reused.
+
+<Note kind="deeper">
+  Researchers are working on reusing non-prefix chunks. It requires fixing up the positional information and
+  selectively recomputing some KV entries to keep quality high. Tools like **CacheBlend** and **LMCache** support
+  this kind of reuse.
+</Note>
+
+## Where to store the KV cache
+
+The KV cache is valuable, but it's big, and GPU memory is limited. Inference engines let you choose how much of the
+GPU's free memory goes to the KV cache. In TensorRT-LLM, for example, you set a fraction of free memory.
+
+The book's example: a **B200 with 180 GB** of memory, **100 GB** used by the model weights and buffers, and the KV
+cache allowed **80%** of what's left. That's 80 GB × 0.8 = **64 GB** of KV cache.
+
+That fills up fast. Once it's full, the engine has to delete old cache entries (*evict* them), and any future request
+that needed them becomes a cache miss.
+
+To get more room, you can **offload** the KV cache to other storage near the GPU. There are four levels, from fastest
+to slowest:
+
+| Level | Where | Approximate speed | Approximate size |
+|---|---|---|---|
+| **G1** | GPU memory (VRAM) | Terabytes/sec | 10s–100s of GB |
+| **G2** | CPU memory (RAM) | 10s–100s of GB/sec | 100s of GB to TBs |
+| **G3** | Local SSD | 5–10 GB/sec | Terabytes |
+| **G4** | Networked SSD | A few GB/sec | 10s of terabytes |
+
+<KVTiers />
+
+<Analogy title="Think of it like a desk and a filing system">
+  G1 is the papers on your desk: instant, but there's not much room. G2 is the drawer, G3 the cabinet in the corner,
+  G4 the archive down the hall. You keep what you use most on the desk and move the rest further away, but fetching
+  from the archive is still much faster than rewriting the document from scratch.
+</Analogy>
+
+Some hardware is especially good at this. Systems like the **GB200** pair GPUs with CPUs over a very fast connection,
+which makes G2 offloading much quicker. **NVIDIA Dynamo** supports offloading through its
+<Term def="KV Block Manager: a part of NVIDIA Dynamo with APIs for moving KV cache blocks between GPU memory, CPU memory, and disk.">KVBM</Term>
+(KV Block Manager), which moves blocks of KV cache between levels. The rule of thumb: **frequently used blocks stay
+in fast memory; rarely used blocks move down until they're needed.**
+
+## Cache-aware routing
+
+In production you run several **replicas** (copies) of your model server, and a router spreads incoming requests
+across them, usually based on how busy each one is.
+
+That breaks prefix caching. If a user's follow-up message lands on a different replica, that replica has never seen
+the conversation, so it's a cache miss. **Cache-aware routing** fixes this by sending a user's requests back to the
+replica that already holds their KV cache whenever possible: the same chat, the same codebase, the same document.
+
+<CacheRouting />
+
+Another option is a **global KV cache** on networked storage (G4) that every replica can read. Routing still matters,
+because a replica with the cache hot in its own GPU memory will answer faster than one reading from the network. But
+a global cache means any replica can eventually use any cached sequence, and cached work isn't lost when a server
+restarts or is shut down during autoscaling.
+
+## Long context
+
+"Long context" has a slightly circular definition: a sequence counts as long once **its KV cache gets big enough to
+cause problems**. Depending on the model, hardware, engine and traffic, that tends to start somewhere past **32K, 64K,
+or 128K tokens**. When you benchmark, deliberately send some very large inputs so you find these limits before your
+users do.
+
+Model labs keep stretching context windows with techniques like
+<Term def="Rotary positional embeddings: a way of encoding each token’s position that also helps models handle longer context windows.">RoPE</Term>,
+but longer windows create new inference problems. With the KV cache, attention grows in step with sequence length,
+and for long sequences **attention can become the biggest user of GPU memory**, the very resource
+<Memory>decode</Memory> is already short on.
+
+Some fixes are model-specific (sliding window, compressed, or sparse attention; see
+[Making attention faster](/learn/faster-attention)). Three work for standard attention in general:
+
+- **FlashAttention**: optimized attention kernels with far fewer memory reads and writes.
+- **PagedAttention**: stores the KV cache in fixed-size pages, which reduces wasted and duplicated memory.
+- **Chunked prefill**: splits a huge input into chunks that run alongside ongoing decode work as resources allow, so one
+  enormous prompt doesn't swamp the engine and stall everyone else.
+
+And if, after all that, the KV cache still needs more memory than one GPU has? Then you need to spread the model
+across several GPUs, which is the next lesson.
+
+<KeyPoints>
+- **Prefix caching** reuses the KV cache from earlier requests that start with the same tokens, cutting TTFT and cost.
+- Reuse stops at the **first differing token**, so put fixed content first and changing content last.
+- KV cache space runs out quickly. **Offload** through G1 (GPU) → G2 (CPU RAM) → G3 (local SSD) → G4 (network), keeping hot blocks fast.
+- **Cache-aware routing** sends returning users to the replica holding their cache. A global cache can back it up.
+- **Long context** strains memory. FlashAttention, PagedAttention and **chunked prefill** help, and beyond that you need more GPUs.
+</KeyPoints>
+
+<Quiz questions={[
+  {
+    q: "Your app sends: [user question] + [5,000-token fixed instructions]. How should you reorder it for prefix caching?",
+    options: [
+      "Keep it as is",
+      "Put the fixed instructions first and the user’s question last",
+      "Put the question in the middle"
+    ],
+    answer: 1,
+    why: "Reuse stops at the first token that differs. With the unique question first, nothing can be reused. With fixed text first, all 5,000 tokens become cache hits."
+  },
+  {
+    q: "Why do APIs charge less for cache-hit input tokens?",
+    options: [
+      "Cached tokens skip prefill compute, so they cost the provider very little",
+      "Cached tokens are shorter",
+      "They are stored on cheaper GPUs"
+    ],
+    answer: 0,
+    why: "Reading a saved KV cache takes very little compute or time compared to running prefill on those tokens."
+  },
+  {
+    q: "The KV cache has filled GPU memory. What does offloading to CPU RAM (G2) buy you?",
+    options: [
+      "Faster access than GPU memory",
+      "Much more room, so fewer entries get evicted and fewer later requests are cache misses",
+      "Smaller KV entries"
+    ],
+    answer: 1,
+    why: "G2 is slower than VRAM but far larger. Reading from it is still much cheaper than redoing prefill."
+  },
+  {
+    q: "What does cache-aware routing do?",
+    options: [
+      "Splits requests evenly no matter what",
+      "Sends a user’s requests to the replica that already has their KV cache",
+      "Caches the model weights on the router"
+    ],
+    answer: 1,
+    why: "Returning to the same replica turns follow-up messages into cache hits instead of full prefills."
+  }
+]} />

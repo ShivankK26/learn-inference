@@ -37,6 +37,9 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
               <Link href="/glossary" className="rounded-md px-3 py-1.5 hover:bg-bg-soft hover:text-ink">
                 Glossary
               </Link>
+              <Link href="/reading" className="hidden rounded-md px-3 py-1.5 hover:bg-bg-soft hover:text-ink sm:block">
+                Reading
+              </Link>
               <ThemeToggle />
             </nav>
           </div>

@@ -64,7 +64,7 @@ This gives us the two most important speed numbers in inference:
 ## How each next token is chosen
 
 At the end of each decode step, the model doesn't output a word. It outputs a **score for every token in its
-vocabulary** (these scores are called <Term def="The raw scores a model gives to every possible next token, before they're turned into probabilities.">logits</Term>).
+vocabulary** (these scores are called <Term def="The raw scores a model gives to every possible next token, before they’re turned into probabilities.">logits</Term>).
 Those scores get turned into probabilities, and then a token is **picked at random, weighted by probability**.
 
 You can nudge that picking with a few settings. Try them:

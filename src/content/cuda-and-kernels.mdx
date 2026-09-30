@@ -1,0 +1,203 @@
+import SoftwareStack from "@/components/widgets/SoftwareStack";
+import KernelFusion from "@/components/widgets/KernelFusion";
+
+<TLDR>
+  **CUDA** is how code talks to NVIDIA GPUs. The small programs it runs on the GPU are called **kernels**. Most
+  inference engineers never write a kernel, but they constantly **choose** kernels and benefit from **fusing** them,
+  because every unnecessary trip to GPU memory costs time.
+</TLDR>
+
+## Why software matters so much
+
+A big reason NVIDIA dominates inference isn't just its chips. It's the **mature software ecosystem** built around
+them.
+
+Hardware moves slowly: new GPU generations arrive every year or two at best. Software moves fast. When a new open model
+drops, you often need *nightly* or pre-release versions of your tools just to run it on day one. Because software is
+faster and easier to build than chips, the software side of inference has **many more players**:
+
+| Who | What they're known for |
+|---|---|
+| **NVIDIA** | Its own (sometimes proprietary) stack, from CUDA all the way up to Dynamo |
+| **Hugging Face** | The registry where open models live, plus the `transformers` and `diffusers` libraries |
+| **The Linux Foundation** | Hardware-neutral projects like PyTorch and vLLM |
+| **LMSYS Org** | Key inference and evaluation tools, most notably SGLang |
+
+…plus thousands of other companies, universities and labs contributing open-source code.
+
+The field moves too fast for any book (or course) to list every tool. So this chapter focuses on the **foundational
+pieces that will stay relevant**, presented from the lowest level to the highest:
+
+<SoftwareStack />
+
+Most inference work today happens near the **top**: configuring and deploying inference engines and coordinating
+multiple GPUs. But whatever level you work at, you need a solid mental picture of the levels right above and below it.
+
+## What CUDA actually is
+
+Officially, CUDA is NVIDIA's computing platform and programming model for running parallel work on GPUs. (The name
+originally stood for *Compute Unified Device Architecture*, but nobody spells it out anymore.) That definition is
+vague, so it's easier to look at its parts:
+
+- **CUDA kernel**: a function you write that runs in parallel on the GPU.
+- **CUDA graph**: a pre-planned chain of kernels and other GPU operations (a
+  <Term def="Directed acyclic graph: a set of steps with arrows showing what depends on what, with no loops.">DAG</Term>),
+  so that workflows that repeat can run with less overhead.
+- **CUDA driver**: the low-level layer between your program and the GPU hardware, managing memory and execution.
+- **CUDA runtime**: the developer-facing API for launching kernels and managing memory.
+
+CUDA is the foundation of the entire generative AI ecosystem on NVIDIA GPUs.
+
+<Note kind="tip">
+  CUDA is **not a programming language**. You write CUDA programs in a normal language (usually C++), and a compiler
+  such as `nvcc` splits them into code for the CPU and code for the GPU.
+</Note>
+
+## A kernel is just a function
+
+Whenever you read "CUDA kernel", you can mentally replace it with **"a piece of code written for NVIDIA GPUs."** The
+book's "Hello, World!" example is a tiny kernel that takes an array of numbers and doubles every element. Something
+like this:
+
+```cpp
+__global__ void double_values(float* data, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;  // which element am I?
+  if (i < n) {
+    data[i] = data[i] * 2.0f;
+  }
+}
+```
+
+On a CPU, doubling a list happens one element after another, so the time grows with the length of the list. On a GPU,
+**thousands of elements get doubled at the same moment**, each handled by its own thread. That's the whole appeal.
+
+<Analogy>
+  A CPU is a brilliant chef who cooks each dish one by one. A GPU is a kitchen with **thousands of line cooks** who
+  each do one simple thing at the same time. A kernel is the instruction card handed to every line cook: "take your
+  item, double it."
+</Analogy>
+
+Writing kernels shifts your thinking from **algorithms** (what math to do) to **implementations** (exactly how to do
+it on this specific chip). Remember attention? The standard algorithm fits in a few dozen lines of code. FlashAttention
+computes *exactly the same math*, but takes **tens of thousands of lines** to do it in a memory-efficient way for one
+particular GPU.
+
+## Kernels for inference: you don't start from scratch
+
+Writing kernels doesn't mean reinventing everything. There's decades of prior work to build on:
+
+- **BLAS** (Basic Linear Algebra Subprograms): a specification from the 1970s, first implemented for Fortran,
+  listing standard linear algebra operations, from dot products to matrix multiplication.
+- **cuBLAS**: NVIDIA's CUDA implementation of BLAS: ready-made kernels for core linear algebra.
+- **cuDNN** (CUDA Deep Neural Network library): ready-made building blocks for neural networks.
+
+The single most-used BLAS operation in inference is **GEMM**
+(<Term def="General Matrix-Matrix Multiplication: the standard ‘multiply two big grids of numbers’ operation.">General Matrix-Matrix Multiplication</Term>).
+Every linear layer in a model is a matrix multiplication, so cuBLAS's GEMM is a strong default.
+
+But because GEMM matters so much, teams sometimes want finer control: different GEMM kernels for matrices of
+different shapes, or versions tuned for a specific GPU architecture. Tools that help:
+
+- **CUTLASS**: a template library of building blocks for writing high-performance kernels. FlashAttention 3 is
+  built with it.
+- **CuTe**: another template library, with abstractions for *tiled* tensor operations on recent GPUs.
+- **FlashInfer**: a library of fast kernels made specifically for LLM inference, including many optimized attention
+  kernels and fused sampling functions.
+
+With CUTLASS and CuTe, kernel writers can work at a higher level without giving up much speed.
+
+## Kernel selection: picking the right tool
+
+Most inference engineers will **never write a kernel**. But **kernel selection** (choosing the best kernel among the
+available options) is a real part of optimization.
+
+The key thing to understand is how **tightly kernels are tied to specific hardware**. Kernel authors make decisions
+based on the exact chip: its memory bandwidth, how many Tensor Cores it has and how they're laid out. Kernels often
+contain hard-coded numbers based on those specs. As a result:
+
+- A kernel written for an **H100** probably won't take advantage of the new architecture and extra memory of a
+  **B200**.
+- A kernel written for a **B200** may not even run on the older Hopper generation.
+- Every new GPU generation means substantial engineering work to port handwritten kernels so they run well again.
+
+Luckily, **most kernel selection is automatic**. Frameworks and inference engines ship with kernels pre-configured
+for different architectures, and both PyTorch and TensorRT-LLM pick kernels automatically when they compile a model.
+
+Sometimes, though, you'll hand-pick a kernel for one important step. For example, most production GEMM kernels come
+from cuBLAS. But when DeepSeek released its updated DeepSeek-V3, it also released **DeepGEMM**, faster GEMM kernels
+for FP8 matrix multiplication on Hopper GPUs. You can plug DeepGEMM in to speed up one specific step, like multiplying
+two matrices of particular sizes.
+
+<Note kind="warn">
+  Watch compatibility. If you swapped in DeepGEMM and later upgraded to B200s, you'd have to swap the kernel back, wait
+  for Blackwell support (which DeepGEMM has since added), or port it yourself.
+</Note>
+
+## Kernel fusion: stop making pointless trips to memory
+
+Here's the problem. When you run two kernels back to back on the same data, the first one **writes its result to
+memory** and the second one immediately **reads it back**. Take two tiny kernels, `multiply_by_2` and
+`multiply_by_3`:
+
+<KernelFusion />
+
+The middle "write, then read it straight back" is a wasted round trip. During decode, which is limited by memory
+bandwidth, an inference engine can't afford that.
+
+**Kernel fusion** combines two or more kernels into a **single kernel** that does all the work in one pass. In the toy
+example, the fused kernel is simply `multiply_by_6`: read once, compute, write once. (The book's Figure 4.2 shows this:
+fewer arrows between memory and compute.)
+
+Real fusion is much messier: the functions are more complex and the data doesn't line up so neatly. But there are
+common patterns in inference, such as fusing **matrix multiplication + adding the bias + the activation function**
+into one kernel.
+
+Fusion happens in two ways:
+
+- **Automatically**: compilers spot straightforward opportunities and generate fused kernels for you.
+- **By hand**: sophisticated algorithms like FlashAttention need handwritten fused kernels, which get plugged in at
+  inference time.
+
+<KeyPoints>
+- Software moves much faster than hardware, and NVIDIA's software ecosystem is a big part of its lead.
+- The stack, from low to high: **CUDA → frameworks (PyTorch) → inference engines → Dynamo**.
+- **CUDA** isn't a language. It's NVIDIA's platform for running parallel code (kernels) on GPUs, usually written in C++.
+- Kernels are **tightly tied to specific GPUs**. Most selection is automatic, but you can plug in special kernels
+  like DeepGEMM.
+- **Kernel fusion** merges kernels to avoid wasted memory round trips, which is crucial for memory-bound decode.
+</KeyPoints>
+
+<Quiz questions={[
+  {
+    q: "What is a CUDA kernel?",
+    options: ["A programming language made by NVIDIA", "A function that runs in parallel on an NVIDIA GPU", "The operating system of a GPU"],
+    answer: 1,
+    why: "A kernel is just a piece of code written to run on the GPU, many threads at once. CUDA itself isn’t a language; kernels are usually written in C++."
+  },
+  {
+    q: "You hand-picked a kernel that’s heavily tuned for H100s. You move to B200 GPUs. What’s most likely?",
+    options: [
+      "It automatically runs faster on the B200",
+      "It may not use the B200’s strengths, or may not work at all, until it’s ported",
+      "Kernels don’t depend on the GPU"
+    ],
+    answer: 1,
+    why: "Kernels often hard-code details of a specific GPU. Moving generations usually means swapping, waiting for support, or porting."
+  },
+  {
+    q: "Why does kernel fusion help most during decode?",
+    options: [
+      "Decode is limited by memory bandwidth, and fusion removes wasted memory reads and writes",
+      "Fusion makes the math itself simpler",
+      "Decode doesn’t use kernels"
+    ],
+    answer: 0,
+    why: "Decode is memory-bound. Fusion cuts round trips to memory, which is exactly the resource decode is short on."
+  },
+  {
+    q: "Which is the most-used linear algebra operation in inference?",
+    options: ["Sorting", "GEMM (matrix-matrix multiplication)", "Division"],
+    answer: 1,
+    why: "Every linear layer is a matrix multiplication, so GEMM dominates. cuBLAS provides the standard implementation."
+  }
+]} />

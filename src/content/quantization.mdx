@@ -1,0 +1,294 @@
+import NumberFormats from "@/components/widgets/NumberFormats";
+import BlockScaling from "@/components/widgets/BlockScaling";
+
+<TLDR>
+  **Quantization** stores a model’s numbers with fewer bits, for example 8 instead of 16. Fewer bits means less data to
+  move and faster math, so everything speeds up. The catch is that fewer bits also means less precision, so the craft
+  is choosing *which* numbers to shrink, *how much*, and *proving* the model didn’t get dumber.
+</TLDR>
+
+## Before we start: how to think about Chapter 5
+
+This chapter covers the five big families of speed-up techniques: **quantization, speculation, caching, parallelism,
+and disaggregation**. A few ideas from the book apply to all of them, so keep them in mind as you read:
+
+- **Research moves into production fast.** In most industries, new research takes years to be adopted. In inference,
+  techniques from a paper are often running in production within weeks or months. Much of the job is bridging that gap.
+- **Constraints buy performance.** The more you can narrow what a system has to handle, the faster you can make it.
+  (Disaggregation, later in this chapter, is an example: each machine only does prefill *or* decode.)
+- **More traffic unlocks more tricks.** Techniques like big multi-GPU parallelism, cache-aware routing, and dynamic
+  disaggregation only make economic sense when you have lots of GPUs serving the same model.
+- **Tuning never ends.** Real traffic keeps changing, so settings for engines, speculation, and servers get adjusted
+  over time. The book tells the story of an engineer who tried **77 configurations** with a hand-written script before
+  finding a non-obvious one that **doubled** tokens per second for a code autocomplete model.
+- **Techniques interact.** Some help each other and some fight. Quantizing the KV cache relieves a bottleneck in
+  disaggregation, but raising the batch size leaves less spare compute for speculation. The goal is a balanced
+  combination that adds up to more than its parts.
+
+For each technique, pay attention to *when* it’s recommended and *what trade-off* it brings.
+
+## What quantization does
+
+Every model is trained with its numbers (weights, activations, and so on) stored in some **native** format, usually
+**BF16** or **FP16** (16 bits per number). 8-bit and even 4-bit native training is becoming more common.
+
+**Post-training quantization** converts those numbers into a lower-precision format after training. Cutting precision
+in half speeds up *both* phases of inference:
+
+- <Compute>Prefill</Compute> is compute-bound, and GPUs do lower-precision math on their Tensor Cores at roughly
+  **twice the FLOPS**.
+- <Memory>Decode</Memory> is memory-bound, and each number is now **half the bytes**, which is like doubling memory
+  bandwidth.
+
+It isn’t a clean 2× in practice, because handling quantized data adds some overhead. Dropping one level of precision
+(say 16 → 8 bits) typically gives LLMs **30–50% better performance**. Quantization improves time to first token,
+tokens per second, and total throughput, and it frees up memory and compute that make other techniques (disaggregation,
+speculation, prefix caching) work even better.
+
+<Analogy>
+  It’s like rounding prices in your head. “About \$3” is much faster to work with than “\$2.97”, and usually good
+  enough. But if you round every single item on a long receipt, the total can drift noticeably.
+</Analogy>
+
+## The risk: errors that compound
+
+When quantization goes wrong, it can noticeably hurt the model’s output quality. Small precision errors don’t stay
+small; they compound as calculations build on each other. Watch what happens when you square and cube π at different
+precisions:
+
+| π stored as | π² | π³ |
+|---|---|---|
+| 3.14159 | 9.869588 | 31.006198 |
+| 3.14 | 9.8596 | 30.959144 |
+| 3 | 9 | 27 |
+
+Rounding π to 3 is off by about 5%, but π³ is off by almost 13%. A model does billions of these operations, so most
+quantization work is about **preventing precision errors** and **limiting their effect on the final output**.
+
+## The number formats you’ll meet
+
+Quantization comes with a lot of abbreviations. These are the formats that matter, with the NVIDIA GPU generation that
+first supported each:
+
+| Name | Short | First GPU architecture |
+|---|---|---|
+| 64-bit floating point | FP64 | Fermi (2010) |
+| 32-bit floating point | FP32 | Kepler (2012) |
+| 16-bit floating point | FP16 | Pascal (2016) |
+| Brain floating point 16 | BF16 | Ampere (2020) |
+| 8-bit floating point | FP8 | Hopper (2022) |
+| Microscaling FP8 | MXFP8 | Blackwell (2024) |
+| 8-bit integer | INT8 | Pascal (2016) |
+| 6-bit floating point | FP6 | Blackwell (2024, experimental) |
+| 4-bit floating point | FP4 | Blackwell (2024) |
+| Microscaling FP4 | MXFP4 | Blackwell (2024) |
+| NVIDIA FP4 | NVFP4 | Blackwell (2024, proprietary) |
+| 4-bit integer | INT4 | Turing (2018) |
+
+You can ignore the extremes. **FP64** (“double precision”) is for scientific computing, not AI. **FP32** is
+sometimes used in training but almost never for inference. **FP6** is still experimental (though AMD GPUs are adopting
+it quickly). That leaves **16, 8, and 4 bits** as the formats that matter for inference.
+
+## What’s inside a number format
+
+Every format is described by three things:
+
+- **Precision**: how many bits each value uses (FP16 = 16 bits).
+- **Type**: whether the bits mean a whole number (**integer**) or a number with a decimal point (**floating point**).
+- **Scale factor**: a multiplier used to map low-precision values back to the range of the original numbers.
+
+Those decide two properties that determine how well a format can represent a model’s numbers:
+
+- <Term def="The span between the smallest and largest values a number format can represent.">Dynamic range</Term>:
+  how far apart the smallest and largest representable values are.
+- <Term def="How many values share one scale factor. Fewer values per scale factor = finer granularity.">Granularity</Term>:
+  how many values share a single scale factor.
+
+Dynamic range is the key to shrinking without losing quality. 16 bits can express **65,536** different values; 8 bits
+only **256**. What matters is how those few values are *spread out*.
+
+That’s why **floating-point formats beat integers** for inference. A floating-point number has three parts:
+
+- **Sign**: one bit for positive or negative.
+- **Exponent**: bits that say *how big* the number is (which power of two).
+- **Mantissa**: bits that give the *detail* (the digits that get multiplied by that power of two).
+
+A format like **FP8 E4M3** has a 4-bit exponent, a 3-bit mantissa, and 1 sign bit. Integer formats have only a sign
+and plain value bits, with no exponent. The book’s Figure 5.1 draws exactly this: floats carry exponent and mantissa
+bits alongside the sign. Try it:
+
+<NumberFormats />
+
+Things to notice:
+
+- In **FP8** and **FP4**, π gets rounded a lot. FP4 can only hold 8 positive values: 0, 0.5, 1, 1.5, 2, 3, 4 and 6.
+- **70,000 doesn’t fit in FP16** (max 65,504) but fits easily in **BF16**, because BF16 spends more bits on the
+  exponent. That extra range is why BF16 became the standard training format.
+- In **INT8**, drag the “biggest number” slider up. One large value stretches the scale, and small values lose almost
+  all their detail.
+
+That last point matters a lot, because **outliers** (rare, unusually large values) are important in real models.
+The exponent lets floating-point formats handle both very large and very small numbers, so they preserve outliers far
+better after quantization.
+
+## Granularity: how many numbers share a scale factor
+
+Within a precision there are several variants, like **FP4 vs. MXFP4 vs. NVFP4**. The difference is **granularity**:
+how many values are quantized using one shared scale factor. Quantization can be applied at three levels:
+
+- **Tensor level**: one scale factor for an entire tensor (e.g. the whole QKV tensor).
+- **Channel level**: a separate scale factor for each feature vector inside the tensor.
+- **Block level**: split each feature vector into blocks of *N* values, with one scale factor per block.
+
+Finer granularity makes it less likely that an outlier “smooths over” its neighbors, so quality holds up better. The
+cost is **overhead**: the scale factors have to be stored and applied.
+
+<BlockScaling />
+
+- **MXFP8** and **MXFP4** (new with Blackwell) are
+  <Term def="Formats that give every small block of values (32 in the MX formats) its own scale factor.">microscaling</Term>
+  formats: they compute a scale factor for **every 32 values**, which offsets their low dynamic range.
+- **NVFP4**, NVIDIA’s own 4-bit format, goes further: **blocks of 16** plus a second **32-bit global scale factor**,
+  fighting the quality loss that 4 bits usually cause.
+
+The trade-off: those per-block scale factors take up memory (eating slightly into the savings), and both the block and
+global scales have to be applied, which costs a little compute. Blackwell GPUs reduce that cost by applying the scale
+factors inside the Tensor Cores.
+
+## A detour: quantization on your own computer
+
+For **local** inference (laptops and desktops), quantization is how people fit huge models onto consumer hardware.
+**GGUF** is the most popular file format for sharing heavily quantized models on Hugging Face. People have squeezed
+models as big as DeepSeek onto Apple computers this way.
+
+These schemes use **dynamic quantization**: some layers stay at full precision while others are crushed down to
+integers with as little as **one bit**. The format is described by its *average* precision, which is why you see names
+like Unsloth’s **1.58-bit** quantization.
+
+<Note kind="warn">
+  Those tricks are impressive and great for local use, but for **production** systems the book is clear: **stick with
+  floating-point formats.** Integer formats don’t have enough dynamic range for quality-sensitive work.
+</Note>
+
+**The sweet spot today is 8-bit floating point (FP8 and MXFP8).** It improves performance without hurting quality, and
+it’s the most flexible option, especially for quantizing the KV cache. FP4 is promising, especially NVFP4 with its
+finer granularity, but FP8 is the safe default.
+
+## How quantization gets done
+
+Bigger models are **less sensitive** to quantization, because each individual number matters less. Even so, it has to
+be done carefully. There are two ways to do it:
+
+- <Term def="Training the model and its scale factors together so the final weights are accurate at a low precision.">Quantization-aware training</Term>:
+  the model is trained *with* the target precision in mind, so its weights end up accurate at that precision. Some
+  labs release models this way, like **GPT-OSS in MXFP4** and **Kimi K2 Thinking in INT4**.
+- <Term def="Converting a finished model to lower precision afterwards, using calibration data to preserve accuracy.">Post-training quantization</Term>:
+  convert finished weights to a new precision, computing scale factors and preserving accuracy through **calibration**
+  (running sample data through the model to pick good scales).
+
+If you’re working with someone else’s open model, the weights are finished, so **post-training quantization is your
+only option**. A leading tool is **NVIDIA TensorRT Model Optimizer (ModelOpt)**, an open-source library that also
+does pruning, distillation, and sparsity. Its output works with all the major engines: vLLM, SGLang, and TensorRT-LLM.
+
+Once you’ve picked a precision, two decisions remain:
+
+1. **Which parts** of the model get quantized: weights, activations, KV cache, attention?
+2. **Which number format** gives the right dynamic range and granularity?
+
+Those two choices turn quantization from a yes/no switch into a **spectrum** of performance vs. quality trade-offs.
+
+## What to quantize: from safest to riskiest
+
+Different parts of a model react very differently to lower precision. From **least** to **most** sensitive:
+
+| Component | Risk | Why |
+|---|---|---|
+| **Weights** (especially linear layers) | Low | Huge in number; each one matters little |
+| **Activations** (outputs of activation functions) | Low–moderate | Somewhat sensitive. The activation functions themselves are rarely quantized, since they’re a tiny fraction of the model |
+| **KV cache** | Moderate | Every later token reuses it, so errors carry forward |
+| **Attention** (especially softmax) | High | Very sensitive to range, and each step builds on the last |
+
+This is the picture in the book’s Figure 5.2: low risk for weights and activations, moderate for the KV cache, high for
+attention. A few more rules of thumb:
+
+- Even among the safe components, the **first and last layers** (input and output) are often left at full precision
+  because they’re more sensitive.
+- **KV cache quantization** is extra valuable: a smaller cache means more of it fits in memory and it reads faster,
+  which boosts prefix caching and disaggregation. But every token reuses the cache of the tokens before it, so errors
+  can **compound token after token**.
+- That compounding is exactly why **attention is the riskiest**. It’s highly sensitive to dynamic range, and each
+  attention calculation depends on all the previous ones. Over thousands of tokens, errors pile up fast. Nearly every
+  scheme keeps functions like **softmax** at their original precision.
+
+**The balanced approach:** use a high-dynamic-range format like FP8 (ideally a microscaling one like MXFP8) to carefully
+quantize selected linear layers, activations, and often the KV cache, while leaving the attention layer mostly alone.
+
+## Proving it didn’t get dumber
+
+The production standard is **zero perceptible quality loss**. After quantizing, test the output against the original
+model in three ways:
+
+1. **Perplexity**: compare the perplexity score of the quantized model with the original.
+2. **Intelligence benchmarks**: run a standard benchmark like **MMLU** or **SWE-bench** and compare scores.
+3. **Custom evals**: run your own product-specific test suite and compare.
+
+<Term def="A score for how ‘surprised’ a model is by a known piece of text. Lower is better.">Perplexity</Term> is the
+simplest check. Instead of generating text, you hand the model known text and measure how likely it thought each token
+was. Higher perplexity means the model is more “surprised”, which is bad for something whose job is predicting tokens.
+After quantizing, you want only a **tiny increase** in perplexity. On benchmarks and evals, you want only a **tiny drop**
+in score.
+
+LLMs are non-deterministic, so scores wobble a little between runs anyway. You’re looking for differences that are
+**indistinguishable from that noise**. For the full picture, run all three kinds of checks and compare apples to apples
+with the original weights. Your own domain-specific evals are the most meaningful.
+
+<Note kind="tip">
+  Remember that quantization is a dial, not a switch. You can get part of the benefit with less risk by using FP8
+  instead of FP4, or by quantizing fewer components, for example
+  <Term def="Quantizing only the model’s weights, leaving activations, KV cache, and attention at original precision.">weights-only quantization</Term>.
+  And if your domain can’t risk *any* quality change, that’s fine: **every other technique in this chapter is lossless.**
+</Note>
+
+<KeyPoints>
+- Quantization = fewer bits per number. Prefill gets faster math, decode moves fewer bytes: typically **30–50%** faster per precision step.
+- Precision errors **compound**, so the work is about preventing and containing them.
+- For inference, 16, 8 and 4 bits are what matter. **Floating point beats integers** because the exponent gives **dynamic range** for outliers.
+- **Granularity** (tensor → channel → block) trades a bit of overhead for quality. MX formats use blocks of 32; NVFP4 uses 16 plus a global scale.
+- Risk ladder: **weights < activations < KV cache < attention**. Keep softmax at full precision.
+- **FP8/MXFP8** is the sweet spot. Verify with **perplexity, benchmarks, and custom evals**, aiming for no difference beyond noise.
+</KeyPoints>
+
+<Quiz questions={[
+  {
+    q: "You quantize a model from FP16 to FP8. Roughly what speedup should you expect for an LLM?",
+    options: ["Exactly 2×", "About 30–50%", "No speedup, just memory savings"],
+    answer: 1,
+    why: "Half the bits helps both prefill (faster math) and decode (fewer bytes), but overheads mean one precision step typically gives 30–50%, not a clean 2×."
+  },
+  {
+    q: "Why are floating-point formats preferred over integer formats for production inference?",
+    options: [
+      "They use fewer bits",
+      "Their exponent bits give much more dynamic range, so outliers survive quantization",
+      "GPUs can’t run integer math"
+    ],
+    answer: 1,
+    why: "Integers spread their few values evenly and struggle with outliers. The exponent lets floats represent very large and very small values."
+  },
+  {
+    q: "Which part of a model is riskiest to quantize?",
+    options: ["Linear layer weights", "Activations", "Attention (e.g. softmax)"],
+    answer: 2,
+    why: "Attention is very sensitive to dynamic range, and each calculation builds on the previous ones, so errors pile up across thousands of tokens."
+  },
+  {
+    q: "What does NVFP4 do differently from plain FP4?",
+    options: [
+      "It uses 8 bits per value",
+      "It gives every block of 16 values its own scale factor, plus a global scale",
+      "It stores only integers"
+    ],
+    answer: 1,
+    why: "Finer granularity (blocks of 16 plus a 32-bit global scale) keeps outliers from wiping out their neighbors, at a small storage and compute cost."
+  }
+]} />

@@ -71,7 +71,7 @@ export function Widget({ title, children, hint }: { title: string; hint?: string
     <figure className="widget my-9 overflow-hidden rounded-2xl border border-line bg-card font-sans shadow-sm">
       <figcaption className="flex flex-wrap items-baseline justify-between gap-2 border-b border-line bg-bg-soft px-5 py-3">
         <span className="flex items-center gap-2 font-semibold">
-          <span className="text-sm font-medium text-accent">Try it</span>
+          <span className="whitespace-nowrap text-sm font-medium text-accent">Try it</span>
           <span className="text-ink-faint">·</span>
           {title}
         </span>

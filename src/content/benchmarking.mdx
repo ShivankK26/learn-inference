@@ -1,0 +1,177 @@
+import LoadTest from "@/components/widgets/LoadTest";
+
+<TLDR>
+  Without honest measurements you can't tell whether an optimization actually worked. A good **benchmark** mimics real
+  production traffic as closely as possible, is repeatable, and changes **one thing at a time**. When you need to know
+  *why* something is slow, not just *how* slow, you reach for a **profiler**.
+</TLDR>
+
+## Benchmarks: measuring before you optimize
+
+Every optimization in this course is a bet that something will get faster or cheaper. Benchmarking is how you check
+the bet. A high-quality benchmark **simulates real life as closely as possible**.
+
+### The gold standard: shadow traffic
+
+The best benchmark is **real production traffic**. **Shadowing** means copying each incoming request and sending the
+copy to the system you're testing as well. You measure how the test system performs on genuine traffic, and real users
+are never affected, because the original request is still served by the production system as usual.
+
+<Analogy>
+  Like a new chef **cooking a copy of every real order** in a test kitchen next door. Customers still get their food
+  from the main kitchen, but you learn exactly how the new chef would cope with a real Friday night.
+</Analogy>
+
+### If you can't shadow, simulate carefully
+
+If shadowing isn't possible, you have to fake realistic traffic, and LLM performance depends on a lot of factors. Your
+simulated traffic needs to match production on several dimensions:
+
+- **Sequence lengths**: time to first token and memory use depend on the
+  <Term def="Input sequence length: how many tokens are in the prompt.">input sequence length (ISL)</Term> and the
+  <Term def="Output sequence length: how many tokens the model generates in its response.">output sequence length (OSL)</Term>.
+- **Volume and pattern of traffic**: batching and server load depend on how many requests arrive at once. Real users
+  don't arrive in a perfectly steady stream, so **add jitter** (irregular bursts) to mimic reality.
+- **Request contents**: the actual prompts matter. They affect things like how often the cache gets reused (the
+  *cache hit rate*) and how often a speculative decoder's guesses are accepted (Chapter 5).
+- **Input parameters**: settings like temperature and reasoning effort change how inference behaves, so set them to
+  the values you expect in production.
+
+Play with how these change the results:
+
+<LoadTest />
+
+<Note kind="warn">
+  Optimization is all about trade-offs and constraints. If you tune your system to look great on **unrealistic**
+  benchmark inputs, production performance won't match what you measured.
+</Note>
+
+## Benchmarking tools
+
+Because a good benchmark reflects *your* production traffic, everyone's setup looks a bit different. But a few tools
+are common:
+
+| Tool | What it is |
+|---|---|
+| **SGLang genai-bench** | A command-line tool and dashboard from the SGLang team, for benchmarking models on *any* inference engine |
+| **NVIDIA GenAI-Perf** | A client-side tool for measuring latency and throughput under varied traffic |
+| **Locust** | A general open-source load-testing tool (not AI-specific) that can simulate up to millions of simultaneous users |
+
+**Open-source eval datasets** are another great resource, from general ones like **MMLU** and **gsm8k** to specialized
+ones like **SWE-bench**. You're measuring *speed*, not answer quality, but these datasets do double duty:
+
+1. They're a ready supply of **varied, realistic prompts** to send.
+2. They let you **spot-check that an optimization hasn't quietly hurt output quality**.
+
+Pick one that matches how your system will be used. For example, use **HumanEval** (a set of coding problems) when
+speeding up a code-completion product.
+
+## Tips for trustworthy benchmarks
+
+Besides being realistic, great benchmarks are **consistent**:
+
+- **Send enough traffic** to get a clear reading that a few outliers can't skew. When in doubt, **run it several times
+  and average** the results.
+- **Measure a baseline first**, before any optimization work, so you have something to compare against.
+- **Keep your benchmark setup fixed** while you test optimizations.
+- **Test each optimization on its own and in combination**, so you know what's really driving any improvement.
+  Optimizations can work *against* each other. For example, speculative decoding tends to fight with very large batch
+  sizes.
+- **Change one variable at a time**, in your benchmark settings too. You'll often need to test different traffic
+  patterns or sequence shapes, but as in any experiment, change only one thing per run so the results are clear.
+
+## Profiling: finding out *why*
+
+**Profiling** goes one level deeper than benchmarking:
+
+- A **benchmark** gives you a number, like *"the P90 time to first token is 350 ms"*. (P90 means 90% of requests were
+  at least that fast; Chapter 1 covers these percentiles.)
+- A **profiler** shows you **where every one of those milliseconds went**, operation by operation.
+
+In short: **benchmarking tells you how your system is performing; profiling tells you why.** The book's Figure 4.7
+shows a kernel profiler timeline, with each operation inside a kernel laid out by how long it took, which makes
+bottlenecks jump out.
+
+### Do you actually need it?
+
+Most inference engineers **won't profile day to day**. If you're using an already highly optimized engine like
+TensorRT-LLM, your workflow is a loop of *configure → benchmark → configure*, and profiling would be overkill.
+
+Profiling becomes essential when you're:
+
+- **contributing** to an inference engine like vLLM or SGLang,
+- **writing your own inference service** in PyTorch, or
+- working at the **cutting edge of a new modality**, like video generation.
+
+### Profiling tools
+
+| Tool | Best for |
+|---|---|
+| **PyTorch Profiler** | Easy step-by-step metrics during inference: CPU time, GPU time, memory usage |
+| **NVIDIA Nsight Systems (nsys)** | Powerful but complex system-wide tracing across CPUs, multiple GPUs and the links between them |
+| **NVIDIA Nsight Compute (ncu)** | Deep analysis of **individual CUDA kernels**, both compute and memory usage |
+
+Frameworks like TensorFlow and TensorRT also ship with their own built-in profilers.
+
+### What profiling looks like in practice
+
+Profilers show you in detail where compute and memory are being spent, so you can aim your effort at the most
+expensive steps. A realistic example from the book:
+
+1. The PyTorch Profiler shows that the **activation functions are taking unusually long**, because of excess memory
+   reads.
+2. You write a **fused kernel** that runs the activations together with attention, eliminating those extra reads
+   (kernel fusion, from the first lesson of this chapter).
+3. You plug the new kernel into your PyTorch code.
+4. You **re-run your system-level benchmarks** to see whether you've hit your latency target.
+
+Together, profiling and benchmarking tell you what to improve and give you the confidence to ship those improvements
+to production.
+
+<KeyPoints>
+- The best benchmark is **shadowed real traffic**. Otherwise, simulate it by matching **sequence lengths, traffic
+  pattern (with jitter), request contents and input parameters**.
+- Tools: **genai-bench**, **GenAI-Perf**, **Locust**, plus **eval datasets** for realistic prompts and quality checks.
+- Be consistent: **baseline first**, enough traffic, repeat runs, and **change one thing at a time**. Optimizations can conflict.
+- **Benchmarks say how fast; profilers say why.** Tools: PyTorch Profiler, Nsight Systems, Nsight Compute.
+- Most engineers configure and benchmark. Profiling matters when you build engines, custom PyTorch services, or new modalities.
+</KeyPoints>
+
+<Quiz questions={[
+  {
+    q: "What is “shadowing” traffic?",
+    options: [
+      "Sending fake random prompts to a server",
+      "Copying real incoming requests to a test system, without affecting the original requests",
+      "Hiding slow requests from your dashboard"
+    ],
+    answer: 1,
+    why: "Shadowing mirrors real production requests onto the test system, so you benchmark on genuine traffic with zero impact on users."
+  },
+  {
+    q: "Your benchmark uses 100-token prompts, but real users paste 5,000-token documents. What’s the problem?",
+    options: [
+      "None: prompt length doesn’t affect performance",
+      "Time to first token and memory use depend on input length, so the benchmark will look far better than production",
+      "Longer prompts make decode faster"
+    ],
+    answer: 1,
+    why: "Input sequence length drives prefill time and KV cache memory. Unrealistic inputs lead to unrealistic results."
+  },
+  {
+    q: "You enabled quantization and speculative decoding together and speed improved. What should you do next?",
+    options: [
+      "Ship it right away",
+      "Also test each optimization on its own, since they can interact or even work against each other",
+      "Change the traffic pattern and the settings at the same time"
+    ],
+    answer: 1,
+    why: "Testing individually and together shows what’s actually helping. Some optimizations conflict, like speculation with big batches."
+  },
+  {
+    q: "Your benchmark says P90 TTFT is 350 ms and you want to know which operation is responsible. What do you use?",
+    options: ["Another benchmark run", "A profiler", "A bigger GPU"],
+    answer: 1,
+    why: "Benchmarks tell you how the system performs; profilers show where each millisecond goes, which reveals the bottleneck."
+  }
+]} />

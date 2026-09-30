@@ -1,0 +1,198 @@
+import GeoLatency from "@/components/widgets/GeoLatency";
+import GpuFailureCalc from "@/components/widgets/GpuFailureCalc";
+
+<TLDR>
+  One cluster in one cloud eventually isn't enough. Big deployments spread thousands of GPUs across many regions and
+  cloud providers, and the hard part is making all of it act like **one pool**: get GPUs wherever you can, send each
+  user to a nearby region, survive hardware failures and outages, and keep data where the law says it must stay.
+</TLDR>
+
+## Why go beyond one cluster?
+
+Autoscaling inside one cluster works up to a point. But a high-volume product with users around the world needs
+**thousands of GPUs, spread across the globe**.
+
+The easy way to use several clouds is to run separate, **siloed** deployments in each. The problem is that silos can't
+help each other: you can't smoothly use spare GPUs in one cloud when another is overloaded, and moving workloads
+between clouds is slow and error-prone.
+
+**True multi-cloud** needs a **bin-packing** system that spans regions and providers and treats all those separate pools
+of GPUs as **interchangeable**.
+
+<Analogy title="Think of it like Tetris across data centers">
+  Bin packing is fitting pieces of different sizes into the available space with as little waste as possible. Here,
+  the pieces are model replicas and the space is every GPU you have access to, in every region and every cloud.
+</Analogy>
+
+Just as Kubernetes has a global view of *one* cluster, multi-cloud capacity management needs a global view of *all of
+them*, so it can **heal itself** (replace what fails) and **schedule globally**.
+
+Doing it properly unlocks four things:
+
+| Benefit | What it gives you |
+|---|---|
+| **Capacity** | Pool GPUs from several providers, for more and more flexible access |
+| **Redundancy** | Spread inference across providers, so one outage doesn't take you down |
+| **Latency** | Run models close to users, cutting network delay |
+| **Compliance** | Keep processing in the right places for data-sovereignty and other regulations |
+
+## Control plane and workload planes
+
+Going from one cluster to many needs a new coordination layer, built from the same idea you saw inside a cluster, but
+one level up:
+
+- **Control plane**: handles deploying models and making **global** scaling decisions. It takes in a live stream of
+  events from everywhere.
+- **Workload planes**: each one serves inference traffic directly, makes its own **in-cluster** scaling decisions, and
+  reports its utilization and demand back up.
+
+The key property of this split: **every workload plane can keep serving on its own.** If the control plane has a
+problem, or any single workload plane fails, the rest keep running unaffected.
+
+## Getting GPUs
+
+Plenty of companies rent out GPUs. They fall into three groups:
+
+- **Hyperscalers**: the giant clouds, like AWS or GCP.
+- **Neoclouds**: newer clouds focused specifically on GPUs, like CoreWeave or Nebius.
+- **Resellers**: secondary markets, like SF Compute Company.
+
+They differ in capacity, availability, and reliability. Hyperscalers usually cost more, and everywhere you trade price
+against things like **uptime guarantees, support, which regions are available, instance configurations, and cluster
+size**.
+
+The first challenge is simply **getting the GPUs at all**, especially the newest hardware. Large clusters are hard to
+find too: few providers can offer blocks of hundreds of nodes. Many providers give most of their in-demand GPUs to their
+biggest customers on long-term reservations, so you may need **several providers** just to get enough GPUs in the
+regions you need.
+
+There are three ways to pay:
+
+| Type | How it works | Trade-off |
+|---|---|---|
+| **Reserved** | Blocks of hundreds or thousands of GPUs, committed for months or years | Cheapest per hour, but you pay whether you use them or not |
+| **On-demand** | Individual machines whenever you need them, up to a quota | Flexible, but a relatively high hourly price |
+| **Spot** | Discounted on-demand machines the provider can **take back** with short notice, often minutes | Cheap, but can disappear |
+
+Large deployments **blend all three**: a baseline of cheap **reserved** GPUs, topped up with **on-demand** and **spot**
+machines for traffic peaks, spread across clusters worldwide to stay close to users.
+
+## Sending each user somewhere close
+
+A single cluster has a load balancer. A multi-cluster system needs a **global load balancer**, and it balances two
+goals:
+
+- Don't leave a request sitting in a queue when there's spare capacity somewhere else.
+- But don't make a habit of sending a user in Singapore to a server in San Francisco.
+
+The book's rule of thumb: a request takes about **5 milliseconds to cross one time zone**. New York to San Francisco is
+three time zones, so about **15 ms one way**. Latency budgets are tight, so run workloads as close to users as you can.
+
+<GeoLatency />
+
+## Building for reliability
+
+GPUs are **infamous for failing** in production. Anyone who has done a large training run plans for hardware to break.
+
+The book cites the Llama 3 paper: running **16,000 GPUs for 54 days**, Meta's team hit **419 unexpected
+interruptions**, mostly from hardware failures. That's roughly **one failure per 50,000 GPU-hours**.
+
+That sounds rare until you do the math: a single 8-GPU node running for a year is **more than 70,000 GPU-hours**. So
+even a small deployment should **expect** failures. (The book includes a chart from the paper breaking these
+interruptions down by root cause; hardware problems with the GPUs themselves and their memory dominate.)
+
+<GpuFailureCalc />
+
+Some practical lessons:
+
+- **GPU health is a node-level concern.** When one GPU on a node fails, the others on that node often fail next, or have
+  to be taken offline for repairs anyway. Watch for failures proactively, **cordon** the bad node (stop sending it new
+  work), and **cycle** the workloads onto healthy machines.
+- **GPUs aren't the only thing that breaks.** Cloud providers have scheduled maintenance and their own unplanned
+  outages. Every layer of the stack needs to be reinforced.
+
+Multi-cloud adds two classic reliability setups:
+
+- **Active-active**: several regions or clusters **serve live traffic at the same time**. If one fails, traffic simply
+  continues on the others.
+- **Active-passive**: a **hot standby** region or cluster is kept ready but idle. If the active one fails, traffic is
+  switched over to it.
+
+Either way, being able to **fail over** to another workload plane when a cluster, a region, or an entire cloud provider
+goes down keeps you reliable *and* keeps latency low.
+
+## Security and compliance
+
+Security and compliance teams have worried about cloud infrastructure for over twenty years, and inference that powers
+important products has to satisfy them. Their concerns fall into three areas:
+
+- **User data**: everything users send and everything the model sends back must be protected.
+- **Model weights**: if you've fine-tuned or built your own model, the weights are a valuable trade secret.
+- **Infrastructure**: the GPUs themselves, and access to the model's intelligence, are targets for abuse.
+
+<Note kind="tip">
+  One of the simplest security wins is to **not store user inputs or model outputs at all**. That's not always
+  possible (you may have logging requirements, or agreements to keep data for future training), but if you don't need
+  the data, not keeping it shrinks what an attacker could steal.
+</Note>
+
+Otherwise, securing inference looks like securing any containerized workload: **encryption, container security, network
+and access controls, and workload isolation**, all checked by thorough third-party **penetration testing** (hiring
+experts to try to break in).
+
+More and more inference serves **regulated industries** and **compliance-heavy regions**, and multi-cloud helps here too:
+
+- **Certifications and regulations flow through your providers.** To meet a standard like **SOC 2 Type II** or a law
+  like **HIPAA**, the providers you run on generally have to be compliant too. Being able to move workloads onto
+  compliant providers is valuable.
+- **Data residency.** Some countries and industries require that their users' data is processed only inside their
+  borders. With one cluster near **Toronto** and another near **New York**, you can keep Canadian data in Canada and
+  American data in the U.S., while users anywhere in the region still get low latency.
+
+<KeyPoints>
+- Siloed clouds can't share capacity. True multi-cloud treats every GPU pool as **one interchangeable pool**.
+- It unlocks **capacity, redundancy, latency, and compliance**.
+- A global **control plane** makes deployment and scaling decisions. **Workload planes** serve traffic and keep running
+  on their own if anything else fails.
+- GPUs come from **hyperscalers, neoclouds, and resellers**, bought as **reserved, on-demand, or spot**, usually blended.
+- A **global load balancer** keeps users near their servers: about **5 ms per time zone**, one way.
+- Expect hardware failures (about **1 per 50,000 GPU-hours**). Cordon bad nodes, and use **active-active** or
+  **active-passive** failover.
+- Protect **user data, model weights, and infrastructure**. Don't store data you don't need. Use regions for
+  **compliance** and **data residency**.
+</KeyPoints>
+
+<Quiz questions={[
+  {
+    q: "Your control plane goes down for 10 minutes. In a well-designed multi-cloud setup, what happens to live inference traffic?",
+    options: [
+      "Everything stops until the control plane is back",
+      "Workload planes keep serving traffic on their own",
+      "Traffic moves to a single backup GPU"
+    ],
+    answer: 1,
+    why: "The point of separating the planes is that each workload plane can serve independently. Only global decisions, like new deployments, wait for the control plane."
+  },
+  {
+    q: "Which GPU purchasing option can be taken back by the provider with only minutes of notice?",
+    options: ["Reserved", "On-demand", "Spot"],
+    answer: 2,
+    why: "Spot instances are discounted because they can be pre-empted at an agreed notice period, often minutes. They’re great for absorbing peaks, not for your baseline."
+  },
+  {
+    q: "Using the book’s rule of thumb, roughly how long does a one-way trip from New York to San Francisco take?",
+    options: ["About 1 ms", "About 15 ms", "About 150 ms"],
+    answer: 1,
+    why: "About 5 ms per time zone, and New York to San Francisco is three time zones: roughly 15 ms each way."
+  },
+  {
+    q: "You run a single 8-GPU node all year. Based on the Llama 3 failure rate, what should you expect?",
+    options: [
+      "No failures: 50,000 hours is longer than a year",
+      "Around one hardware failure, since the node racks up over 70,000 GPU-hours",
+      "Hundreds of failures"
+    ],
+    answer: 1,
+    why: "8 GPUs × 8,760 hours is over 70,000 GPU-hours, more than the ~50,000 GPU-hours per failure. Plan for it."
+  }
+]} />

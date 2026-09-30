@@ -1,0 +1,172 @@
+import GpuHierarchy from "@/components/widgets/GpuHierarchy";
+import FitCalculator from "@/components/widgets/FitCalculator";
+
+<TLDR>
+  A GPU is a machine for doing the **same simple math on huge amounts of data at once**. Inside, it has lots of small
+  math units (<Compute>compute</Compute>) and a ladder of memory, from tiny-and-fast caches to big-and-slow VRAM
+  (<Memory>memory</Memory>). Knowing which part is the bottleneck tells you which GPU to pick.
+</TLDR>
+
+## Accelerators, and where they live
+
+Inference runs on **accelerators**: hardware built to move terabytes of data and do trillions of operations per
+second. The most common one is the **GPU**, and the market leader is **NVIDIA**. This course (like the book) focuses on
+NVIDIA's datacenter GPUs. Other chips and running models on your own devices come later in this chapter.
+
+GPUs come in three flavors:
+
+| Type | What it is | Example |
+|---|---|---|
+| **Datacenter** | Racked servers packed with connected, high-performance GPUs | NVIDIA B200 |
+| **Workstation** | A single powerful desktop GPU for professional work | NVIDIA RTX Pro 6000 |
+| **Personal** | A desktop GPU for everyday use and gaming | NVIDIA GeForce RTX 5090 |
+
+Inference at scale uses **datacenter GPUs** mounted in racks: fridge-sized cabinets with standard power, networking, and
+cooling. They're the fastest individually, but what matters more is that they come with **very fast GPU-to-GPU
+connections**, are installed in **standardized setups**, and exist **by the millions** worldwide.
+
+You almost certainly don't have a B200 under your desk. So datacenter inference runs in one of three ways:
+
+- **Cloud**: you rent GPUs in someone else's datacenter. That's either a
+  <Term def="The giant cloud providers: AWS, Google Cloud, Microsoft Azure.">hyperscaler</Term> like AWS or GCP, or a
+  <Term def="A newer cloud company focused specifically on renting out GPUs, like CoreWeave or Nebius.">neocloud</Term>
+  like CoreWeave or Nebius.
+- **On-premise**: you buy the GPUs and install them in a datacenter you control.
+- **Air-gapped**: on-premise GPUs that are cut off from outside networks, so you have to be physically there to use them.
+
+Most inference engineers use **cloud GPUs**, because fast-growing products need the flexibility. Big enterprises and
+governments are more likely to run on-premise or air-gapped.
+
+## GPUs are throughput machines
+
+A **CPU** is great at complex, step-by-step work. A **GPU** is built for the opposite: **one simple operation applied to
+thousands of independent pieces of data at the same time**. Since inference is mostly vector and matrix
+multiplication, GPUs are a natural fit.
+
+<Analogy>
+  A CPU is a handful of **master chefs** who can each cook anything, one complex dish at a time. A GPU is a
+  **stadium full of line cooks** who each only know how to chop, but they all chop at once. If your job is "chop ten
+  million onions," the stadium wins easily.
+</Analogy>
+
+GPUs are incredibly complex under the hood (the physics of power and cooling, absurdly tight manufacturing tolerances),
+but inference engineers work a comfortable level above that. You just need a solid mental picture of what's inside.
+
+## Compute: SMs, cores, and threads
+
+On a CPU, a "core" is a big, independent processor (like the 8 cores in a high-end gaming PC). On a GPU the word means
+something smaller. A GPU is made of many **Streaming Multiprocessors (SMs)**, and each SM contains several kinds of
+cores:
+
+- **CUDA cores**: do math on individual numbers.
+- **Tensor Cores**: do math on whole vectors and matrices at once. **These are what matter for inference.**
+- **Special Function Units (SFUs)**: speed up specific math like sin, cos, and log. They're needed for softmax (part of
+  attention), but they're not where most of the work happens.
+
+So when you measure a GPU's compute for inference, **measure its Tensor Core compute**. Tensor Cores run a core
+instruction called **Matrix Multiply and Accumulate (MMA)**: multiply matrix A by matrix B, add matrix C, and store the
+result as matrix D.
+
+```
+D = A × B + C
+```
+
+The word **thread** means roughly the same thing on CPUs and GPUs: one stream of instructions. The difference is scale.
+A CPU runs dozens to hundreds of threads. A GPU runs **tens to hundreds of thousands** at once, can switch between tasks
+in a single clock cycle, and executes simple instructions in parallel.
+
+### Reading a spec sheet: FLOPS
+
+Compute is measured in **FLOPS** (floating-point operations per second). Datacenter GPUs do trillions
+(**teraFLOPS**) or quadrillions (**petaFLOPS**). Spec sheets can be misleading, so watch for two traps:
+
+1. **Dense vs. sparse.** The *dense* number is raw speed with every value used. The *sparse* number assumes a special
+   pattern (<Term def="A pattern where 2 out of every 4 values in a matrix are zero, so the hardware can skip them.">2:4 structured sparsity</Term>)
+   where half the values are zero and can be skipped. Sparse numbers are often about double the dense ones. **Normal
+   inference is dense**, so ignore the sparse number.
+2. **Precision.** FLOPS roughly **double every time you halve the precision**. A GPU that does 1 petaFLOPS in 16-bit
+   does about 2 petaFLOPS in 8-bit. Only compare GPUs **at the same precision**.
+
+<Note kind="tip">
+  Compute is the bottleneck for **LLM prefill** and for **image and video generation**. If that's your workload, pick
+  the GPU with **more FLOPS**.
+</Note>
+
+## Memory: VRAM and the caches
+
+A GPU has its own fast memory called **VRAM** (the "V" is for *video*, a leftover from when GPUs were mainly for
+graphics, just like the "G"). Today's VRAM is **high-bandwidth memory**: generations named **HBM3, HBM3e, and HBM4**.
+GPUs have dozens to hundreds of gigabytes of it.
+
+Every chip has two kinds of memory:
+
+| Kind | Where | Size | Speed |
+|---|---|---|---|
+| **DRAM** (dynamic RAM) | Off the main chip | Gigabytes | Slower |
+| **SRAM** (static RAM) | On the chip itself | Kilobytes to megabytes | Much faster, more expensive |
+
+VRAM is a type of DRAM. The GPU's SRAM comes as three levels of cache:
+
+- **L0**: an instruction cache for a single Tensor Core.
+- **L1**: shared memory for each Streaming Multiprocessor. An H100 has **256 KB per SM**.
+- **L2**: one global cache shared by all SMs. An H100 has **50 MB** in total.
+
+The book's diagram shows this layout: a GPU holds many SMs, each SM holds several Tensor Cores plus its own L1, and one
+L2 sits across all of them. Explore it:
+
+<GpuHierarchy />
+
+**VRAM bandwidth** is the top speed at which data moves between VRAM and the GPU's cores over the memory bus. In
+practice, it decides how fast VRAM can feed the caches, and so the compute.
+
+## Picking a GPU: will it fit, and how fast?
+
+**VRAM size decides what model you can load.** The book's rule of thumb: VRAM should hold the **model weights plus at
+least 50% extra** for the KV cache. You need more for long contexts, big batches, or video models.
+
+- If the **weights don't fit**, loading fails with an **OOM** (out-of-memory) error.
+- If the weights fit but there's **not enough headroom**, inference is slow or crashes with an OOM later.
+
+<FitCalculator />
+
+**Memory bandwidth decides decode speed** at low to medium batch sizes (remember the <a href="/learn/bottlenecks">bottleneck lesson</a>).
+If you want more tokens per second, pick the GPU with more bandwidth, e.g. an **H200 instead of an H100**.
+
+<KeyPoints>
+- Inference runs mostly on **NVIDIA datacenter GPUs**, usually rented in the **cloud**.
+- GPUs = **Streaming Multiprocessors** full of cores. **Tensor Cores** (matrix math, MMA) are what count for inference.
+- Compare **dense** FLOPS at the **same precision**. More FLOPS → faster prefill and image/video.
+- Memory ladder: tiny fast **SRAM caches** (L0, L1, L2) → big slower **VRAM** (HBM).
+- VRAM must fit **weights + ≥50% headroom**. More **bandwidth** → faster decode.
+</KeyPoints>
+
+<Quiz questions={[
+  {
+    q: "A spec sheet lists 2 petaFLOPS ‘with sparsity’ and 1 petaFLOPS dense. Which number should you use for normal inference?",
+    options: ["2 petaFLOPS (sparse)", "1 petaFLOPS (dense)", "Average them: 1.5"],
+    answer: 1,
+    why: "Inference is dense by default. The sparse number only applies to matrices with a special pattern of zeros."
+  },
+  {
+    q: "Which part of the GPU does the matrix math that dominates inference?",
+    options: ["Special Function Units", "CUDA cores", "Tensor Cores"],
+    answer: 2,
+    why: "Tensor Cores run Matrix Multiply and Accumulate (MMA) instructions, the heart of inference."
+  },
+  {
+    q: "A model’s weights take 60 GB. Using the book’s rule of thumb, is one 80 GB H100 enough?",
+    options: [
+      "Yes, easily",
+      "The weights load, but there’s less than the recommended 50% headroom (you’d want about 90 GB)",
+      "No, it won’t even load"
+    ],
+    answer: 1,
+    why: "60 GB × 1.5 = 90 GB recommended. It loads, but the KV cache will be squeezed and you risk slowdowns or OOM crashes."
+  },
+  {
+    q: "Your chatbot’s tokens-per-second is too low. Which upgrade fits the book’s advice?",
+    options: ["H100 → H200 (more memory bandwidth)", "H100 → L40", "More SFUs"],
+    answer: 0,
+    why: "Decode is memory-bandwidth bound at typical batch sizes, and the H200 has 4.8 TB/s vs. the H100’s 3.35 TB/s."
+  }
+]} />

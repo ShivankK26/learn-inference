@@ -1,0 +1,201 @@
+<TLDR>
+  **PyTorch** is the Python toolkit almost everyone uses to build, train and run models. From there, a model reaches
+  production in one of a few ways: **compile it with PyTorch**, **export it to ONNX / TensorRT**, or (increasingly
+  often) **hand the weights to an inference engine** like vLLM. Hugging Face's `transformers` and `diffusers` are
+  great for learning and experimenting, not for production serving.
+</TLDR>
+
+## The middle layer of the stack
+
+Deep learning frameworks sit between raw CUDA and ready-made inference engines. They're used for **both training and
+inference**. Over the last few years, **PyTorch** has become the clear winner at this level. Two others are worth
+knowing by name:
+
+- **TensorFlow**: Google's end-to-end ML platform. It was big in the 2010s but has fallen out of favor.
+- **JAX**: a research project loosely associated with Google, with a simpler interface and fewer legacy features.
+  Its own docs warn you to expect "sharp edges".
+
+The rest of this lesson is about PyTorch and the tools around it.
+
+## PyTorch
+
+PyTorch is a **Python package for describing operations on tensors** (multi-dimensional grids of numbers). It was
+created at Meta, now lives in the Linux Foundation, and is the industry standard for training *and* running
+generative AI models.
+
+Its big appeal: you can write high-performance model code in plain Python, for CPUs and GPUs, and **still drop down to
+CUDA when you need to** by plugging in specific kernels. The book's author, a lifelong Python programmer who finds
+low-level C++ hard going, uses exactly this approach.
+
+A basic neural network in PyTorch looks like this (the book shows a similar example from the PyTorch docs):
+
+```python
+from torch import nn
+
+class TinyNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(784, 512),  # a linear layer (matmul + bias)
+            nn.ReLU(),            # an activation function
+            nn.Linear(512, 10),
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+```
+
+You'll recognize the pieces from Chapter 2: **linear layers** and **ReLU activations**.
+
+### Great for training…
+
+PyTorch automatically computes **gradients** (the "which way should each weight move?" signal) for any function you
+write, thanks to its **autograd** module. You describe the computation, and PyTorch gives you what you need to train
+it. That's why it's so popular for training.
+
+### …and for inference
+
+PyTorch is also powerful for inference, balancing built-in functions and automatic optimizations with manual control
+where you need it. The step that prepares a model for fast inference is **compilation**:
+
+- `torch.compile` targets a **specific GPU** and automatically does **kernel selection** and **kernel fusion**
+  (from the previous lesson).
+- But it **can't fuse plugin kernels** like DeepGEMM, FlashAttention, or your own custom kernels. Since fast LLM
+  inference relies mostly on custom kernels, that limits its usefulness for LLMs.
+- It *is* useful for **less common architectures** and for compiling **long chains of small, lightweight kernels**.
+- For custom or unusual models, you may need to **rewrite some functions** in a more generic style (especially code
+  that relies on Python-specific language tricks) before compilation succeeds.
+
+## Model file formats
+
+A trained model's weights have to be saved to disk somehow. Two formats matter.
+
+### safetensors (the default)
+
+The dominant format for model weights is **safetensors**, created by Hugging Face to replace generic formats like
+`.bin`.
+
+- **Why "safe"?** Generic formats can run arbitrary Python code when they're loaded, which is a security risk.
+  safetensors files hold **only tensor data, never executable code**.
+- **Why fast?** Big models have hundreds of gigabytes of weights, split across **dozens of files**. safetensors uses
+  <Term def="Letting the operating system treat a file on disk as if it were already in memory, loading pieces only when they’re needed.">memory mapping</Term>,
+  so files can be loaded without allocating all the memory up front. That makes loading both faster and safer.
+
+### ONNX (weights + the recipe)
+
+**ONNX** (Open Neural Network Exchange) stores the weights **together with the model's execution graph** (the
+step-by-step recipe of operations). safetensors keeps weights and architecture separate; ONNX bundles them.
+
+ONNX files are **very portable**, deeply integrated with PyTorch, and supported on many kinds of hardware. It's the
+format to reach for when you want to store the whole model graph, not just the weights.
+
+<Analogy>
+  **safetensors** is a box of pre-measured ingredients: safe, easy to open, but you need to bring your own recipe
+  (the model code). **ONNX** is a meal kit: the ingredients *and* the recipe card, packed together so any kitchen can
+  cook it.
+</Analogy>
+
+## ONNX Runtime and TensorRT
+
+Once a PyTorch model is exported to ONNX, two high-performance runtimes can run it. **ONNX Runtime** executes it
+directly, while **TensorRT** compiles it into a highly optimized "engine".
+
+| | ONNX Runtime | TensorRT |
+|---|---|---|
+| Who makes it | Open source, associated with the Linux Foundation | NVIDIA (mix of proprietary and open parts) |
+| PyTorch integration | First-class exporter in the PyTorch ecosystem | Via Torch-TensorRT |
+| Hardware | Many kinds of GPUs | NVIDIA GPUs only |
+
+The export step looks a bit like `torch.compile`, with one catch: these formats **don't support every data type,
+structure and operation in PyTorch**. The exporter will flag problems, but with complex models it gets tricky. The
+book's example is **DeepSeek V3's Multi-Latent Attention (MLA)**, which is hard to export as written in PyTorch. On the
+other hand, the rest of the transformer architecture is simple enough that engineers can fuse its kernels by hand.
+
+### Where the industry is heading
+
+It's increasingly common to **skip the export step entirely**: go straight from PyTorch to an inference engine like
+vLLM or TensorRT-LLM (for models those engines support), saving just the weights as safetensors. ONNX Runtime and
+TensorRT are still widely used, **TensorRT especially for image and video models**, where its out-of-the-box runtime
+is strong.
+
+The book describes the industry as **splitting in two**: the *control* of handwritten PyTorch code on one side, and
+the *convenience* of prebuilt inference engines on the other.
+
+| Path to production | Good for |
+|---|---|
+| Handwritten PyTorch + `torch.compile` | Unusual architectures, full control |
+| PyTorch → ONNX → ONNX Runtime / TensorRT | Portable graphs; TensorRT is strong for image and video models |
+| safetensors weights → inference engine | Popular LLM architectures, fastest route to high performance |
+
+## Transformers and Diffusers
+
+Hugging Face's `transformers` and `diffusers` libraries are built on PyTorch, but they are **not designed for
+large-scale production inference**. Think of them as **reference implementations**: clear, readable versions of each
+model for engineers to learn from and adapt.
+
+They're still extremely useful:
+
+- The `config.json` that ships with models built for these libraries describes the model's architecture (Chapter 2).
+- Their utilities for Hugging Face tasks, like **downloading model weights**, are used everywhere.
+- Almost every popular open model's page (its **model card**) includes `transformers` or `diffusers` sample code,
+  which is perfect for understanding a model's exact inputs and outputs, running it locally, or playing in a notebook.
+
+<Note kind="warn">
+  For production, don't serve straight from `transformers` or `diffusers`. Either write and compile PyTorch code
+  yourself, or use a production-ready inference engine.
+</Note>
+
+<KeyPoints>
+- **PyTorch** is the standard framework for training *and* inference. TensorFlow has faded; JAX has sharp edges.
+- **Autograd** makes training easy. **torch.compile** selects and fuses kernels for a specific GPU, but can't fuse plugin
+  kernels like FlashAttention.
+- **safetensors** = weights only, no executable code, memory-mapped, the default. **ONNX** = weights plus the execution
+  graph, very portable.
+- **ONNX Runtime** (open, many GPUs) and **TensorRT** (NVIDIA only, highly optimized) run exported models. Not
+  everything exports cleanly.
+- The trend is to go **straight from PyTorch weights to an inference engine**. `transformers` / `diffusers` are for
+  learning and prototyping.
+</KeyPoints>
+
+<Quiz questions={[
+  {
+    q: "What makes safetensors “safe” compared to generic formats like .bin?",
+    options: [
+      "It encrypts the weights",
+      "It only stores tensor data, so loading it can’t run arbitrary code",
+      "It automatically checks the model’s accuracy"
+    ],
+    answer: 1,
+    why: "Generic formats can execute code during loading. safetensors holds only the numbers, never code."
+  },
+  {
+    q: "Why is torch.compile of limited help for LLM inference specifically?",
+    options: [
+      "It only works on CPUs",
+      "It can’t fuse plugin kernels like FlashAttention, and LLM inference relies mostly on custom kernels",
+      "It makes models less accurate"
+    ],
+    answer: 1,
+    why: "torch.compile does automatic selection and fusion, but the specialized custom kernels that make LLMs fast are outside its reach."
+  },
+  {
+    q: "What’s the key difference between safetensors and ONNX?",
+    options: [
+      "ONNX stores weights plus the execution graph; safetensors stores only weights",
+      "safetensors is only for image models",
+      "ONNX only works with TensorFlow"
+    ],
+    answer: 0,
+    why: "ONNX bundles the recipe (graph) with the ingredients (weights), which makes it portable. safetensors keeps just the weights."
+  },
+  {
+    q: "You found a new model on Hugging Face with transformers sample code on its model card. What’s that code best for?",
+    options: [
+      "Serving millions of users in production",
+      "Understanding the model’s inputs and outputs and running it locally",
+      "Training the model from scratch"
+    ],
+    answer: 1,
+    why: "transformers and diffusers are reference implementations: great for learning and local testing, not for large-scale serving."
+  }
+]} />

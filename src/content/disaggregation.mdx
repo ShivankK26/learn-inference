@@ -1,0 +1,156 @@
+import DisaggFlow from "@/components/widgets/DisaggFlow";
+import XPyD from "@/components/widgets/XPyD";
+import ShouldDisagg from "@/components/widgets/ShouldDisagg";
+
+<TLDR>
+  Prefill and decode want different things from a GPU, and under heavy load they get in each other's way.
+  **Disaggregation** runs them on separate engines: prefill engines read prompts and build KV caches, decode engines
+  write the answers. It's powerful, but only worth it for large models, lots of traffic, and long inputs.
+</TLDR>
+
+## Three ideas, combined
+
+Disaggregation brings together three ideas from earlier lessons:
+
+1. <Compute>Prefill</Compute> is compute-bound and sets your **TTFT**; <Memory>decode</Memory> is memory-bound and sets
+   your **TPS** (see [Finding the bottleneck](/learn/bottlenecks)).
+2. **Specialization improves performance**, from choosing kernels to tuning engine settings. A machine doing one job
+   can be tuned for that job.
+3. You can spread serving across many GPUs, or even many machines, **if you avoid bottlenecks** on the slower links
+   between them.
+
+When prefill and decode share the same GPUs under heavy traffic, they tend to **interfere**. In theory they're a good
+pairing: prefill mostly uses compute, decode mostly uses memory. But with large batches and compute-hungry
+optimizations, they start competing for the same resources, and a big prefill can stall everyone's token stream.
+
+<Analogy>
+  Picture a restaurant where the same cooks both **prep** (chopping for big new orders) and **cook to order**. When a
+  catering order for 200 arrives, all the à-la-carte diners wait. Give prep its own team and its own station, and
+  both kinds of work flow smoothly. Each team can also be sized and trained for its own job.
+</Analogy>
+
+## How disaggregation works
+
+**Disaggregated serving** puts prefill and decode on **separate engines, on separate GPUs or machines**. A request
+becomes a three-step relay:
+
+1. The **prefill engine** reads the input, builds the KV cache, and computes the **first token**.
+2. The prefill engine **sends the KV cache** over the hardware connection to a decode engine.
+3. The **decode engine** generates every token after that.
+
+### Conditional disaggregation
+
+Shipping a KV cache has a cost, and it isn't worth paying for a tiny prompt. With **conditional disaggregation**, the
+request goes to the **decode engine first**, which checks whether the input is already in its prefix cache or short
+enough to handle itself:
+
+- **If yes**, the decode engine runs prefill locally and skips disaggregation.
+- **If no**, it hands the request to a prefill engine and the disaggregated relay happens.
+
+The book notes that conditional disaggregation works **better for real-world traffic**, which is a messy mix of long
+and short requests.
+
+<DisaggFlow />
+
+Separating the engines has another big benefit: **you can tune each one independently.** For example, the
+compute-bound prefill engine needs **less tensor parallelism** than the memory-bound decode engine (see
+[Using many GPUs](/learn/parallelism)).
+
+## When should you use it?
+
+Disaggregation needs multiple GPUs and real engineering effort. The book says to reach for it only when **all three**
+of these are true:
+
+1. **High volume**: you serve a lot of traffic, starting around **100 million to 1 billion tokens per day**, depending
+   on model size.
+2. **A big model**: at least around **100 billion parameters**.
+3. **Prefill-heavy traffic**: many long input sequences.
+
+If (1) or (2) is false, you're probably paying for extra hardware for little gain. If (3) is false, you may do better
+using those GPUs for **more replicas**, since decode engines handle short prompts and prefix-cache hits efficiently on
+their own.
+
+<ShouldDisagg />
+
+The textbook workload: a **frontier LLM inside a code editor**, where many developers at once send big, varied
+chunks of code as context. That's tons of tokens, mostly prefill, on a trillion-parameter model.
+
+## Dynamic disaggregation with NVIDIA Dynamo
+
+**NVIDIA Dynamo** provides production-ready disaggregation that can cope with messy real traffic. Its main building
+blocks:
+
+- A **prefill queue** that holds requests when every prefill engine is busy.
+- Solid support for **conditional disaggregation**, with configurable thresholds for when to send a request to prefill
+  engines, based on the
+  <Term def="Input sequence length: how many tokens are in the prompt.">input length (ISL)</Term>
+  left after prefix caching, and on how long the prefill queue is.
+- Fast KV cache transfer from prefill to decode engines, built on
+  <Term def="NVIDIA’s Inference Transfer Library, used by Dynamo to move KV cache data quickly between engines.">NIXL</Term>,
+  including a kernel that **rearranges KV blocks** when the prefill and decode engines use different tensor-parallel
+  layouts.
+
+Together these enable **dynamic disaggregation**: the number of prefill and decode engines can be **changed at
+runtime** and adjusted over time as traffic shifts.
+
+### xPyD: not one-to-one
+
+It's easiest to explain disaggregation with one prefill engine and one decode engine, but real systems run several
+of each, in whatever ratio the traffic needs. The shorthand is **xPyD**: **5P3D** means five prefill engines and three
+decode engines serving one model together.
+
+<XPyD />
+
+More moving parts means more places to get stuck. Disaggregation adds two new bottlenecks to watch:
+
+- **Prefill queue size.** Don't let the queue grow too long. Set a sensible threshold so decode engines prefill
+  smaller requests themselves, and reconfigure xPyD at runtime to shift engines to prefill when needed.
+- **Running out of KV cache on decode engines** under heavy load. Make more room with
+  [quantization](/learn/quantization) (including of the KV cache) and [KV cache offloading](/learn/caching).
+
+<KeyPoints>
+- Disaggregation splits <Compute>prefill</Compute> and <Memory>decode</Memory> onto **separate engines** so they stop interfering and can each be tuned.
+- The flow: prefill engine builds the KV cache and first token → ships the cache → decode engine writes the rest.
+- **Conditional disaggregation** lets decode engines handle short or cached prompts themselves, which fits real traffic best.
+- Worth it only with **high volume** (~100M–1B+ tokens/day), a **big model** (100B+), and **prefill-heavy** traffic.
+- **Dynamo** adds a prefill queue, routing thresholds, fast KV transfer (NIXL), and runtime-adjustable **xPyD** ratios. Watch the prefill queue and decode KV memory.
+</KeyPoints>
+
+<Quiz questions={[
+  {
+    q: "In disaggregated serving, which engine produces the first token?",
+    options: ["The decode engine", "The prefill engine", "The router"],
+    answer: 1,
+    why: "The prefill engine processes the input, builds the KV cache, and computes the first token. Then it hands the cache to decode."
+  },
+  {
+    q: "With conditional disaggregation, what happens to a short prompt that’s mostly in the prefix cache?",
+    options: [
+      "It’s always sent to a prefill engine",
+      "The decode engine handles its prefill locally, skipping the transfer",
+      "It’s rejected"
+    ],
+    answer: 1,
+    why: "Shipping a KV cache isn’t worth it for small jobs, so the decode engine does the prefill itself."
+  },
+  {
+    q: "You serve an 8B model at 20 million tokens a day. Should you disaggregate?",
+    options: [
+      "Yes, always",
+      "Probably not: the model is too small and traffic too low, so extra GPUs would add little",
+      "Only if the prompts are short"
+    ],
+    answer: 1,
+    why: "The book’s checks need high volume and a model of roughly 100B+ parameters. Here, replicas are a better use of GPUs."
+  },
+  {
+    q: "What does 5P3D mean?",
+    options: [
+      "5 GPUs for prefill, 3 for data",
+      "Five prefill engines and three decode engines serving one model",
+      "A 5-to-3 compression ratio"
+    ],
+    answer: 1,
+    why: "xPyD describes how many prefill (P) and decode (D) engines work together. Dynamo can change this ratio at runtime."
+  }
+]} />

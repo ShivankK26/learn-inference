@@ -1,0 +1,211 @@
+import LongAudio from "@/components/widgets/LongAudio";
+import TTSStreams from "@/components/widgets/TTSStreams";
+
+<TLDR>
+  Speech models are small and already fast, so the big wins come from **how you run them**, not from the model itself.
+  For **transcription**, that means streaming for live audio and **chopping long files into chunks run in parallel**.
+  For **text-to-speech**, the goal isn’t maximum speed but **as many real-time voices per GPU as possible**.
+</TLDR>
+
+## Speech to text (ASR)
+
+**Automatic speech recognition** (ASR) models take audio in and produce text out. They power transcription and
+dictation apps. The most popular open one is **Whisper**, released by OpenAI, which handles dozens of languages
+accurately.
+
+Whisper is small by modern standards: the largest, highest-quality version is only **1.55B parameters**. It runs so
+fast that it fits comfortably on **a slice of a big GPU**, using [Multi-Instance GPU (MIG)](/learn/instances) to split
+one H100 into several smaller GPUs. Lots of smaller variants, distillations and quantizations exist, but in practice
+the top-quality models, **Whisper 3 Large** and **Whisper 3 Turbo**, already meet most latency budgets.
+
+Whisper is an **encoder-decoder** model (remember [Chapter 2](/learn/neural-networks)):
+
+- **Encoder**: takes the audio, converted into a <Term def="A picture of sound: how much energy there is at each pitch over time, scaled to match how human hearing works.">log-Mel spectrogram</Term>,
+  and turns it into audio features.
+- **Decoder**: turns those features into text tokens.
+
+**Almost all the time is spent in the decoder**, which is an autoregressive transformer very much like an LLM. That’s
+good news, because LLM tools apply. The main one is **TensorRT-LLM**, which gives the decoder in-flight batching, an
+optimized C++ runtime, and efficient CUDA kernels. It works especially well on newer **Hopper** and **Blackwell** GPUs,
+which makes MIG slices of those GPUs an even better fit.
+
+### Live transcription: one chunk at a time
+
+For real-time uses like dictation or voice agents, what matters is the **round trip for one chunk of audio**. A great
+target is **200 milliseconds**, about the average human reaction time.
+
+With Whisper on an optimized TensorRT-LLM engine, there’s little left to gain in the runtime. The gains come from
+**orchestration and infrastructure**, and the biggest one is **streaming**:
+
+- Instead of uploading a finished recording, the app opens a <Term def="A connection that stays open so both sides can keep sending data continuously, instead of one request and one response.">WebSocket</Term>
+  (covered in [Chapter 7](/learn/shipping)), streams audio in continuously, and gets text back continuously.
+- Streaming is handled in the **API server**, not the model. A small <Term def="Voice activity detection: a tiny model that detects when someone is speaking versus silence.">VAD</Term>
+  model watches the incoming audio and cuts it into chunks. Whisper transcribes each chunk as usual, and the text
+  streams back over the WebSocket.
+
+This setup can serve several streams at once, and it keeps transcription **in order**. When every chunk from a stream
+goes to the same GPU, the **previous chunk’s text can be fed in as a prefix** for the next one, which improves accuracy.
+
+### Long files: go wide
+
+Whisper can only process **30 seconds of audio at a time**, so an hour-long podcast needs a different approach.
+
+Long-file speed is measured with the confusingly named **real-time factor** (RTF): how many times faster than real time
+you transcribe. If the world’s fastest typist could transcribe an hour of audio in 30 minutes, that’s an RTF of **2×**.
+An optimized Whisper deployment can do an hour in **under four seconds**, an RTF of **1000×**.
+
+It takes a multi-step pipeline (the book’s figure shows it as two stages):
+
+1. **Chunk it smartly.** A VAD model, on its own hardware, **removes the silence** and cuts the audio into
+   meaningful segments. Splitting on fixed time intervals would risk **cutting words in half**.
+2. **Transcribe the chunks in parallel.** Spread them across many GPUs (or MIG slices), each running several chunks at
+   once with in-flight batching. **RTF improves roughly linearly with the number of GPUs.**
+3. **Stitch** the pieces back together by timestamp.
+
+<LongAudio />
+
+Going parallel means you **lose the trick of feeding the previous chunk as a prefix**. But there are quality tricks
+that more than make up for it. ASR models sometimes **hallucinate**, for example by repeating a phrase over and over.
+You can detect that automatically by checking the output’s **compression ratio** (repetitive text compresses
+suspiciously well) and its **words per minute** (too many words for the audio length is a red flag). When a chunk
+looks bad:
+
+1. **Re-run it at a higher temperature.** This is counterintuitive, since higher temperature usually means *more*
+   randomness, but here the point is to **break the repetition loop** and get a different output.
+2. **Re-chunk** the audio (or just that part) into smaller pieces and transcribe again.
+
+In practice these fixes remove the need for prefix passing, so you get transcription that’s both fast and accurate.
+
+### Who said what: diarization
+
+<Term def="Labeling a transcript with who is speaking when.">Diarization</Term> means annotating a transcript with
+**who is speaking when**. It’s a neighboring problem, and a completely different kind of model. Where Whisper is a
+transformer, diarization systems like **pyannote audio** are **pipelines of classic ML models**:
+
+1. **Segmentation**: find where speech changes.
+2. **Embedding**: capture each segment’s voice characteristics.
+3. **Clustering**: group segments by speaker across the whole file.
+
+Optimizing it means making each model fast and orchestrating the pipeline well, using tools like PyTorch, pyannote,
+and **Torch compilation**. Even so, highly optimized diarization still takes **at least twice as long** as
+transcribing the same file.
+
+## Text to speech (TTS)
+
+**Text-to-speech** (or *speech synthesis*) models take text in and produce spoken audio. In 2025, open models like
+**Orpheus TTS** brought extremely lifelike voices to open source, and many companies fine-tuned it for better quality
+and their own branded voices, which drove wide adoption of open models in voice AI.
+
+**Modern TTS models are fine-tuned LLMs.** Orpheus is built from **Llama 3.2 3B**, so the LLM playbook applies again.
+They’re small (3B is on the large end), so like ASR, **MIG slices of H100s** run them efficiently. Unlike ASR models,
+which usually run in FP16, TTS models can have their **weights and KV cache quantized to FP8**, on top of TensorRT-LLM’s
+optimized kernels and in-flight batching.
+
+### How an LLM learns to talk
+
+To turn an LLM into a TTS model, its **vocabulary is expanded with tens of thousands of audio tokens**, and it’s trained
+on pairs of text and tokenized audio. The model then “writes” audio tokens the way a chatbot writes words.
+
+That means you also need an **audio decoder** that turns those tokens into an actual sound wave (for Orpheus that’s a
+decoder called **SNAC**). This step can become a bottleneck. The book’s advice:
+
+- Implement it in **PyTorch** and **compile** it for the target GPU.
+- Use **dynamic batching with a short timeout** (around **15 milliseconds**): wait briefly to gather work, then run
+  it. **In-flight batching isn’t possible** for the audio decoder.
+
+<Analogy>
+  The TTS model is like a **composer writing sheet music**, and the audio decoder is the **musician who actually plays
+  it**. A brilliant composer doesn’t help if the musician can’t keep up.
+</Analogy>
+
+### Measuring speech speed
+
+| Metric | Meaning |
+|---|---|
+| **TTFB** (time to first byte) | The speech version of time to first token: how soon any audio arrives. |
+| **Time to first sentence** | A more user-centered measure: how soon a meaningful phrase is ready. |
+| **TPS** (tokens per second) | Decode speed, just like an LLM. |
+
+Lower TTFB is always better. Orpheus can get as low as **150 milliseconds** on a single H100.
+
+But TPS works differently from LLMs. Audio only needs to be generated **as fast as it plays**, which depending on the
+model takes about **80 to 100 tokens per second**. Anything faster is wasted. So instead of making one voice faster,
+you use the extra performance to **serve more voices at once**. The more real-time streams one GPU can handle, the
+cheaper each user gets.
+
+<TTSStreams />
+
+### Streaming TTS in production
+
+Almost all TTS is real-time, and again the runtime is already tuned (TensorRT-LLM, quantization, a compiled SNAC
+decoder), so the remaining gains are in **infrastructure**. As with ASR, **streaming over WebSockets** is the biggest
+unlock compared to sending text and getting audio back in chunks. Test your engine to find **how many concurrent
+real-time streams it can sustain**, then set your **batch size and number of active WebSockets** to match, which keeps
+the GPU busy but stable.
+
+<Note kind="warn">
+  If you ever use TTS in bulk, like converting a library of documents to audio for accessibility, remember that TTS
+  models **struggle with long inputs**. Speech quality starts to degrade after **about 30 seconds**, so split the text.
+</Note>
+
+## Speech to speech
+
+A fast-moving research area is **speech-to-speech** models: audio in, audio out.
+
+Today, most voice apps use a **cascade**, a pipeline where an **ASR model listens**, an **LLM thinks**, and a **TTS
+model responds**, with helpers like VAD and embedding models to make conversation feel natural and add context. The
+book’s figure shows this multi-model pipeline.
+
+Speech-to-speech models like OpenAI’s **gpt-realtime** instead give one core LLM the ability to hear and speak
+directly, merging the pipeline into **a single model**. That’s possible because ASR, LLMs and TTS share such similar
+architectures, especially on the decoder side.
+
+As of the book’s writing (January 2026), there were **no commercially viable open speech-to-speech models**, and closed
+ones like gpt-realtime were **less capable and more expensive** than a good cascade. But research is active, and this
+modality will soon need its own flavor of inference engineering.
+
+<KeyPoints>
+- **Whisper** (≤1.55B params) is encoder-decoder. The **decoder** is the bottleneck, so optimize it with **TensorRT-LLM**, often on **MIG** slices.
+- Live ASR: target **~200 ms** per chunk. **Streaming** via WebSockets + a **VAD** model is the big win, and same-GPU chunks can pass the previous text as a prefix.
+- Long files: VAD chunking → **parallel** transcription across GPUs → stitch by timestamp. **RTF** grows roughly linearly with GPUs (1000× is achievable).
+- Catch hallucinations via **compression ratio** and **words per minute**, then re-run hotter or re-chunk.
+- **Diarization** is a classic-ML pipeline (segment → embed → cluster) and takes ≥2× as long as transcription.
+- **TTS** = a fine-tuned LLM + an **audio decoder** (dynamic batching, ~15 ms timeout). Measure **TTFB** (~150 ms possible) and time to first sentence.
+- TTS only needs **~80–100 tokens/s** per stream, so scale **concurrent streams**, not speed.
+- **Speech-to-speech** merges the ASR → LLM → TTS cascade into one model, but cascades still win today.
+</KeyPoints>
+
+<Quiz questions={[
+  {
+    q: "Where does Whisper spend most of its inference time?",
+    options: ["The encoder", "The decoder", "Converting audio to a spectrogram"],
+    answer: 1,
+    why: "The decoder is an autoregressive transformer, like an LLM, and dominates inference time. That’s why LLM tools like TensorRT-LLM help so much."
+  },
+  {
+    q: "An hour of audio is transcribed in 6 seconds. What’s the real-time factor?",
+    options: ["6×", "60×", "600×"],
+    answer: 2,
+    why: "3,600 seconds of audio ÷ 6 seconds of processing = 600× faster than real time."
+  },
+  {
+    q: "A transcribed chunk keeps repeating the same phrase. Which fix does the book recommend?",
+    options: [
+      "Lower the temperature to zero",
+      "Re-run the chunk at a higher temperature, or re-chunk it smaller",
+      "Pass the previous chunk as a prefix"
+    ],
+    answer: 1,
+    why: "Counterintuitively, a higher temperature helps break the repetition loop. Re-chunking into smaller pieces is the other option."
+  },
+  {
+    q: "Your TTS model generates 300 tokens/s for a single user, but real-time audio needs ~90. What should you do with the extra speed?",
+    options: [
+      "Nothing, faster is always better for the user",
+      "Serve more concurrent streams on the same GPU",
+      "Increase the audio quality setting"
+    ],
+    answer: 1,
+    why: "Speed beyond real time is wasted. Batching more streams per GPU lowers the cost per user."
+  }
+]} />

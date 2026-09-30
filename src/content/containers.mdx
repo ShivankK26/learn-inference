@@ -1,0 +1,192 @@
+import DockerLayers from "@/components/widgets/DockerLayers";
+
+<TLDR>
+  A fast model on one GPU is only half the job. To serve real users you have to **package** it so it runs the same way
+  everywhere. That package is a **container**: the model server plus every library it needs, frozen at exact versions
+  so nothing breaks when you deploy it again next month.
+</TLDR>
+
+## Welcome to production
+
+Everything so far has been about making a single model run well on a single machine. This chapter is about what
+happens when real traffic shows up.
+
+The whole point of inference engineering is to make models faster, cheaper, and more reliable **so you can build
+better products**. That only pays off if your work actually reaches production and keeps up when a product takes off,
+including the sudden viral spikes that successful AI products get.
+
+Production is where your assumptions get tested for real:
+
+- **Real traffic is messy.** The lengths of prompts and answers, when people show up, even *what topics* they chat
+  about all change the performance you actually see.
+- **Any one server will eventually be overwhelmed.** No matter how optimized a single instance is, enough traffic
+  swamps it. That's not a PyTorch problem or a CUDA problem. It's an **infrastructure** problem, which needs a
+  different mindset and different tools.
+- **New questions appear.** Where do you get GPUs? How do you spread traffic across them? How do you avoid downtime?
+- **Cost accounting changes.** You go from paying a simple price per million tokens to paying directly for machines,
+  which is much harder to reason about.
+- **Latency isn't just prefill and decode.** The server, the network, and even the *client* code add delay. You have
+  to look at the whole path end to end.
+
+This chapter walks through all of it: packaging (this lesson), autoscaling, running across many clouds, and finally
+shipping, cost, monitoring, and client code.
+
+## What a container is
+
+**Containerization** means packaging an application together with everything it depends on, so it can be deployed the
+same way anywhere. It turns your program into one sealed artifact, and ends the classic *"but it works on my machine"*
+problem.
+
+Containers are lightweight because they **share the host machine's operating system kernel** instead of each bringing
+their own. (Careful: "kernel" here means the *Linux* kernel, not a CUDA kernel from Chapter 4.) That makes them a great
+fit for packaging inference services.
+
+For most developers, containers mean **Docker**, which comes with its own vocabulary:
+
+| Word | What it means |
+|---|---|
+| **Container** | A running, isolated environment holding your app and its dependencies |
+| **Image** | The packaged, ready-to-run blueprint a container is started from |
+| **Dockerfile** | A readable recipe of instructions for building an image |
+| **Registry** | A central store for sharing and downloading images |
+
+NVIDIA, the cloud providers, and Docker all run registries. A popular one for AI is **Docker Hub**: it is to images
+what Hugging Face is to model weights, or what PyPI is to Python packages.
+
+<Analogy>
+  An **image** is like a **meal kit**: every ingredient pre-measured, plus the recipe card (the **Dockerfile**). The
+  **registry** is the warehouse that ships kits out. A **container** is the meal actually being cooked in someone's
+  kitchen. Because the kit is sealed, the dish comes out the same in every kitchen.
+</Analogy>
+
+## Images are built in layers
+
+Docker images are stacked **layers**, each one a set of file changes on top of the one below. There are three kinds:
+
+- **Base image**: the bottom of the stack. It can be a plain operating system like Ubuntu, or a much richer image
+  pulled from a registry. (A base image is itself made of several layers.)
+- **Additional layers**: everything your Dockerfile adds, such as dependencies, your application code, and config files.
+- **Container layer**: a thin, *temporary*, writable layer created when the container starts. Anything the running
+  container writes (new files, edits, deletions) goes here, and **it all vanishes when the container stops.**
+
+The book's diagram of this is just the stack you see below: a base image at the bottom, your layers in the middle, and
+the throwaway writable layer on top.
+
+<DockerLayers />
+
+Inference engines like **vLLM** and **SGLang** publish **official base images** for their releases. Starting from one of
+these proven images is usually far smarter than assembling your own stack from scratch.
+
+## Dependency management: pack light, pin everything
+
+The chain of software under an inference server is **long and fragile**. Getting to a working build is genuinely hard,
+and breaking changes are common, so a container's biggest value is that it **preserves a known-good build**.
+
+An image is built for a specific GPU architecture and a specific model, and it bundles several moving parts:
+
+- **CUDA toolkit version**: the exact CUDA, cuDNN, and driver versions that work with the rest of your stack.
+- **Python packages**: things like `torch`, `transformers`, and `diffusers`.
+- **Inference engine**: the exact version of vLLM, SGLang, TensorRT-LLM, or whatever engine you use.
+- **System packages**: Linux tools like `ffmpeg`, which audio, image, and video models often need.
+
+Two habits matter most.
+
+**1. Pack light.** Like a hiker on a backpacking trip, only bring what you truly need. Inference images are often
+*many gigabytes*, and every extra gigabyte slows down deployments (and, as you'll see next lesson, cold starts).
+
+**2. Pin versions.** Write down the *exact* version of every dependency, not a range. A pinned dependency tree makes
+the runtime behave the same in every environment, and lets you rebuild the image and get the identical result.
+
+```text
+# Risky: "any version at least this new" can pull in tomorrow's breaking release
+transformers>=4.40
+
+# Safe: the same version every single build (example version)
+transformers==4.46.3
+```
+
+Package tools like **uv**, **poetry**, and **pip** will flag incompatible versions and fail the build. With everything
+pinned, once an image builds successfully it will *always* resolve to the same versions, which protects you from
+surprise breakage.
+
+Here's a minimal sketch of what that looks like in a Dockerfile:
+
+```dockerfile
+# Start from the engine's official image: a proven, known-good base
+FROM vllm/vllm-openai:vX.Y.Z
+
+# Only the system packages you actually need
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Exact, pinned Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Your server code last, since it changes most often
+COPY server/ /app/server/
+```
+
+<Note kind="warn">
+  **Brand-new models are where things break most.** When a major model like DeepSeek is released, the whole ecosystem
+  races to offer **day zero** support. To keep up, engineers often build on *nightly builds* or pre-release versions of
+  their dependencies. Those early versions are buggier, so plan to **rebuild on stable releases** in the days and weeks
+  after the launch.
+</Note>
+
+## NIMs: pre-built containers from NVIDIA
+
+**NIMs** (<Term def="NVIDIA Inference Microservices: ready-made Docker containers that serve popular open models on NVIDIA GPUs.">NVIDIA Inference Microservices</Term>)
+are ready-made Docker containers for popular open models. NVIDIA makes two kinds:
+
+- **Multi-LLM NIM**: a flexible container that can run a whole family of models on a supported GPU architecture.
+- **LLM-specific NIM**: an engine tuned for **one** specific model on **one** specific GPU, configured for maximum
+  performance.
+
+They're available for many common combinations of model, GPU architecture, GPU count, and configuration. A NIM is just
+a container like any other, so you can use it three ways: as a **starting point** to build on, as a **reference** to
+learn from, or as a complete **out-of-the-box** inference service.
+
+The trade-off is control. If you want to tune every detail yourself, you'll usually be better off building your own
+container from a **less opinionated base image** than bending a NIM to your needs.
+
+<KeyPoints>
+- Production tests everything: real traffic, real scale, real costs, and latency from the whole path, not just the GPU.
+- A **container** packages your model server with all its dependencies. **Images** are built from a **Dockerfile** and
+  shared through a **registry**.
+- Images are **layers**: a base image, your added layers, and a temporary writable **container layer** on top.
+- Start from an engine's **official base image**, **pack light**, and **pin exact versions**.
+- New model launches often force pre-release dependencies, so rebuild on stable releases afterwards.
+- **NIMs** are NVIDIA's pre-built containers: great as a starting point, less ideal if you want full control.
+</KeyPoints>
+
+<Quiz questions={[
+  {
+    q: "Your container writes a log file while it runs. What happens to that file when the container shuts down?",
+    options: ["It’s saved into the image automatically", "It’s lost, because it lived in the temporary container layer", "It’s uploaded to the registry"],
+    answer: 1,
+    why: "Runtime changes go into the thin, ephemeral container layer, which disappears when the container terminates. Anything you need to keep must be stored elsewhere."
+  },
+  {
+    q: "Why pin dependencies to exact versions (like transformers==4.46.3) instead of ranges?",
+    options: [
+      "Pinned packages download faster",
+      "So every rebuild resolves to the same known-good set and a future release can’t silently break you",
+      "Registries reject unpinned images"
+    ],
+    answer: 1,
+    why: "A pinned dependency tree makes builds repeatable and behavior consistent across environments, protecting you from breaking changes."
+  },
+  {
+    q: "A brand-new model came out yesterday and you shipped it using nightly builds of your engine. What should you plan to do?",
+    options: ["Nothing, nightly builds are the most stable", "Rebuild on stable releases in the coming days and weeks", "Switch to a closed model"],
+    answer: 1,
+    why: "Day-zero support often relies on pre-release dependencies, which are more prone to bugs. Rebuilding on stable releases once they land is standard practice."
+  },
+  {
+    q: "You need maximum control over every engine setting. Which starting point does the book suggest?",
+    options: ["An LLM-specific NIM", "A multi-LLM NIM", "Your own container built from a less opinionated base image"],
+    answer: 2,
+    why: "NIMs are done-for-you configurations. For full control you’re usually better off building your own container from a more neutral base image."
+  }
+]} />

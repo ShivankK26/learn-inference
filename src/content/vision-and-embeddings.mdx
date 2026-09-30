@@ -1,0 +1,237 @@
+import VisualTokens from "@/components/widgets/VisualTokens";
+import EmbeddingSpace from "@/components/widgets/EmbeddingSpace";
+
+<TLDR>
+  Most non-text models are **LLMs in disguise**, so the same engines and tricks apply. **Vision language models**
+  are an LLM plus a small image reader, and their big problem is that pictures turn into *lots* of tokens.
+  **Embedding models** turn text into coordinates of meaning, and serving them is mostly about **huge batches and good
+  queues**.
+</TLDR>
+
+## Beyond text in, text out
+
+So far the course has been about LLMs: text goes in, text comes out. A model’s <Term def="What kinds of input a model accepts and what kinds of output it produces, e.g. text → text, audio → text, text → image.">modality</Term>
+describes what it takes in and what it gives back, and there are many:
+
+| Input | Output | Category |
+|---|---|---|
+| Text + image/video | Text | Vision language |
+| Text or image/video | Vector (list of numbers) | Embedding |
+| Audio (voice) | Text | Transcription |
+| Text | Audio (voice) | Speech synthesis |
+| Text | Audio (music) | Music generation |
+| Audio (voice) | Audio (voice) | Speech-to-speech |
+| Text and/or image | 3D model | Generative CAD |
+| Text and/or image | Image/video | Image & video generation |
+| Image/video | Text | Captioning |
+| Image/video | Mask (outline of objects) | Segmentation |
+| Text + image | Image | Image editing |
+
+That looks like a lot, but it’s simpler than it seems. As you saw in [Chapter 2](/learn/neural-networks), there are
+only **two basic styles** of generative model:
+
+- **Autoregressive**: predict the next token, over and over. LLMs work this way, and so do vision language models,
+  embedding models, speech recognition, and text-to-speech. They reuse LLM-style architectures, so **the same engines
+  and techniques mostly carry over**.
+- **Iterative denoising**: start from noise and refine. Image and video generators work this way (increasingly as
+  hybrid *diffusion transformers*). Some ideas transfer, like careful kernel choice and parameter tuning, but the
+  details end up quite different.
+
+<Note kind="tip">
+  Each modality also needs its **own way of measuring speed**. For example, one token of audio from a text-to-speech
+  model is useless on its own, so instead of time to first token you measure **time to first word** or **time to
+  first sentence**.
+</Note>
+
+## Vision language models (VLMs)
+
+A **vision language model** takes one or more images or videos *plus* a text prompt, and answers in text: “What’s in
+this photo?”, “Summarize this chart”, “What happens in this clip?”
+
+A VLM is usually two parts bolted together:
+
+1. **A regular LLM**, the big part.
+2. **A vision encoder**, a small model that reads the raw image and turns it into **image tokens** the LLM can
+   consume.
+
+The size difference is dramatic. In Mistral Large 3, the vision encoder is about **2B parameters**, while the LLM is
+**673B**. But small doesn’t mean unimportant: vision encoders are built in lots of different ways, so engine support is
+more **fragmented** than for plain LLMs. That makes flexible engines like **vLLM** and **SGLang** especially useful
+for VLMs (see [Inference engines](/learn/inference-engines)).
+
+<Analogy>
+  The vision encoder is like a **translator who describes a painting in words** to a brilliant expert who can’t see.
+  The expert (the LLM) does the real thinking, but the description has to be detailed, and detailed descriptions are
+  long.
+</Analogy>
+
+### Pictures are expensive
+
+Here’s the key rule of thumb: **one high-resolution image adds about 1,000 tokens** to the input. To the LLM, image
+tokens mostly behave like normal tokens, but they add up fast.
+
+<VisualTokens />
+
+So the core challenge for VLMs is **longer inputs and a bigger KV cache**, and it shows up in both phases:
+
+- <Compute>Prefill</Compute>: the image is cut into patches, embedded, turned into tokens, and processed along with
+  the text, which means a much bigger prefill.
+- <Memory>Decode</Memory>: same mechanics as an LLM, just with a longer context to attend to. Some models also add
+  special attention variants for the image tokens.
+
+The good news is that **every technique from Chapter 5 helps**:
+
+| Technique | How it helps VLMs |
+|---|---|
+| [Quantization](/learn/quantization) | Quantizing the **KV cache** cuts the memory and bandwidth cost of those long sequences. |
+| [Speculation](/learn/speculative-decoding) | Decode works just like an LLM, so speculation (especially **EAGLE**) speeds it up. |
+| [Prefix caching](/learn/caching) | Reuse the KV cache for an image across a multi-turn chat or repeated questions. |
+| [Parallelism](/learn/parallelism) | **Tensor parallelism** gives speed plus more total GPU memory for big models and long contexts. |
+| [Disaggregation](/learn/disaggregation) | Move the heavy prefill to its own workers that scale separately. |
+
+### A new dial: downsampling
+
+VLMs add a new speed-versus-quality trade-off: **downsampling**, which means feeding in images at lower resolution. A
+high-resolution version takes **about four times as many tokens** as a low-resolution one, but carries more detail.
+For a single image you usually don’t need to downsample. With **many images or video clips**, you often do.
+
+### Video
+
+A video is more than a pile of photos. It may contain **audio**, which many VLMs can’t hear, so it has to be
+transcribed separately and added to the prompt. And its frames show **motion over time**, which you lose if you look at
+frames one by one. VLMs are trained on clips to understand that time dimension, so for good results the **whole clip
+should go into a single request**.
+
+Now do the math. Cinematic video runs at **24 frames per second**, and each frame is an image. At ~1,000 tokens per
+frame, a **four-second clip is nearly 100,000 tokens**. In practice, **downsampling is basically mandatory**: lower the
+resolution *and* the frame rate so a whole clip fits in one request. Even so, today’s video understanding models can
+only handle **very short clips**.
+
+Once the video is tokenized, inference works like it does for images, just with a much longer context. That makes
+prefix caching, **KV cache offloading** (moving cache out of GPU memory, see [Caching](/learn/caching)), and optimized
+attention even more important at tens of thousands of tokens.
+
+### Omni-modal models
+
+VLMs are part of a trend toward **“omni” models** that accept and produce many types of data. The trade-off is that a
+blend of skills gives unique abilities, but **smaller specialist models are often faster and more accurate** in their
+own area. For example, many VLMs can read text in images, but they lag behind dedicated **OCR** (optical character
+recognition) models that are a fraction of their size.
+
+So production VLM systems are often **pipelines**: one component pulls data out of PDFs, another reads text with OCR,
+another transcribes a video’s audio, and so on. **Each step needs to be optimized on its own and scale on its own**,
+or the slowest one becomes the bottleneck for everything.
+
+## Embedding models
+
+An **embedding model** turns a chunk of text of any length (or an image, or other input) into a **fixed-length list of
+numbers**, a <Term def="A fixed-length list of numbers. For embeddings, it acts like coordinates for an input’s meaning.">vector</Term>,
+that captures what it *means*. Inputs with similar meanings land close together, so you can find related things with
+simple math.
+
+<EmbeddingSpace />
+
+That simple trick powers a lot: **search**, **recommendations**, **agent memory**, and <Term def="Retrieval-augmented generation: look up relevant documents with embeddings, then give them to an LLM to answer from.">RAG</Term>.
+Usually the vectors are stored in a **vector database**.
+
+### Two very different kinds of traffic
+
+Embedding workloads come in two flavors:
+
+1. **High-throughput backfills**: bulk jobs like indexing millions of documents, refreshing a product catalog, or
+   preparing data for training. Only total volume matters.
+2. **Low-latency lookups**: a single user’s search query, where every millisecond is felt.
+
+Step one is working out which one you’re serving. If you need both, and have enough traffic to justify it, **build a
+separate system for each**.
+
+### Two architectures
+
+There are tens of thousands of embedding models on Hugging Face, but they come in just two styles:
+
+- **BERT-style**: encoder-only networks, usually **under 1B** parameters, originally built to fill in masked-out words.
+  Still used for simple, latency-sensitive jobs like classification.
+- **LLM-based**: modern LLMs, usually **8B or smaller**, repurposed to output embeddings. These are **much more
+  capable** today.
+
+Embeddings have their own speed/quality dial: **dimensionality**, the length of the output vector (a few hundred to a
+few thousand numbers). Longer vectors hold more information. Modern models use <Term def="A training trick that packs the most important information into the first part of the vector, so you can cut it shorter and keep most of the quality.">Matryoshka representations</Term>,
+named after Russian nesting dolls, so you can **truncate a vector** and still keep most of its meaning.
+
+Dimensionality barely affects inference time. It matters for **storage, retrieval, and comparison speed** in the
+rest of your system.
+
+<Note kind="warn">
+  Vectors from **different embedding models can’t be compared**, even if they’re the same length. Each model has its
+  own “map” of meaning. Switch models and you have to re-embed everything.
+</Note>
+
+### Serving embedding models fast
+
+For LLM-based embedding models like **Qwen 3 Embed 8B**, the toolbox is the same one used for small, high-volume LLMs.
+Several runtimes work (**vLLM, SGLang, Infinity, TEI**, which is Hugging Face’s Text Embeddings Inference), but the best
+performance comes from adapting **TensorRT-LLM**. It brings a fast attention kernel (**XQA**) and
+[kernel fusion](/learn/cuda-and-kernels), and for supported models it wins on **both latency and throughput**. The
+book’s figure shows a high-performance pipeline: **parallel tokenization** and **batch management** in front of an
+optimized engine.
+
+More speed comes from **FP8 quantization** of the weights, with minimal quality loss. Smaller models are more
+sensitive to quantization, so check it: run the same inputs through the original and quantized models and compare the
+outputs with <Term def="A measure of how closely two vectors point in the same direction. 100% means identical direction.">cosine similarity</Term>.
+**Aim for at least 99%** similarity.
+
+Some of the usual tricks *don’t* apply:
+
+- **Prefix caching and disaggregation are irrelevant.** Embedding models process all tokens in parallel in one pass,
+  with no decode phase.
+- **Multi-GPU parallelism doesn’t help.** The models are too small. Instead, **scale horizontally**: each GPU is its
+  own replica.
+
+What *does* matter is **batching and queueing**. Embedding models handle **much bigger batches** than other models.
+One request might contain dozens or hundreds of texts, and many requests can share a GPU because even the biggest
+embedding models are small and fast. When a backfill or traffic spike still exceeds that, a **robust queue** is
+essential infrastructure.
+
+<KeyPoints>
+- Almost every modality is either **autoregressive** (LLM-like) or **denoising** (image/video). LLM tools carry over to the first group.
+- Each modality needs its own speed metric (e.g. **time to first word** for speech).
+- VLM = **big LLM + small vision encoder**. A high-res image ≈ **1,000 tokens**, so the challenge is long inputs and a big KV cache.
+- **Downsampling** trades detail for tokens (~4× between high and low res), and it’s essentially required for video.
+- Specialist models often beat omni models in their niche, so real systems are **pipelines** where each part scales independently.
+- Embedding models map meaning to vectors. Separate **bulk backfills** from **live lookups**, use **FP8** (check ≥99% cosine similarity), scale **horizontally**, and lean on **big batches and queues**.
+</KeyPoints>
+
+<Quiz questions={[
+  {
+    q: "In a vision language model, which part is usually much bigger?",
+    options: ["The vision encoder", "The LLM", "They’re about the same size"],
+    answer: 1,
+    why: "The vision encoder is small, about 2B parameters in Mistral Large 3 versus a 673B-parameter LLM. It still matters for inference, though."
+  },
+  {
+    q: "Roughly how many input tokens would an unmodified 4-second, 24 fps video clip produce at ~1,000 tokens per frame?",
+    options: ["About 4,000", "About 24,000", "Nearly 100,000"],
+    answer: 2,
+    why: "4 seconds × 24 frames × ~1,000 tokens ≈ 96,000 tokens. That’s why video is almost always downsampled."
+  },
+  {
+    q: "You switch to a new embedding model. What must you do with your existing stored vectors?",
+    options: [
+      "Nothing, as long as the vectors are the same length",
+      "Re-embed your documents with the new model",
+      "Quantize them to FP8"
+    ],
+    answer: 1,
+    why: "Each embedding model has its own semantic space, so vectors from different models can’t be meaningfully compared."
+  },
+  {
+    q: "Your embedding service gets far more traffic than one GPU can handle. What’s the right way to scale?",
+    options: [
+      "Split the model across 8 GPUs with tensor parallelism",
+      "Add more GPUs, each running its own full copy, with a queue in front",
+      "Turn on disaggregation"
+    ],
+    answer: 1,
+    why: "Embedding models are small, so multi-GPU parallelism doesn’t help. Scale horizontally with replicas, big batches, and a robust queue."
+  }
+]} />

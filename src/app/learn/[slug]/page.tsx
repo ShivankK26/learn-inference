@@ -90,9 +90,10 @@ export default async function LessonPage({ params }: PageProps<"/learn/[slug]">)
                 <div className="mt-1 font-medium">{next.title}</div>
               </Link>
             ) : (
-              <div className="rounded-xl border border-dashed border-line p-4 text-right text-sm text-ink-faint">
-                More chapters coming soon
-              </div>
+              <Link href="/reading" className="rounded-xl border border-line bg-card p-4 text-right hover:border-accent">
+                <div className="text-xs text-ink-faint">You finished the course →</div>
+                <div className="mt-1 font-medium">Where to go next: further reading</div>
+              </Link>
             )}
           </nav>
         </article>

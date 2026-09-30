@@ -1,0 +1,143 @@
+import Interconnects from "@/components/widgets/Interconnects";
+import MigSlicer from "@/components/widgets/MigSlicer";
+
+<TLDR>
+  You don't rent a bare GPU; you rent an **instance**: GPUs plus CPUs, RAM, disk, and networking. Big models need
+  **several GPUs wired together** (8 per node, joined by very fast NVLink, with slower InfiniBand between nodes). Small
+  models can go the other way and use a **slice of one GPU** (MIG).
+</TLDR>
+
+## What an instance is
+
+In the cloud, the basic unit you rent is an **instance**: a virtual machine that bundles together:
+
+| Part | What it does |
+|---|---|
+| **GPUs** (the *device*) | Run the inference itself |
+| **CPUs** (the *host*) | Handle everything that doesn't run on the GPU |
+| **Host memory** | Regular RAM for the CPU |
+| **Storage** | Disk for loading and saving big files (like model weights) |
+| **Networking** | Connections to the datacenter and the internet |
+| **Interconnect** | Direct GPU-to-GPU and machine-to-machine links for using many GPUs at once |
+
+**Not all instances are equal.** NVIDIA publishes reference designs, but every cloud provider builds its own systems.
+Compute, memory, storage, and interconnect all vary. Even the GPU itself can differ: the A100, for example, comes in
+two <Term def="The physical package a GPU comes in. SXM plugs directly into a special board; PCIe is a standard add-in card.">form factors</Term>,
+**PCIe** and **SXM**. Most A100 inference uses SXM because it has about **5% more memory bandwidth**.
+
+<Note kind="warn">
+  Know exactly what you're renting. **Any** part of the instance, not just the GPU, can become the bottleneck or the
+  thing that breaks.
+</Note>
+
+## When one GPU isn't enough: multi-GPU instances
+
+Often a model is too big for one GPU, or you want several GPUs working together to go faster. It's common to need 2,
+4, 8, or more GPUs for large models like DeepSeek or heavy workloads like video generation.
+
+The standard unit is a **node**: **eight GPUs** in one machine. A "B200 node" means eight B200s. Inside a node, the
+GPUs are connected by two systems:
+
+- **NVLink**: direct GPU-to-GPU links. Up to **1,800 GB/s** on Blackwell and **900 GB/s** on Hopper.
+- **NVSwitch**: sits on top of NVLink so that **every GPU can talk to every other GPU** in the node at full speed.
+
+These make it possible to spread one model across up to all eight GPUs in a node.
+
+### Going beyond one node
+
+For the most demanding workloads, eight GPUs still isn't enough, and you need a fast connection *between* nodes. The
+standard for NVIDIA GPUs is **InfiniBand** (NVIDIA bought its maker, Mellanox, in 2019).
+
+InfiniBand is **much slower than NVLink**, up to **400 Gb/s** per
+<Term def="Network Interface Controller: the network card that connects a machine to the network.">NIC</Term>, but it's
+still the fastest node-to-node option. Ordinary Ethernet tops out around **100 Gb/s** per NIC.
+
+<Note kind="tip">
+  Watch the units. Network speeds are quoted in **gigabits** (Gb/s), while GPU links are quoted in **gigabytes** (GB/s).
+  One byte is 8 bits, so 400 Gb/s is only **50 GB/s**.
+</Note>
+
+The book's diagram shows how it all fits together: NVLink connects GPUs, NVSwitch lets all eight GPUs in a node talk
+to each other, and InfiniBand connects separate nodes.
+
+<Interconnects />
+
+Not every cloud provider uses InfiniBand. Some have their own interconnects, and some only offer it on certain GPUs.
+Always **check what interconnect you're getting and how fast it really is**.
+
+### Rack-scale systems
+
+NVIDIA also sells a way to extend NVLink beyond eight GPUs. The **GB200 NVL72** packs **72 Blackwell GPUs and 36 Grace
+CPUs** into one full rack, all joined by NVLink, for serving the world's largest models under heavy traffic. The next
+generation, **Vera Rubin NVL144 CPX**, pairs Vera CPUs and Rubin GPUs with the new Rubin CPX chip.
+
+<Analogy title="Think of it like an office">
+  NVLink is **people at the same desk** passing papers by hand. InfiniBand is **sending a courier to another
+  building**. It still works, but anything that needs constant back-and-forth belongs at the same desk.
+</Analogy>
+
+Keep these **relative speeds** in mind. Because NVLink is roughly an order of magnitude faster than InfiniBand, it can
+carry far more traffic before it becomes the bottleneck. The parallelism and disaggregation techniques in Chapter 5 are
+all about arranging work to fit this layout.
+
+## When one GPU is too much: Multi-Instance GPU (MIG)
+
+Sometimes you have the opposite problem: **the GPU is too big for the model**. An H100 or B200 has huge amounts of
+compute and memory, and a model with a couple of billion parameters can't make good use of it, even with big batches.
+Expensive hardware sits idle.
+
+Instead of falling back to old, slow GPUs, you can run small models on **fractions of new ones**.
+**Multi-Instance GPU (MIG)** is a hardware feature of larger GPUs (**A100, H100, H200, B200**) that splits one GPU into
+**up to seven** independent pieces. Each piece also gets its own slice of CPU, RAM, storage, and networking, making it
+a real instance.
+
+An H100 has **seven compute slices** and **eight memory slices** to build instances from (the book shows this as a
+diagram). For example, an H100 MIG instance with **three slices** gets about **3/7 of the compute** and up to **half the
+VRAM (40 GB)**, plus about half the CPU cores, CPU memory, storage, and network bandwidth.
+
+<MigSlicer />
+
+Why seven, when software people love powers of two? Compute slices are made of Streaming Multiprocessors, and GPUs don't
+have tidy SM counts. An SXM H100 has **132 SMs**, so it's split into seven equal slices and the leftover SMs sit idle.
+
+For small models like **Orpheus TTS** (a 3B-parameter text-to-speech model), running **two MIG instances** can be a more
+efficient use of an H100 than giving one instance the whole GPU.
+
+<KeyPoints>
+- An **instance** = GPUs + CPUs + RAM + storage + networking + interconnect. Check every part.
+- A **node** has **8 GPUs**, linked by **NVLink** (900–1,800 GB/s) and **NVSwitch** (all-to-all).
+- Between nodes: **InfiniBand** (up to 400 Gb/s ≈ 50 GB/s per NIC), much slower than NVLink.
+- **NVL72** systems join 72 Blackwell GPUs over NVLink in one rack.
+- **MIG** splits a big GPU into up to **7** smaller instances for small models.
+</KeyPoints>
+
+<Quiz questions={[
+  {
+    q: "How many GPUs are in a standard node?",
+    options: ["2", "4", "8", "72"],
+    answer: 2,
+    why: "A node is eight GPUs connected by NVLink and NVSwitch. 72 is a special rack-scale system (NVL72)."
+  },
+  {
+    q: "An InfiniBand NIC is rated at 400 Gb/s. Roughly how many gigabytes per second is that?",
+    options: ["400 GB/s", "50 GB/s", "3,200 GB/s"],
+    answer: 1,
+    why: "Divide bits by 8: 400 Gb/s ≈ 50 GB/s, far slower than NVLink’s 900–1,800 GB/s."
+  },
+  {
+    q: "You need to serve a 2B-parameter model cheaply on modern hardware. What does the book suggest?",
+    options: ["Use a full 8×B200 node", "Use a MIG slice of a big GPU like an H100", "Always use an old T4"],
+    answer: 1,
+    why: "MIG lets small models run on a fraction of a fast GPU instead of wasting a whole one or using slow old hardware."
+  },
+  {
+    q: "Why does an H100 have 7 compute slices instead of 8?",
+    options: [
+      "Its 132 SMs don’t split evenly, so it makes 7 equal slices and leaves a few SMs idle",
+      "One slice is reserved for the CPU",
+      "It’s a manufacturing defect"
+    ],
+    answer: 0,
+    why: "GPUs don’t have neat power-of-two SM counts, so 7 even slices are made and the leftover SMs aren’t used."
+  }
+]} />

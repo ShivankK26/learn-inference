@@ -1,0 +1,165 @@
+import LocalMachines from "@/components/widgets/LocalMachines";
+
+<TLDR>
+  NVIDIA leads, but plenty of companies build AI chips, each betting on one edge: **faster memory**, **lower power**, or
+  **tight integration with a cloud**. Models can also run **on your own laptop or phone**, which gives instant,
+  private, free inference but on much weaker hardware.
+</TLDR>
+
+## Other datacenter accelerators
+
+NVIDIA's lead in AI hardware has made it the world's most valuable company, but it's far from the only option. Giants
+like Amazon and Google and a big crop of startups are pouring billions into alternatives. The book's short list:
+
+| Company | Stage | Flagship product |
+|---|---|---|
+| **AMD** | Public | **MI350 GPU**: a datacenter GPU with competitive specs, running on AMD's own software stack. |
+| **AWS** | Public | **Inferentia** and **Trainium**: a pair of chips built for inference and training, respectively, on AWS. |
+| **Cerebras** | Startup | **WSE-3**: a chip the size of a whole silicon wafer, with extremely high memory bandwidth to remove decode bottlenecks. |
+| **Etched** | Startup | **Sohu**: an <Term def="Application-Specific Integrated Circuit: a chip designed to do one specific job extremely well, rather than general-purpose work.">ASIC</Term> built specifically for the transformer architecture. |
+| **Furiosa** | Startup | **RNGD**: a power-efficient accelerator designed for tensor operations. |
+| **Google** | Public | **TPU** (Tensor Processing Unit): an AI-specific ASIC for inference and training. |
+| **Groq** | Startup | **LPU**: a composable "language processing unit" that relies on SRAM for high memory bandwidth. |
+| **Qualcomm** | Public | **Cloud AI 100 Ultra**: a full-sized accelerator built from multiple power-efficient mobile GPUs. |
+| **SambaNova** | Startup | **RDU**: a Reconfigurable Dataflow Unit with lots of memory for trillion-parameter models. |
+
+### What each one is betting on
+
+GPUs are fairly general-purpose. Each competitor is betting on one specific place where it can win:
+
+- **Memory bandwidth**: Cerebras and Groq get very high tokens-per-second on LLMs by speeding up
+  <Memory>decode</Memory> with ultra-high-bandwidth memory. (Remember: decode is memory-bound.)
+- **Power efficiency**: Furiosa and Qualcomm design chips that use less power, so they're cheaper to operate.
+- **Platform integration**: Amazon and Google tie their chips deeply into their own clouds and their own closed models.
+
+### What they all struggle with
+
+- **Software**: without CUDA (NVIDIA's software platform, covered in Chapter 4), each company has to rebuild the entire
+  inference software stack for its chips.
+- **Manufacturing**: they have to build what the book calls the most complex object humans have ever made.
+- **Distribution**: once a chip exists, it still has to be installed in datacenters and brought online before anyone
+  can use it.
+
+More competition is good for every inference engineer. It speeds up innovation, and it'll only grow as inference gets
+more valuable, including options outside the datacenter entirely.
+
+## Local inference
+
+**Local inference** (also called *edge*, *client-side*, or *on-device* inference) means running the model **directly on
+the user's own device** instead of a server.
+
+<Analogy>
+  Cloud inference is **ordering from a restaurant**: professional kitchen, huge capacity, but you wait for delivery and
+  pay every time. Local inference is **cooking at home**: instant and private, but your kitchen is small and there's
+  only so much you can make.
+</Analogy>
+
+**Four big advantages:**
+
+1. **Zero network latency**: no round trip to a server, saving tens or even hundreds of milliseconds.
+2. **Independence**: works without internet, and doesn't care about server traffic or outages.
+3. **Privacy**: the user's data never leaves their device.
+4. **Cost**: datacenter GPUs are expensive, but on-device inference is free for the developer, which enables new
+   business models.
+
+**Four big weaknesses** (and why most inference still happens in the cloud):
+
+1. **Weak hardware**: even high-end home machines are a fraction of a datacenter GPU.
+2. **Heat**: devices have worse cooling than datacenters, which limits speed further.
+3. **Fragmentation**: endless combinations of hardware and software make it hard to standardize.
+4. **Battery**: inference is demanding and drains laptop and phone batteries fast.
+
+<Note kind="warn">
+  Build for your **real users**. An AI enthusiast might have the newest phone and a powerful computer, but the median
+  user probably has older, weaker devices.
+</Note>
+
+Still, local inference is moving from experiments into production, with a strong ecosystem of hardware and software and
+an active community closely tied to open models.
+
+### Desktop inference
+
+The classic setup is a workstation or gaming PC with one or two high-end NVIDIA or AMD cards. Researchers and
+enthusiasts use these, but they're a small part of the desktop market.
+
+Increasingly, **Apple leads desktop inference**. Apple's M-series chips have the CPU and GPU share one pool of
+<Term def="A single pool of memory shared by the CPU and GPU, instead of separate RAM and VRAM.">unified memory</Term>,
+so the GPU gets access to **far more memory**, but at **slower speeds**. The top machines from each side show the
+trade-off:
+
+| | NVIDIA RTX 5090 | Apple M3 Ultra |
+|---|---|---|
+| Memory | 32 GB | 512 GB |
+| Bandwidth | 1,792 GB/s | 819 GB/s |
+| Cost (full computer) | $5,000 | $10,000 |
+
+<LocalMachines />
+
+The same pattern holds for mid-range machines at more reasonable prices. Low-end machines like Chromebooks can't run
+meaningful local inference at all.
+
+What people run at home:
+
+- **Big open LLMs**: with tools like **Ollama** and **llama.cpp**, it's possible to run heavily quantized models with
+  **100B+ parameters** on high-end personal hardware.
+- **Mixture of Experts models** help a lot here. A single user's request only touches the **active** experts, a
+  fraction of the total weights. (Try the MoE option in the demo above.)
+- **Image generation** is popular on personal computers, especially through **ComfyUI**, a tool for wiring image model
+  components into pipelines.
+- **Smaller LLMs and speech models** run fine on mid-range computers, and browser libraries like **WebLLM** are working
+  to bring this to everyday users.
+
+### Mobile inference
+
+**Phones are where most on-device inference happens today.** Both major platforms give developers tools for it:
+
+- **Android**: Google's **AI Edge SDK** and **ML Kit GenAI APIs**, which work with **Gemini Nano** and open **Gemma**
+  models.
+- **iOS**: Apple's **Foundation Models** and **Core ML** frameworks, with APIs for models across modalities.
+
+Phones have very limited hardware and battery, so this is even harder. **Even high-end phones struggle with models over
+one or two billion parameters.** But some jobs fit well:
+
+- **Transcription and speech synthesis** are latency-sensitive, and some models are small enough to run in real time
+  on modern phones.
+- **Discrete tasks like translation** can be handled by small fine-tuned models.
+
+The future isn't local *or* cloud; it's **both**. Small models and quick requests run on the device, and heavier work
+stays on datacenter GPUs.
+
+<KeyPoints>
+- Alternatives to NVIDIA bet on **memory bandwidth** (Cerebras, Groq), **power efficiency** (Furiosa, Qualcomm), or **cloud
+  integration** (AWS, Google).
+- Their shared hurdles: **software** (no CUDA), **manufacturing**, and **distribution**.
+- **Local inference**: no network delay, works offline, private, free for the developer, but has weak hardware, heat,
+  fragmentation, and battery limits.
+- **Desktops**: NVIDIA = faster memory, Apple = much more memory. Quantization and MoE make 100B+ models possible at home.
+- **Phones**: most on-device inference today, but realistically only models up to about 1–2B parameters.
+</KeyPoints>
+
+<Quiz questions={[
+  {
+    q: "Cerebras and Groq get very high tokens-per-second mainly by…",
+    options: ["Using more power", "Very high memory bandwidth, which speeds up memory-bound decode", "Running on phones"],
+    answer: 1,
+    why: "Decode is limited by memory bandwidth, so chips with ultra-fast memory (like Groq’s SRAM-based LPU) generate tokens faster."
+  },
+  {
+    q: "What’s the biggest shared challenge for NVIDIA’s competitors, according to the book?",
+    options: ["They can’t do matrix math", "Without CUDA they must rebuild the whole software stack", "Their chips are too small"],
+    answer: 1,
+    why: "Software is a huge moat. Competitors have to rebuild the entire inference stack, alongside manufacturing and distribution."
+  },
+  {
+    q: "You want to run a 200B-parameter model at home. Which machine from the book’s table makes more sense?",
+    options: ["RTX 5090 (32 GB, faster memory)", "M3 Ultra (512 GB, slower memory)"],
+    answer: 1,
+    why: "Even at 4-bit, 200B parameters is about 100 GB, far beyond 32 GB. The Mac’s 512 GB unified memory fits it, though it runs slower."
+  },
+  {
+    q: "Which of these is NOT an advantage of local inference?",
+    options: ["No network latency", "Better privacy", "More powerful hardware than the cloud", "Free for the developer"],
+    answer: 2,
+    why: "Local hardware is much weaker than datacenter GPUs, which is the main reason most inference still runs in the cloud."
+  }
+]} />
