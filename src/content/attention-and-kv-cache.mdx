@@ -1,137 +1,394 @@
+import TransformerBlock from "@/components/widgets/TransformerBlock";
+import KVSize from "@/components/widgets/KVSize";
+
 <TLDR>
-  **Attention** is how each word figures out which earlier words matter to it. Done naively it gets much more expensive
-  as text gets longer, so models keep a **KV cache**: a memo pad of their work on earlier tokens, so they never redo
-  it. The cache saves huge amounts of compute, but it eats GPU memory.
+  An LLM is a tall stack of **transformer blocks**. Inside each one, **attention** lets every token work out which
+  earlier tokens matter to it, and a **feed-forward network** holds most of the model’s weights. Attention done naively
+  gets much more expensive as text gets longer, so models keep a **KV cache**, a memo pad of work on earlier tokens.
+  The cache saves enormous compute but eats GPU memory. **Mixture of Experts** models add a twist: only a few slices of
+  the model run for each token.
 </TLDR>
 
-## What's inside an LLM
+## What’s inside an LLM
 
-An LLM is a long stack of identical-looking units called **transformer blocks**, sandwiched between an entry and an
-exit:
+The main body of an LLM is a series of **dozens to hundreds of transformer blocks**. Together with an entry and an exit
+layer, they form one large neural network with three kinds of layers:
 
-1. **Embedding layer** (entry): turns each token ID into a long list of numbers that captures its meaning.
-2. **Transformer blocks** (the middle, dozens to hundreds of them): where the "thinking" happens.
-3. **Output layer / LM head** (exit): turns the final result into a score for every token in the vocabulary.
+1. **Embedding layer** (the input layer): takes token IDs and returns **embeddings**, the vector for each token.
+2. **Transformer blocks** (the hidden layers): where the model does its work and forms its prediction.
+3. **Output layer**, also called the **language modeling head** or **LM head**: converts the final hidden states into
+   a vector of **logits**, one for each token in the vocabulary.
 
-Each transformer block has two main parts:
+<Note kind="beyond">
+  The embedding layer is essentially a lookup table with one row per vocabulary entry. In Llama 3 8B it has 128,256
+  rows of 4,096 numbers each: token ID 42 just means “take row 42.” The LM head does the reverse: a matmul from 4,096
+  numbers to 128,256 logits.
+</Note>
 
-- An **attention** part, where tokens look at each other.
-- A **feed-forward** part, which is plain layers of matmul. This holds *most of the model's weights*.
+### Inside a transformer block
 
-The feed-forward part is the biggest by size, but **attention is the trickiest part for inference**. So let's look
-at it.
+Each transformer block contains **sublayers** for **attention**, a **feed-forward neural network**, and
+**normalization**. The book’s Figure 2.7 reproduces the classic diagram from *“Attention Is All You Need”*: token
+embeddings (plus position information) enter at the bottom, pass through a multi-head attention sublayer and an
+“add & norm” step, then a feed-forward sublayer and another “add & norm,” and this block repeats N times before a final
+linear layer and softmax produce the output probabilities. Click through a modern version of one block:
 
-## Attention: words looking at other words
+<TransformerBlock />
 
-Read this sentence (it's the example the book uses):
+The **feed-forward network** is a **multi-layer perceptron**: the plain linear layers and activation functions from the
+neural networks lesson. The book spells out where the model’s size lives:
 
-> *"I decided to write a book because I thought it would be easy, but **it** was actually hard."*
+- The **linear (feed-forward) sublayers** hold the **majority** of an LLM’s trainable weights.
+- The **attention sublayers** are the **second-largest** component.
+- **Normalization and activation functions** are a rounding error in the model’s size.
 
-What does the second "it" refer to? You instantly know it means *writing the book*. Attention is the mechanism that
-gives models that same ability: for each token, it works out **how much every earlier token matters**.
+<Worked title="Where Llama 3 8B’s 8 billion parameters live">
+  Using the model’s published configuration (hidden size 4,096; 32 blocks; feed-forward size 14,336; 32 query heads
+  and 8 key/value heads of 128 dimensions; vocabulary 128,256):
+
+  1. **Attention, per block**: query and output matrices are 4,096 × 4,096 each (16.8M apiece); key and value
+     matrices are 4,096 × 1,024 each (4.2M apiece). Total ≈ **41.9M**.
+  2. **Feed-forward, per block**: three matrices of 4,096 × 14,336 ≈ **176.2M**.
+  3. **Across 32 blocks**: attention ≈ 1.34B, feed-forward ≈ 5.64B.
+  4. **Embedding layer and LM head**: 128,256 × 4,096 ≈ 0.53B each, so ≈ 1.05B together.
+  5. **Normalization**: about 0.27 million in total. Genuinely a rounding error.
+
+  Grand total ≈ **8.03B**. Feed-forward ≈ **70%**, attention ≈ **17%**, embeddings and head ≈ **13%**, exactly the
+  ordering the book describes.
+</Worked>
+
+<Note kind="beyond">
+  **Residual connections and normalization.** Each sublayer’s output is *added* back onto its input (the “add” in
+  “add & norm”) instead of replacing it, so every block makes an adjustment on top of what came before. This makes very
+  deep stacks trainable. **Normalization** rescales each token’s vector to a steady size so values don’t drift out of
+  range across dozens of blocks. The 2017 design normalized after each sublayer; most modern LLMs normalize before
+  it. Either way, a block’s output has the same shape as its input, which is what lets identical blocks be stacked.
+</Note>
+
+The book’s point is that even though the feed-forward layers are the **biggest**, the **more complex operation for
+inference is attention**. So let’s take it apart.
+
+## Attention: tokens looking at other tokens
+
+**Attention** is the mechanism transformers use to relate a given token to the other tokens in the sequence. Humans do
+this effortlessly when reading. Take the book’s example sentence:
+
+> *“I decided to write a book because I thought it would be easy, but **it** was actually hard.”*
+
+You know instantly that “it” refers to **writing the book**. Attention gives models the same ability: for each token,
+it works out how much every earlier token matters.
 
 <Attention />
 
-Under the hood, attention uses three things for each token. You'll see the letters **Q, K, V** everywhere:
+### The equation, piece by piece
 
-- **Q (query)**: "What am I looking for?" (from the token being worked on right now)
-- **K (key)**: "What do I contain?" (one per earlier token)
-- **V (value)**: "Here's my actual information." (one per earlier token)
+The standard form is **scaled dot-product attention**. The book’s Figure 2.8 shows the equation (adapted from the
+FlashAttention paper):
 
-The model compares the current token's **query** with every earlier **key** to get relevance scores, then blends the
-**values** according to those scores.
+```
+Attention(Q, K, V) = softmax( Q·Kᵀ / √d ) · V
+```
+
+It takes three inputs:
+
+- **Q (queries)**: the embedded representation of the token being generated or updated. Think “what am I looking
+  for?”
+- **K (keys)**: representations of all prior tokens. Think “what does each earlier token contain?”
+- **V (values)**: the information each prior token contributes to the result.
+
+Reading the equation left to right:
+
+1. **`Q·Kᵀ`**: take the **dot product** of the query with every key. A dot product multiplies two vectors position by
+   position and adds up the results; it’s large when the two vectors point in similar directions. The result is one
+   **relevance score** per earlier token.
+2. **`/ √d`**: divide every score by the square root of the vector size *d* (e.g. √128 ≈ 11.3).
+3. **`softmax(…)`**: turn the scores into **weights** that are positive and add up to 1 (the same softmax as token
+   sampling).
+4. **`· V`**: blend the value vectors using those weights. The output is mostly made of the values of the most relevant
+   tokens.
+
+<Note kind="beyond">
+  **Where Q, K and V come from.** Each token’s hidden state is multiplied by three learned weight matrices (W_Q, W_K,
+  W_V) to produce its query, key and value, so they’re just more matmuls. **Why divide by √d?** Dot products of long
+  vectors tend to grow with the vector length; without the scaling, the scores would get so large that softmax would
+  put nearly all the weight on one token, which makes training unstable.
+</Note>
+
+<Worked title="Attention for a three-token sentence">
+  Sentence: “the cat sat.” We’re updating the token **sat**, using tiny 2-dimensional vectors (d = 2) to keep the
+  arithmetic readable:
+
+  ```
+  query for "sat":  q = [1, 0]
+
+  keys:    the = [0, 1]    cat = [2, 1]    sat = [1, 1]
+  values:  the = [1, 0]    cat = [0, 2]    sat = [1, 1]
+  ```
+
+  1. **Scores (dot products)**: the = 1×0 + 0×1 = **0**; cat = 1×2 + 0×1 = **2**; sat = 1×1 + 0×1 = **1**.
+  2. **Scale by √2 ≈ 1.414**: 0, 1.414, 0.707.
+  3. **Softmax**: e⁰ = 1, e^1.414 ≈ 4.11, e^0.707 ≈ 2.03; total ≈ 7.14. Weights: the ≈ **14%**, cat ≈ **58%**,
+     sat ≈ **28%**.
+  4. **Blend the values**: 0.14 × [1, 0] + 0.58 × [0, 2] + 0.28 × [1, 1] ≈ **[0.42, 1.44]**.
+
+  The new vector for “sat” is now mostly built from “cat”: the model has linked the verb to its subject. Real models
+  do exactly this with vectors of 128 numbers per head, over thousands of tokens.
+</Worked>
 
 <Analogy title="Think of it like searching a library">
-  Your **query** is what you type into the search box. Every book's **key** is its title and tags. You compare your
-  query against every key to find what's relevant, then read the **values** (the actual pages) of the best matches.
+  Your **query** is what you type into the search box. Every book’s **key** is its title and tags. You compare your
+  query against every key to decide what’s relevant, then read the **values** (the pages) of the best matches, paying
+  most attention to the best ones.
 </Analogy>
 
-A few more details:
+### Many heads at once
 
-- Models run many attention "searches" side by side, called **heads**. Each head tends to learn a different kind of
-  relationship (e.g. one tracks grammar, another tracks what "it" refers to).
-- LLMs use **self-attention** with a *causal mask*: a token can only look **backward**, never ahead.
-- Image models also use **cross-attention**, where the picture being generated looks at the *text prompt*.
+Attention sublayers are **multi-head**: each **head** is one independent attention operation, and the heads sit
+**side by side on the same sublayer**, running in parallel. Each head can specialize in a different kind of
+relationship between tokens. The book gives two examples: **subject–verb agreement** (matching “the dogs” with
+“bark”) and **co-reference resolution** (working out what “it” refers to).
+
+<Note kind="beyond">
+  In Llama 3 8B, each attention sublayer has 32 heads of 128 dimensions (32 × 128 = 4,096, the model’s hidden size).
+  Many modern models also use **grouped-query attention**: several query heads share one key/value head. Llama 3 8B
+  has 32 query heads but only 8 key/value heads, and Qwen3-235B-A22B has 64 and 4. Fewer key/value heads means fewer
+  keys and values to store, which shrinks the KV cache you’ll meet below.
+</Note>
+
+### Self-attention, cross-attention, and the causal mask
+
+There are two main types:
+
+- **Self-attention**: Q, K and V all come from the **same sequence**.
+- **Cross-attention**: Q comes from a **different sequence** than K and V, which **conditions** the queries on outside
+  information.
+
+LLMs use **self-attention with a causal mask**, which stops any token from looking **ahead** in the sequence. Image
+generation and multimodal models also use **cross-attention**, for example between the image being generated and the
+text prompt that describes it.
+
+<Note kind="beyond">
+  **How the causal mask works.** Before the softmax, every score for a *future* position is replaced with negative
+  infinity. Since e^(−∞) = 0, those tokens get exactly zero weight. For three tokens the pattern of allowed
+  comparisons is a triangle:
+
+  ```text
+             the   cat   sat
+  the   →     ✓     ✗     ✗
+  cat   →     ✓     ✓     ✗
+  sat   →     ✓     ✓     ✓
+  ```
+
+  This matters for training (the model can’t cheat by peeking at the answer) and for inference (each token’s keys and
+  values never change once computed, which is exactly what makes the KV cache possible).
+</Note>
 
 ## The problem: attention gets expensive fast
 
-Every token compares itself to every token before it. So for a sequence of N tokens, the total number of comparisons
-grows like **N²** (*quadratic*). Double the text and you do roughly four times the work.
+Because attention compares the current token with **every previous token**, it is a **quadratic-time** algorithm with
+respect to sequence length. The book puts it simply: **as context expands, attention slows.**
 
-But look closely at *decode*. When generating token #1,001, the keys and values for tokens #1 to #1,000 are exactly the
-same as they were one step earlier. Recomputing them would be pure waste.
+<Worked title="How fast quadratic grows">
+  With a causal mask, a sequence of N tokens needs about N × (N + 1) ÷ 2 query–key comparisons, per head, per layer.
+
+  1. N = 1,000 → about **500,000** comparisons.
+  2. N = 8,000 → about **32 million** comparisons.
+  3. The sequence got 8× longer; the work got about **64×** larger (8²).
+</Worked>
 
 ## The fix: the KV cache
 
-So models **save the K and V for every token** the first time they're computed, and simply look them up afterwards.
-That saved store is the **KV cache**.
+Look closely at decode. When the model generates token #1,001, the keys and values for tokens #1 to #1,000 are
+**exactly the same** as they were one step earlier (the causal mask guarantees earlier tokens never change based on
+later ones). Recomputing them every step would be pure waste.
+
+So attention implementations keep a **KV cache**: a store of the **key and value vectors for every previous token**.
+The book calls it a standard component of any attention implementation. By **looking up** past keys and values instead
+of recomputing them, attention during decode runs in **linear** time instead of quadratic.
+
+Here’s precisely what changes for each new token:
+
+- **Without a cache**: recompute keys and values for every earlier token and redo attention across the whole sequence.
+  The work for a single new token grows with the **square** of the length.
+- **With a cache**: compute the query, key and value for **only the new token**, store its key and value, and compare
+  its one query against all the cached keys. The work for a single new token grows **in proportion** to the length.
 
 <KVCache />
 
-- It's **built during prefill** (for all the prompt tokens at once).
-- It's **read and extended during decode** (one new entry per generated token).
+The lifecycle of the KV cache:
+
+- It’s **built during prefill**, for all the prompt tokens at once.
+- It’s **used and extended during decode**, one new entry per generated token.
 - It lives in **GPU memory** by default.
 
-With the cache, each new token only needs its *own* K and V computed, and attention during decode becomes linear
-instead of quadratic.
+### The catch: it’s big
+
+<Worked title="Sizing a real KV cache">
+  For each token, the cache stores a key and a value, for every layer and every key/value head:
+
+  ```
+  bytes per token = 2 (K and V) × layers × KV heads × head size × bytes per number
+  ```
+
+  For Llama 3 8B in 16-bit precision:
+
+  1. Per token: 2 × 32 × 8 × 128 × 2 bytes = 131,072 bytes = **128 KiB**.
+  2. One 8,000-token conversation: 131,072 × 8,000 ≈ **1.05 GB**.
+  3. Thirty-two such conversations at once: ≈ **33.6 GB**, more than **twice** the model’s own 16 GB of weights.
+</Worked>
+
+Try other models and workloads:
+
+<KVSize />
 
 <Note kind="warn">
-  There's no free lunch. The KV cache **grows with every token, for every user**. With long conversations and many
-  users, it can take up more GPU memory than the model itself. Managing it (where to store it, when to reuse it, how
-  to share it) is one of the biggest topics in inference. Chapter 5 is all about it.
+  The KV cache **grows with every token, for every user**. With long conversations and many users, it can take more GPU
+  memory than the model itself. Storing, accessing and reusing it is one of the biggest topics in inference; the
+  caching lesson in Chapter 5 is devoted to it.
 </Note>
 
 ## Mixture of Experts (MoE)
 
-One more architecture you'll hear constantly. In a normal (**dense**) model, every weight is used for every token. A
-**Mixture of Experts** model instead splits the big feed-forward layers into many smaller pieces called **experts**,
-and a tiny **router** picks just a few experts per token, per layer.
+The **density** of a neural network is determined by the number of connections between its layers. The trade-off:
 
-For example, *Qwen3-235B-A22B* has **235B** parameters in total, but only **22B** are *active* for any given token. At
-each of its 94 layers, the router picks 8 of 128 experts.
+- **Denser** networks retain more information.
+- **Sparser** networks take less compute and memory to run.
+
+**Mixture of Experts** is an architecture optimization that adds **sparsity** to the linear layers. Instead of one
+giant feed-forward matrix, an MoE model has **many smaller matrices**, called **experts**, and sends each input to a
+small selection of them. Choosing those experts is called **activating** them.
+
+The book’s example is **Qwen3-235B-A22B**: it has **235 billion** parameters in total, but only **22 billion** are
+active for any given token (that’s what “A22B” in the name means).
+
+### Routing happens per token, per layer
+
+Expert routing is **granular**. Remember that each forward pass generates one token by working through **every layer**
+of the model. At **each layer**, a **router** (a tiny model inside the LLM) picks which experts to activate for that
+token. In Qwen3-235B-A22B there are **128 experts** per layer, and the router picks **8** of them, at **each of its 94
+layers**, for **every token** generated.
+
+<Worked title="Counting experts in Qwen3-235B-A22B">
+  1. Experts in the whole model: 94 layers × 128 = **12,032**.
+  2. Experts used for one token: 94 × 8 = **752** separate choices, one set of 8 per layer.
+  3. Share of experts used per token: 8 ÷ 128 = **6.25%**.
+  4. Share of parameters active per token: 22B ÷ 235B ≈ **9.4%**. That’s higher than 6.25% because some parts, like
+     attention, embeddings and the router itself, run for every token regardless.
+</Worked>
 
 <MoE />
 
-That sounds like a free 10× speedup, and for a **single user** on a laptop, it nearly is. But notice what happens when
-you press *Show whole batch*: on a busy server, different tokens want different experts, so **almost all the experts
-end up in use anyway**. Getting the savings back at scale takes a special technique called *expert parallelism*
-(Chapter 5).
+### Great for one user, less so for a busy server
 
-MoE is popular for very large models (100B+). Small models (especially under ~30B) usually stay dense.
+Because so few parameters are active, MoE models are **highly efficient for single-request local inference**: each
+token only touches a fraction of the weights. But on a production server with **batched** inference, **different
+requests activate different experts**. The book’s warning: expect **almost all** of the model’s parameters to be active
+at any given moment, unless sparsity is recovered with large-scale **Expert Parallelism** (Chapter 5).
+
+<Worked title="Why a batch wakes up nearly every expert">
+  A simplified model: at one layer, each token picks 8 of 128 experts, and suppose choices were random and independent.
+
+  1. Chance a given expert is **not** picked by one token: 1 − 8 ÷ 128 = 0.9375.
+  2. Chance it’s unused by a batch of 16 tokens: 0.9375¹⁶ ≈ 0.36, so about **64%** of experts are busy.
+  3. For a batch of 64 tokens: 0.9375⁶⁴ ≈ 0.016, so about **98%** are busy.
+
+  Real routing isn’t uniformly random (some experts are more popular), but the conclusion holds: a busy server has to
+  pull nearly all the experts’ weights through memory at every step.
+</Worked>
+
+<Note kind="beyond">
+  **Sparsity saves compute, not memory.** Every expert must be loaded in GPU memory, because any token might pick any
+  expert. Qwen3-235B-A22B does roughly the arithmetic of a 22B model per token, but still needs room for all 235B
+  parameters: about 470 GB at 16 bits per number.
+</Note>
+
+### When MoE is used
+
+- MoE is especially popular for **large models above 100B parameters**, though there are MoE models as small as **20
+  to 30 billion**.
+- It unlocks a form of parallelism called **Expert Parallelism**, which enables high-throughput inference for large
+  models across many GPUs. The book’s Figure 2.9 shows an MoE model spread across GPUs, with some components
+  **sharded** (divided among GPUs) and others **replicated** (copied to each); Chapter 5 explains the details.
+- Models **under 32B**, and especially **under 8B**, tend to use **dense** architectures efficiently.
+- **Domain-specific** models, such as those for tab completion, gain little from MoE: the entire model is effectively
+  one expert.
 
 <KeyPoints>
-- LLM = embedding layer → many **transformer blocks** (attention + feed-forward) → output layer.
-- **Attention** lets each token weigh every earlier token using **queries, keys, and values**.
-- Naive attention is **quadratic** in sequence length. The **KV cache** saves past K/V so decode doesn't redo work.
-- The KV cache trades compute for **GPU memory**, and that memory is often the scarce resource.
-- **MoE** models activate only a few experts per token. Great for one user, less so in big batches.
+- LLM = **embedding layer** → dozens to hundreds of **transformer blocks** → **LM head** producing logits.
+- A block = **attention** + **feed-forward** + **normalization**. Feed-forward holds most weights (~70% in Llama 3 8B), attention is second, norms are negligible.
+- **Attention** = softmax(Q·Kᵀ/√d)·V: score every earlier token, turn scores into weights, blend their values. **Multi-head** runs many in parallel.
+- LLMs use **self-attention with a causal mask**; image and multimodal models also use **cross-attention**.
+- Naive attention is **quadratic** in length. The **KV cache** stores past keys/values so each new token costs **linear** work, at the price of lots of **GPU memory** (128 KiB per token for Llama 3 8B).
+- **MoE** activates a few experts per token, per layer (8 of 128 × 94 layers in Qwen3-235B-A22B). Efficient for one user; batches wake nearly every expert; all experts still need memory.
 </KeyPoints>
 
 <Quiz questions={[
   {
     q: "Where does most of an LLM’s weight (size) live?",
-    options: ["The attention layers", "The feed-forward layers", "The tokenizer"],
+    options: ["The attention sublayers", "The feed-forward (linear) sublayers", "The normalization layers", "The tokenizer"],
     answer: 1,
-    why: "The feed-forward (plain matmul) layers hold most of the weights. Attention is second, and the tokenizer isn’t even a neural network."
+    why: "The feed-forward sublayers hold the majority of weights (about 70% in Llama 3 8B). Attention is second, normalization is a rounding error, and the tokenizer isn’t a neural network at all."
   },
   {
-    q: "What does the KV cache store?",
+    q: "In softmax(Q·Kᵀ/√d)·V, what does Q·Kᵀ produce?",
     options: [
-      "The user’s chat history as text",
-      "The keys and values computed for previous tokens",
-      "A copy of the model weights"
+      "One relevance score for each earlier token, from the dot product of the query with that token’s key",
+      "The final output vector",
+      "The list of tokens in the vocabulary",
+      "The model’s weights"
     ],
-    answer: 1,
-    why: "It stores each earlier token’s K and V so that decode steps can look them up instead of recomputing them."
+    answer: 0,
+    why: "Each dot product measures how well the current token’s query matches an earlier token’s key. Softmax then turns those scores into weights for blending the values."
   },
   {
-    q: "An MoE model activates 10% of its parameters per token. On a busy server with large batches, what usually happens?",
+    q: "What does the causal mask do in an LLM?",
+    options: [
+      "Prevents each token from attending to tokens that come after it",
+      "Hides the prompt from the model",
+      "Removes the KV cache",
+      "Chooses which experts to activate"
+    ],
+    answer: 0,
+    why: "Scores for future positions are set to negative infinity before softmax, so they get zero weight. That’s also why earlier tokens’ keys and values never change and can be cached."
+  },
+  {
+    q: "A model has 32 layers, 8 KV heads, a head size of 128, and stores its KV cache in 16-bit (2-byte) numbers. How much KV cache does each token need?",
+    options: ["About 8 KiB", "128 KiB", "About 4 MiB", "1 byte"],
+    answer: 1,
+    why: "2 (K and V) × 32 × 8 × 128 × 2 bytes = 131,072 bytes = 128 KiB. At 8,000 tokens that’s about 1 GB per conversation."
+  },
+  {
+    q: "A conversation grows from 1,000 to 2,000 tokens. With a KV cache, roughly how does the attention work for generating one more token change?",
+    options: ["About 2× (linear)", "About 4× (quadratic)", "It stays the same", "About 8×"],
+    answer: 0,
+    why: "With the cache, the new token’s one query is compared against every cached key, so the work grows in proportion to the length. Without the cache, it would grow with the square."
+  },
+  {
+    q: "In Qwen3-235B-A22B (128 experts per layer, 8 chosen per layer, 94 layers), how many expert selections are made to generate a single token?",
+    options: ["8", "128", "752", "12,032"],
+    answer: 2,
+    why: "The router picks 8 experts at each of the 94 layers: 94 × 8 = 752. (12,032 is the total number of experts in the model.)"
+  },
+  {
+    q: "An MoE model activates about 10% of its parameters per token. On a busy server with large batches, what usually happens?",
     options: [
       "It runs 10× faster than a dense model of the same total size",
       "Different requests use different experts, so most of the model ends up active anyway",
+      "It needs only 10% of the memory",
       "The router stops working"
     ],
     answer: 1,
-    why: "In a batch, each token picks its own experts, so together they tend to wake up nearly all of them. Big savings need expert parallelism."
+    why: "Each token picks its own experts, so a batch together wakes up nearly all of them. And memory never shrinks: every expert must be loaded because any token might choose it."
+  },
+  {
+    q: "Where would you expect cross-attention?",
+    options: [
+      "In an image generator, where the image being generated attends to the text prompt",
+      "In an LLM’s tokenizer",
+      "In a KV cache lookup",
+      "Nowhere; modern models only use self-attention"
+    ],
+    answer: 0,
+    why: "Cross-attention conditions one sequence (the image) on another (the prompt). LLMs themselves use self-attention with a causal mask."
   }
 ]} />

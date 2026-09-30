@@ -1,113 +1,349 @@
+import PagedKV from "@/components/widgets/PagedKV";
+
 <TLDR>
-  Attention is one of the most expensive parts of any model. There are two ways to make it cheaper: **implement the
-  same math more cleverly** (FlashAttention, PagedAttention; no quality loss) or **use a cheaper kind of attention**
-  (sliding windows, linear attention, and friends; small quality trade-offs).
+  Attention is one of the most expensive parts of inference in every kind of model, and it’s delicate, because every
+  token depends on every earlier one. There are two ways to make it cheaper. **Implement the same math better**
+  (FlashAttention, PagedAttention): lossless, but still quadratic. Or **use a cheaper kind of attention** (sliding
+  window, gated, linear, compressed, multi-latent): better scaling, with a quality trade-off that training can shrink.
+  A third path skips attention entirely (state-space models like Mamba), usually mixed with transformer layers.
 </TLDR>
 
-## Why attention needs special care
+## Why attention is the target
 
-Even with the KV cache, attention stays expensive, especially as prompts get long. It's also **delicate**: every
-token depends on every earlier token, so small errors in attention can snowball through the whole output. Optimizing
-it is both valuable and risky, which is why so much research goes into it.
+For LLMs, attention **scales quadratically with the length of the input sequence**. Every attention calculation
+depends on the K and V values of every previous token, so the number of query–key comparisons grows with the square of
+the sequence length.
 
-There are two families of fixes:
+<Worked title="What “quadratic” means in numbers">
 
-| Approach | Example | Quality impact |
-|---|---|---|
-| **Better implementation** of the same math | FlashAttention, PagedAttention | None (exact same result) |
-| **A different, cheaper algorithm** | Sliding window, linear attention | Small, and reduced if the model is trained for it |
+With causal attention, token 1 compares against 1 token, token 2 against 2, and so on, so a sequence of *N* tokens
+needs 1 + 2 + … + *N* = *N*(*N* + 1) ÷ 2 comparisons (per head, per layer).
 
-## Fix #1: FlashAttention (fewer trips to memory)
+1. *N* = 4,096: 4,096 × 4,097 ÷ 2 ≈ **8.39 million** comparisons.
+2. *N* = 8,192: 8,192 × 8,193 ÷ 2 ≈ **33.6 million** comparisons.
+3. Ratio: 33.6 ÷ 8.39 ≈ **4.0×**. **Double the length, quadruple the work.** Ten times the length, a hundred times
+   the work.
 
-Recall from the last lesson that moving data is often the real bottleneck. The straightforward way of computing
-attention creates big in-between tables (called S and P), **writes them out to slow GPU memory, then immediately reads
-them back in**. That's a lot of pointless trips for the waiter.
+</Worked>
+
+In practice, attention during decode is a **linear-time operation**, thanks to the KV cache: it stores the results of
+the key and value computations for previous tokens, so each new token only needs to compare its one query against the
+stored keys.
+
+<Note kind="beyond">
+
+**Linear per step, quadratic in total.** The KV cache makes each decode step linear in the current length: one query
+against *N* cached keys. But generating a long sequence still adds those steps up: 1 + 2 + … + *N* again, so the total
+work for a whole generation is still quadratic. Without the cache it would be far worse, because every step would
+recompute keys and values for the entire sequence so far. The cache removes that redundancy; it doesn’t make long
+contexts free.
+
+</Note>
+
+But the book’s point is that **even a linearly scaling algorithm gets very expensive**, and attention remains one of the
+most expensive parts of inference across models and architectures. So optimizing it is an important and highly active
+research area.
+
+### Why it’s delicate
+
+Attention is also **sensitive**. Each token depends on every previous token, so **small errors in attention can
+accumulate quickly** as they propagate through the sequence and through the layers. Optimizing attention is valuable,
+but it has to be done carefully: a shortcut that’s slightly wrong for one token can become badly wrong a thousand tokens
+later.
+
+## The waste in the basic algorithm
+
+The [previous lesson](/learn/bottlenecks) walked through the standard three-line attention algorithm:
+
+```
+1. Load Q and K.   Compute S = Q·Kᵀ.        Write S.
+2. Load S.         Compute P = softmax(S).  Write P.
+3. Load P and V.   Compute O = P·V.         Write O.
+```
+
+The algorithm itself is straightforward, but the book points out that this **basic implementation is inefficient**:
+the intermediate matrices S and P are **stored at the end of one step, then immediately loaded again in the next**.
+
+<Worked title="How much of the traffic is waste? (the book’s example, continued)">
+
+With N = 4,096, d = 128 in FP16 (from the previous lesson):
+
+1. Total memory traffic: **132 MiB**.
+2. S written (32 MiB) + S read (32) + P written (32) + P read (32) = **128 MiB**.
+3. Useful traffic (read Q, K, V; write O): 1 + 1 + 1 + 1 = **4 MiB**.
+4. So about **97%** of the memory traffic is the intermediate matrices making a round trip to GPU memory.
+
+That round trip is why the standard algorithm ended up memory-bound at an arithmetic intensity of about 62. Remove it,
+and the same 8.59 GFLOPs of math need only about 4 MiB of traffic: roughly **2,048 FLOPs per byte**, well past the H100’s
+ops:byte ratio of 295.
+
+</Worked>
+
+## Two strategies
+
+The book divides attention optimization into two strategies:
+
+| Strategy | What it means | Quality | Scaling |
+|---|---|---|---|
+| **Implementation improvements** | Write higher-performance kernels that use memory and compute more efficiently | **Lossless**: exactly the same result | Still quadratic, but makes long sequences feasible on today’s hardware |
+| **New algorithms** | Create attention variants that scale better than quadratic | Trades some quality for time and space; training can minimize the impact | Better than quadratic |
+
+## FlashAttention: the same math, far fewer trips
+
+The most famous implementation of attention is the **FlashAttention** series of papers and kernels (by Tri Dao and
+colleagues). The contrast with the basic algorithm is striking: the basic version can be written in a handful of lines
+of code, while FlashAttention uses **tens of thousands of lines** to implement attention as **hand-fused kernels built for
+specific GPUs**. FlashAttention for the H100 uses different code than FlashAttention for the B200. (In the book’s
+glossary: FlashAttention 3 is written for Hopper, FlashAttention 4 targets Blackwell.)
+
+FlashAttention works by **eliminating excess reads and writes from memory** and **laying out the attention algorithm to
+precisely fit the GPU’s capabilities**.
 
 <FlashCompare />
 
-**FlashAttention** reorganizes the work into small tiles that fit in the GPU's tiny-but-fast on-chip memory, and does
-all the steps there before writing only the final answer out. Same math, same answer, far less memory traffic. It's
-hand-written for each GPU generation (the H100 version differs from the B200 version) and runs to tens of thousands of
-lines of code. It helps most with **compute-heavy** work like LLM prefill and video generation.
+Because it attacks memory traffic and keeps the math units fed, FlashAttention is **especially useful for compute-bound
+operations** like LLM prefill and video generation: the cases where the full score matrix is large and there’s a lot of
+math to organize.
 
 <Analogy>
-  Instead of carrying each ingredient to the counter, walking it back to the fridge, then fetching it again for the
-  next step, the chef keeps a small tray of everything needed **right at the stove** and finishes the whole dish
-  before putting anything away.
+  Instead of carrying each ingredient to the counter, walking it back to the storeroom, then fetching it again for the
+  next step, the chef keeps a small tray of exactly what’s needed **right at the stove**, finishes the whole dish, and
+  only then puts the result away. Same recipe, same dish, far fewer trips.
 </Analogy>
 
-## Fix #2: PagedAttention (smarter memory layout)
+<Note kind="beyond">
 
-KV caches get big, and they grow unpredictably, because you don't know how long an answer will be. Reserving one big
-continuous chunk of memory per request wastes a lot of space.
+**How FlashAttention avoids storing S and P.** Two ideas make it work:
 
-**PagedAttention** splits the KV cache into small fixed-size **pages** and keeps a lookup table of where each page
-lives, so the cache can be scattered around GPU memory wherever there's room. It's the same trick your computer's
-operating system uses for RAM, and it lets many more requests fit on one GPU. It's a big reason the **vLLM** engine
-became popular.
+1. **Tiling.** A GPU has a large but relatively slow main memory (HBM, tens of gigabytes) and a tiny but very fast
+   on-chip memory (SRAM, a few hundred kilobytes per streaming multiprocessor). FlashAttention splits Q, K and V into
+   small blocks that fit in SRAM, and computes a block of scores, their softmax, and their contribution to the output
+   all on-chip. The full 4,096 × 4,096 matrices never exist in HBM.
+2. **Online softmax.** Softmax normally needs the whole row of scores (for the maximum and the total). FlashAttention
+   instead keeps a **running maximum** and **running sum** as each block arrives, and rescales what it has so far
+   whenever a bigger maximum shows up. The final result is mathematically identical.
+
+This is also an example of **kernel fusion** (three steps merged into one kernel), covered in
+[CUDA and kernels](/learn/cuda-and-kernels).
+
+</Note>
+
+<Worked title="Online softmax on a tiny example">
+
+Suppose a row of scores arrives in two blocks: first [1, 2], then [3]. The softmax denominator is the sum of
+*e*^(score − max).
+
+1. **All at once** (standard): max = 3. Sum = *e*^(1−3) + *e*^(2−3) + *e*^(3−3) = 0.1353 + 0.3679 + 1 = **1.5032**.
+2. **Block 1 only** (online): running max = 2. Running sum = *e*^(1−2) + *e*^(2−2) = 0.3679 + 1 = 1.3679.
+3. **Block 2 arrives** with a new max of 3. Rescale the old sum by *e*^(2−3) = 0.3679: 1.3679 × 0.3679 = 0.5032. Then add
+   *e*^(3−3) = 1. Running sum = **1.5032**.
+
+Same answer, but the online version never needed the whole row at once. That’s what lets FlashAttention process
+attention tile by tile without ever writing the score matrix to memory.
+
+</Worked>
+
+## PagedAttention: fitting the KV cache into memory
+
+The second important implementation is **PagedAttention**. The problem it solves: **KV caches quickly grow large**,
+filling GPU memory and taking time to read. Worse, you don’t know in advance how long each request will run, so if
+every request’s KV cache must live in a **single contiguous block** of memory, the system has to reserve room for the
+worst case.
+
+PagedAttention **partitions the KV cache into fixed-size blocks (pages)** that are found through a **lookup table**. A
+request’s KV cache can then be stored across the GPU in **fragmented memory**, wherever free blocks happen to be, instead
+of needing one continuous chunk.
+
+<PagedKV />
 
 <Analogy title="Think of it like a parking lot">
-  Without paging, every group of cars must park in one continuous row, so you end up with lots of gaps that are too
-  small for anyone. With paging, each car just takes any free spot, and a list at the gate says where everyone is.
+  Without paging, every group of cars must park in one continuous row, reserved for the biggest group that might show
+  up, so rows sit half-empty and the lot looks full. With paging, each car takes any free spot, and a list at the gate
+  says where everyone is.
 </Analogy>
 
-## Fix #3: cheaper kinds of attention
+<Worked title="How much memory contiguous allocation wastes (illustrative)">
 
-FlashAttention and PagedAttention make attention *faster*, but it's still fundamentally **quadratic**: double the
-length, roughly 4× the work. The other approach is to change the algorithm itself:
+Suppose an engine must reserve room for up to 2,048 tokens per request, but requests actually average 400 tokens.
+
+1. **Contiguous**: each request holds a 2,048-token slot but fills 400 of it. Utilization = 400 ÷ 2,048 ≈ **20%**. About
+   four-fifths of the KV cache memory is reserved but empty.
+2. **Paged with 16-token blocks**: a request only ever holds whole blocks it has started filling, so it wastes at most 15
+   token slots (on average about 7.5). Utilization ≈ 400 ÷ 407.5 ≈ **98%**.
+3. Since KV cache memory is what limits how many requests can run at once, that difference translates almost directly
+   into **several times more concurrent requests** on the same GPU, and therefore higher throughput.
+
+</Worked>
+
+<Note kind="beyond">
+
+PagedAttention was introduced with the **vLLM** engine (“Efficient Memory Management for Large Language Model Serving
+with PagedAttention,” Kwon et al., 2023, which is in the book’s reading list). The idea is borrowed from how operating
+systems manage RAM with **virtual memory**: each sequence has a *block table* mapping its logical token positions to
+physical blocks, the way a process’s page table maps virtual addresses to physical memory. vLLM’s default block holds
+16 tokens. Because blocks are referenced through a table, two sequences that share a prefix can point at the **same
+physical blocks** instead of storing duplicate copies, which is the foundation of the prefix caching covered in
+[Caching](/learn/caching).
+
+</Note>
+
+## New algorithms: making attention better than quadratic
+
+FlashAttention and PagedAttention are valuable, but they **don’t change the fact that attention is a quadratic
+algorithm**. The second strategy changes the algorithm itself. The book lists five families:
+
+- **Sliding window attention.** Each token computes attention only over a sliding window of the previous *w* tokens,
+  turning attention from O(*N*²) into O(*N*·*w*). The window *w* is often in the range of **8K to 32K** tokens.
+- **Gated attention.** Various types of layers, introduced during training, allow the model to **approximate attention
+  for certain chunks of context in linear time** with respect to the chunk length.
+- **Linear attention.** Replaces the quadratic softmax equation with a **linear-time algorithm that approximates**
+  attention.
+- **Compressed attention.** Periodically **compresses context from earlier in the sequence**. Attention then considers
+  both the compressed older context and the uncompressed recent tokens.
+- **Multi-latent attention.** Approximates attention in a **low-dimensional latent space**.
 
 <AttentionPatterns />
 
-- **Sliding window attention**: each token only looks at the last *w* tokens (often 8K–32K), so work grows linearly.
-- **Linear attention**: replaces the expensive core formula with a cheaper approximation.
-- **Compressed attention**: periodically squashes older context into a summary, then attends to the summary plus the
-  recent tokens.
-- **Multi-latent attention**: does the attention work in a smaller compressed space (used by DeepSeek models).
-- **Gated attention**: special layers that approximate attention over chunks of context in linear time.
+<Worked title="How much sliding windows save on a 128K-token context">
 
-The intuition is that **nearby words usually matter more than distant ones**. The sentence you're reading depends a
-lot on the previous sentence and much less on the first line of this page. When models are *trained* with these
-tricks, they learn to cope, and quality stays high.
+For *N* = 131,072 tokens (128K), count query–key comparisons per head per layer.
 
-## Beyond transformers
+1. **Full causal attention**: *N*(*N* + 1) ÷ 2 ≈ **8.59 billion**.
+2. **Sliding window, *w* = 8,192**: the first 8,192 tokens see everything before them (≈ 33.6 million comparisons); every
+   later token sees exactly 8,192: 122,880 × 8,192 ≈ 1.007 billion. Total ≈ **1.04 billion**, about **8.3× less**.
+3. **Sliding window, *w* = 32,768**: ≈ 0.54 billion + 98,304 × 32,768 ≈ 3.22 billion = ≈ **3.76 billion**, about **2.3×
+   less**.
 
-Some researchers skip attention entirely. **Mamba** is a *state-space model* that keeps a running summary instead of
-comparing against every past token, so it scales linearly. Pure versions are still rare, but **hybrid** models that mix
-Mamba-style blocks with regular transformer blocks are catching on (for example, NVIDIA's Nemotron 3 Nano).
+The savings grow as contexts get longer: with a fixed window, work grows in a straight line with *N*, while full
+attention keeps growing with *N*².
+
+</Worked>
+
+<Note kind="beyond">
+
+A few details about these variants that the book doesn’t spell out:
+
+- **Sliding windows also cap the KV cache.** A pure sliding-window layer only ever needs the last *w* tokens’ keys and
+  values, so its KV cache stops growing once the context passes *w*. The catch is that information from further back
+  has to reach the current token indirectly, through the layers. Several recent open models (Google’s Gemma family,
+  for example) interleave sliding-window layers with a smaller number of full-attention layers to get most of the
+  savings while keeping long-range recall.
+- **Why linear attention is linear.** Standard attention computes softmax(Q·Kᵀ)·V, and the N × N matrix Q·Kᵀ is the
+  quadratic part. If the softmax is replaced by a simpler function applied to Q and K separately, matrix multiplication
+  can be regrouped as Q·(Kᵀ·V). Kᵀ·V is only d × d, no matter how long the sequence is. The price is that it’s an
+  approximation of softmax attention.
+- **Multi-latent attention** is DeepSeek’s design (used in DeepSeek V2 and V3). It compresses each token’s keys and
+  values into a small latent vector, which dramatically shrinks the KV cache that has to be stored and read during
+  decode.
+
+</Note>
+
+### Why approximations can work: locality
+
+The intuition behind these algorithms is that **tokens near each other in a sequence affect each other more than tokens
+from much earlier**. The book’s own example: the sentence it’s writing follows closely from the previous sentence, but
+much less so from the sentence at the start of the chapter.
+
+That intuition can be **built into the model through training**. When an algorithm like sliding window attention is
+applied during training, the model learns to work within that constraint, and it **keeps quality high when the same
+technique is used during inference**. That’s the important distinction from implementation improvements: these
+algorithms are generally part of how a model is *trained*, not a switch you can flip on any existing model.
+
+## Avoiding attention altogether: state-space models
+
+Another avenue of research is to avoid attention entirely by using a different architecture than transformers.
+**Mamba** is a *selective state-space model* that **replaces self-attention with a recurrent state update**: instead of
+comparing each new token against every previous one, it updates a running internal state, which scales **linearly
+with sequence length**.
+
+Pure state-space models still have limited applications, but **hybrid models**, which mix Mamba-style state-space
+blocks with transformer blocks, are becoming more popular. The book’s example is **NVIDIA Nemotron 3 Nano**, an open
+model that adopts a hybrid architecture.
+
+<Note kind="beyond">
+  The appeal for inference is memory: a state-space layer keeps a **fixed-size state** no matter how long the
+  sequence gets, so it has no growing KV cache. The trade-off is that a fixed-size summary can’t hold every detail of
+  a long context the way attention can look back at every token exactly, which is one reason hybrids keep some
+  attention layers.
+</Note>
+
+## Choosing among the options
+
+| Approach | Type | Lossless? | What it saves |
+|---|---|---|---|
+| FlashAttention | Implementation | Yes | Memory traffic (S and P never leave the chip), which speeds up compute-bound attention |
+| PagedAttention | Implementation | Yes | Wasted KV cache memory, so more requests fit at once |
+| Sliding window | Algorithm (trained in) | No | Compute *and* KV cache size for long contexts |
+| Gated, linear, compressed attention | Algorithm (trained in) | No | Compute for long contexts |
+| Multi-latent attention | Algorithm (trained in) | No | KV cache size |
+| State-space / hybrid models | Different architecture | n/a | Compute and memory growth with length |
+
+As an inference engineer, you’ll usually *use* the first two directly (every serious engine ships FlashAttention-style
+kernels and paged KV caches), and *inherit* the rest from whichever model architecture you choose to serve.
 
 <KeyPoints>
-- Attention is expensive *and* delicate, so it's a top optimization target.
-- **FlashAttention**: same math, done in fast on-chip memory, with far fewer slow memory trips. Lossless.
-- **PagedAttention**: stores the KV cache in small pages so memory isn't wasted. Lossless.
-- **Sliding window / linear / compressed / multi-latent**: cheaper algorithms that trade a bit of quality for scaling.
-- **State-space models** like Mamba avoid attention altogether, often in hybrids.
+- Attention is **quadratic** in sequence length (double the length, ~4× the work). The KV cache makes each decode step linear, but long contexts stay expensive.
+- Attention is **delicate**: errors accumulate because every token depends on every earlier one.
+- The basic algorithm writes S and P to memory and reads them straight back: **~97%** of its traffic in the book’s example.
+- **FlashAttention**: hand-fused, GPU-specific kernels that keep the work on-chip. Lossless. Especially good for compute-bound prefill and video.
+- **PagedAttention**: stores the KV cache in fixed-size pages found through a lookup table, so it can live in fragmented memory. Lossless.
+- **Sliding window, gated, linear, compressed, multi-latent**: better-than-quadratic algorithms that trade some quality; training them in keeps quality high.
+- **State-space models** like Mamba replace attention with a recurrent state update; hybrids (e.g. Nemotron 3 Nano) are growing.
 </KeyPoints>
 
 <Quiz questions={[
   {
-    q: "Does FlashAttention change the model’s output?",
-    options: ["Yes, it’s an approximation", "No, it computes exactly the same result, just with fewer memory trips"],
+    q: "A prompt grows from 10,000 to 30,000 tokens. Roughly how much more work does full attention do during prefill?",
+    options: ["3×", "9×", "30×"],
     answer: 1,
-    why: "It’s an implementation improvement: identical math, reorganized to avoid writing and re-reading the big intermediate matrices."
+    why: "Attention is quadratic: tripling the length multiplies the comparisons by about 3² = 9."
+  },
+  {
+    q: "Does FlashAttention change the model’s output?",
+    options: ["Yes, it’s an approximation", "No, it computes exactly the same result, just with far fewer memory trips"],
+    answer: 1,
+    why: "It’s an implementation improvement: identical math, reorganized into fused, tiled kernels so the big intermediate matrices never make a round trip to GPU memory."
+  },
+  {
+    q: "In the book’s attention example, what share of the 132 MiB of memory traffic does fusing the steps eliminate?",
+    options: ["About 25%", "About 50%", "About 97%"],
+    answer: 2,
+    why: "128 of the 132 MiB is S and P being written and immediately read back. Only 4 MiB (reading Q, K, V and writing O) is unavoidable."
+  },
+  {
+    q: "Why does FlashAttention have separate code for the H100 and the B200?",
+    options: [
+      "Because the math of attention changed",
+      "Because it lays the algorithm out to precisely fit each GPU’s memory and compute capabilities",
+      "Because the B200 doesn’t support attention"
+    ],
+    answer: 1,
+    why: "Its speed comes from matching tiles, memory movement and instructions to a specific GPU architecture, so each generation gets hand-tuned kernels (FlashAttention 3 for Hopper, 4 for Blackwell)."
   },
   {
     q: "What problem does PagedAttention solve?",
     options: [
-      "Wasted GPU memory from storing each KV cache in one big continuous block",
+      "KV caches needing one big contiguous block of memory, which wastes space and limits how many requests fit",
       "Slow tokenization",
       "Choosing the next token"
     ],
     answer: 0,
-    why: "By splitting the KV cache into pages that can live anywhere, far less memory is wasted and more requests fit."
+    why: "By splitting the KV cache into fixed-size pages found through a lookup table, it can live in fragmented memory, and far less memory is reserved but unused."
   },
   {
-    q: "With sliding window attention and a window of 4,096 tokens, what happens as a document gets very long?",
-    options: [
-      "Work grows quadratically",
-      "Work grows linearly, because each token only looks at the last 4,096",
-      "The model refuses long inputs"
-    ],
+    q: "With sliding window attention (window 8,192) on a 128K-token context, roughly how many times fewer comparisons than full attention are needed?",
+    options: ["About 1.5×", "About 8×", "About 128×"],
     answer: 1,
-    why: "Each token compares against a fixed-size window, so total work grows in proportion to the length instead of its square."
+    why: "Full causal attention needs ≈ 8.59 billion comparisons; the window needs ≈ 1.04 billion, about 8.3× fewer. The saving grows as the context gets longer."
+  },
+  {
+    q: "Why can sliding window attention keep quality high, when it can’t directly see far-back tokens?",
+    options: [
+      "Because models trained with the same technique learn to work within it, and nearby tokens usually matter most",
+      "Because it secretly computes full attention",
+      "Because quality doesn’t depend on attention"
+    ],
+    answer: 0,
+    why: "Tokens near each other influence each other most, and when the window is applied during training, the model adapts to it and keeps quality when the same technique runs at inference."
   }
 ]} />

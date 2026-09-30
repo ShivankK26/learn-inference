@@ -3,13 +3,14 @@
 import { useState } from "react";
 import { Widget } from "../Blocks";
 
-// GB/s. Network specs are quoted in gigabits (Gb/s); divide by 8 for gigabytes.
+// GB/s per direction. The book quotes NVLink and NVLink-C2C as totals for both directions combined
+// (900 GB/s = 450 each way on Hopper); network NICs are quoted per direction in gigabits.
 const links = [
-  { name: "NVLink (Blackwell)", gbps: 1800, what: "GPU ↔ GPU inside one node" },
-  { name: "NVLink (Hopper)", gbps: 900, what: "GPU ↔ GPU inside one node" },
-  { name: "NVLink-C2C (Grace)", gbps: 900, what: "CPU ↔ GPU on a superchip" },
-  { name: "InfiniBand (400 Gb/s NIC)", gbps: 50, what: "Node ↔ node" },
-  { name: "Ethernet (100 Gb/s NIC)", gbps: 12.5, what: "Node ↔ node" },
+  { name: "NVLink (Blackwell)", gbps: 900, total: "1,800 GB/s total", what: "GPU ↔ GPU inside one node" },
+  { name: "NVLink (Hopper)", gbps: 450, total: "900 GB/s total", what: "GPU ↔ GPU inside one node" },
+  { name: "NVLink-C2C (Grace)", gbps: 450, total: "900 GB/s total", what: "CPU ↔ GPU on a superchip" },
+  { name: "InfiniBand (400 Gb/s NIC)", gbps: 50, total: "400 Gb/s each way", what: "Node ↔ node" },
+  { name: "Ethernet (100 Gb/s NIC)", gbps: 12.5, total: "100 Gb/s each way", what: "Node ↔ node" },
 ];
 
 export default function Interconnects() {
@@ -27,7 +28,7 @@ export default function Interconnects() {
       <div className="space-y-2.5">
         {links.map((l) => {
           const ms = (gb / l.gbps) * 1000;
-          const pct = (Math.log10(l.gbps) / Math.log10(1800)) * 100;
+          const pct = (Math.log10(l.gbps) / Math.log10(900)) * 100;
           return (
             <div key={l.name} className="grid grid-cols-[minmax(0,11rem)_1fr_5.5rem] items-center gap-3 text-sm">
               <div>
@@ -39,15 +40,16 @@ export default function Interconnects() {
               </div>
               <div className="text-right">
                 <div className="font-medium">{ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${ms.toFixed(ms < 10 ? 1 : 0)} ms`}</div>
-                <div className="text-xs text-ink-faint">{l.gbps.toLocaleString("en-US")} GB/s</div>
+                <div className="text-xs text-ink-faint">{l.gbps.toLocaleString("en-US")} GB/s each way</div>
               </div>
             </div>
           );
         })}
       </div>
       <p className="mt-4 text-xs text-ink-faint">
-        Bars use a log scale; the real gaps are even bigger than they look. NVLink is roughly 18–36× faster than InfiniBand,
-        which is why splitting one model across GPUs works best inside a single node.
+        Times assume one link moving data in one direction. NVLink’s headline figures (900 and 1,800 GB/s) count both
+        directions together, so per direction NVLink is about 9–18× faster than a 400 Gb/s InfiniBand NIC: the book’s
+        “order of magnitude”. Bars use a log scale.
       </p>
     </Widget>
   );

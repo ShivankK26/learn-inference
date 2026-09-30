@@ -1,140 +1,286 @@
 import LoadTest from "@/components/widgets/LoadTest";
+import ProfilerTrace from "@/components/widgets/ProfilerTrace";
 
 <TLDR>
-  Without honest measurements you can't tell whether an optimization actually worked. A good **benchmark** mimics real
-  production traffic as closely as possible, is repeatable, and changes **one thing at a time**. When you need to know
-  *why* something is slow, not just *how* slow, you reach for a **profiler**.
+  Without precise, accurate measurements you can’t tell whether an optimization actually worked. A good **benchmark**
+  mimics real production traffic as closely as possible, is consistent and repeatable, starts from a baseline, and
+  changes **one thing at a time**. When you need to know *why* something is slow, not just *how* slow, you reach for a
+  **profiler**.
 </TLDR>
 
 ## Benchmarks: measuring before you optimize
 
-Every optimization in this course is a bet that something will get faster or cheaper. Benchmarking is how you check
-the bet. A high-quality benchmark **simulates real life as closely as possible**.
+Benchmarking is an **essential part of model performance optimization**. Every technique in this course is a bet that
+something will get faster or cheaper. **Without precise, accurate performance benchmarks, there’s no way of knowing if
+your optimizations are actually working.**
+
+A high-quality benchmark **simulates real life as closely as possible**.
 
 ### The gold standard: shadow traffic
 
-The best benchmark is **real production traffic**. **Shadowing** means copying each incoming request and sending the
-copy to the system you're testing as well. You measure how the test system performs on genuine traffic, and real users
-are never affected, because the original request is still served by the production system as usual.
+The best benchmark is to **shadow real-world production traffic** onto the system you’re testing. **Shadowing** means
+**copying incoming requests onto the test system** so you can benchmark its performance **without affecting the
+original request**: production still serves the user as usual, and the copy tells you how the new system would have
+done.
 
 <Analogy>
-  Like a new chef **cooking a copy of every real order** in a test kitchen next door. Customers still get their food
-  from the main kitchen, but you learn exactly how the new chef would cope with a real Friday night.
+  Like a new chef **cooking a copy of every real order** in a test kitchen next door. Customers still get their food from
+  the main kitchen, but you learn exactly how the new chef would cope with a real Friday night: the real mix of dishes,
+  the real rush at 8 pm, the real weird special requests.
 </Analogy>
 
-### If you can't shadow, simulate carefully
+### If you can’t shadow, simulate carefully
 
-If shadowing isn't possible, you have to fake realistic traffic, and LLM performance depends on a lot of factors. Your
-simulated traffic needs to match production on several dimensions:
+If you can’t shadow real usage, you’ll need to simulate it. LLM performance is affected by many factors, so when
+simulating traffic you need to match your expected production workload on **multiple dimensions**:
 
-- **Sequence lengths**: time to first token and memory use depend on the
-  <Term def="Input sequence length: how many tokens are in the prompt.">input sequence length (ISL)</Term> and the
-  <Term def="Output sequence length: how many tokens the model generates in its response.">output sequence length (OSL)</Term>.
-- **Volume and pattern of traffic**: batching and server load depend on how many requests arrive at once. Real users
-  don't arrive in a perfectly steady stream, so **add jitter** (irregular bursts) to mimic reality.
-- **Request contents**: the actual prompts matter. They affect things like how often the cache gets reused (the
-  *cache hit rate*) and how often a speculative decoder's guesses are accepted (Chapter 5).
-- **Input parameters**: settings like temperature and reasoning effort change how inference behaves, so set them to
-  the values you expect in production.
+- **Sequence lengths.** Time to first token and memory usage depend on the
+  <Term def="Input sequence length: how many tokens are in the prompt.">input sequence length (ISL)</Term> and
+  <Term def="Output sequence length: how many tokens the model generates in its response.">output sequence length (OSL)</Term>:
+  the number of tokens in the prompt and the response. Long prompts mean long prefills and big KV caches; long outputs
+  mean many decode steps.
+- **Volume and pattern of traffic.** Batching and server load depend on the **number of concurrent requests**. Real users
+  don’t arrive in a perfectly steady stream, so **jitter** your traffic (add randomness to arrival times and request
+  shapes) to mimic real usage.
+- **Request contents.** The **actual prompt** in each request affects performance factors like the **cache hit rate**
+  ([Caching](/learn/caching)) and **draft token acceptance** ([Speculative decoding](/learn/speculative-decoding)).
+  Random gibberish prompts behave nothing like real ones.
+- **Input parameters.** Settings like **temperature** and **reasoning effort** that affect inference should be set to their
+  **anticipated production values**. Temperature changes how often speculative drafts get accepted; reasoning effort
+  changes output length.
 
-Play with how these change the results:
+<Note kind="warn">
+  **Optimization is about trade-offs and constraints.** If you’re maximizing benchmark performance against **bad inputs**,
+  performance in production **won’t match expectations**. An engine tuned for 200-token prompts can look brilliant in a
+  benchmark and fall over when real users paste 20-page documents.
+</Note>
+
+### What a benchmark actually measures
+
+<Note kind="beyond">
+  A benchmarking client records timestamps for every request: when it was sent, when the first token arrived, when each
+  later token arrived, and when the response finished. From those it computes the latency metrics from
+  [Measuring speed properly](/learn/measuring-speed):
+
+  - **TTFT**: first token time minus send time.
+  - **Inter-token latency (ITL)**: the gaps between consecutive tokens, which converts to perceived tokens per second.
+  - **End-to-end latency**: finish time minus send time.
+
+  Then it aggregates across all requests: **percentiles** (P50, P90, P99) of each latency, plus **throughput**: requests
+  per second and output tokens per second across the whole server.
+
+  There are two common ways to generate load, and they behave differently:
+
+  - **Fixed concurrency** (a *closed loop*): keep N requests in flight; each time one finishes, send another.
+  - **Fixed request rate** (an *open loop*): send requests at a set rate, such as 5 per second with random gaps, whether
+    or not earlier ones have finished.
+
+  A closed loop has a subtle blind spot: if the server slows down, the client automatically slows its sending too,
+  because it’s waiting for responses. That hides exactly the overload you want to detect. Real users don’t wait for each
+  other, so a rate-based test is closer to production when you’re probing the limits.
+</Note>
+
+Play with how the traffic shape changes the results:
 
 <LoadTest />
 
-<Note kind="warn">
-  Optimization is all about trade-offs and constraints. If you tune your system to look great on **unrealistic**
-  benchmark inputs, production performance won't match what you measured.
+<Worked title="Reading a concurrency sweep">
+  A standard experiment is to run the same traffic at increasing concurrency and record per-user speed, total throughput
+  and TTFT. Using the toy model from the widget above (200-token prompts, steady traffic):
+
+  | Concurrent requests | Per-user speed | Total throughput | Typical TTFT |
+  |---|---|---|---|
+  | 1 | 164 tok/s | 164 tok/s | 18 ms |
+  | 8 | 151 tok/s | 1,205 tok/s | 20 ms |
+  | 32 | 117 tok/s | 3,738 tok/s | 27 ms |
+  | 64 | 90 tok/s | 5,755 tok/s | 36 ms |
+  | 128 | 62 tok/s | 7,882 tok/s | 54 ms |
+  | 256 | 38 tok/s | 9,668 tok/s | 90 ms |
+
+  1. **Throughput keeps rising, but with diminishing returns.** Doubling from 128 to 256 users adds only about 23% more
+     total tokens, while per-user speed drops by almost 40%. This is batching’s trade-off from
+     [Finding the bottleneck](/learn/bottlenecks).
+  2. **Apply your targets.** Suppose your product needs **at least 60 tokens per second per user** and **TTFT under
+     100 ms**. Concurrency 128 meets both (62 tok/s, 54 ms); 256 breaks the per-user target.
+  3. **Pick the operating point.** Run each replica at about **128 concurrent requests**. That number becomes your
+     autoscaler’s concurrency target ([Autoscaling](/learn/autoscaling)), and total traffic ÷ 128 tells you roughly how
+     many replicas you need.
+  4. The numbers here are illustrative. The method, sweep then apply your targets, is exactly what you’d do on real
+     hardware.
+</Worked>
+
+### Common ways benchmarks lie
+
+<Note kind="beyond">
+  A few mistakes show up again and again:
+
+  - **No warm-up.** The first requests to a fresh server can include compilation, CUDA graph capture and empty caches.
+    Send some warm-up traffic and exclude it from your results.
+  - **The same prompt over and over.** Identical prompts get near-perfect prefix cache hits, so TTFT looks unrealistically
+    good. This is the book’s “request contents” point in its sharpest form.
+  - **Uncontrolled output lengths.** If the model sometimes stops after 10 tokens and sometimes after 1,000, runs aren’t
+    comparable. Benchmark tools usually let you fix the output length.
+  - **A bottlenecked client.** One laptop can’t always generate enough load for a big GPU server. If adding load doesn’t
+    change the server’s metrics, check the client.
+  - **Mismatched token counts.** Count tokens with the model’s own tokenizer, or throughput numbers won’t line up with
+    anything.
 </Note>
 
 ## Benchmarking tools
 
-Because a good benchmark reflects *your* production traffic, everyone's setup looks a bit different. But a few tools
-are common:
+Because a performance benchmark should closely reflect *your* production traffic, **everyone’s benchmarking setup looks
+a bit different**. But there are a few common tools:
 
 | Tool | What it is |
 |---|---|
-| **SGLang genai-bench** | A command-line tool and dashboard from the SGLang team, for benchmarking models on *any* inference engine |
-| **NVIDIA GenAI-Perf** | A client-side tool for measuring latency and throughput under varied traffic |
-| **Locust** | A general open-source load-testing tool (not AI-specific) that can simulate up to millions of simultaneous users |
+| **SGLang genai-bench** | A CLI and dashboard by the SGLang team for benchmarking models deployed with **any** inference framework |
+| **NVIDIA GenAI-Perf** | A **client-side** tool by NVIDIA for measuring latency and throughput on varied traffic |
+| **Locust** | An open-source load-testing tool, **not specific to generative AI**, that can simulate as many as millions of simultaneous users |
 
-**Open-source eval datasets** are another great resource, from general ones like **MMLU** and **gsm8k** to specialized
-ones like **SWE-bench**. You're measuring *speed*, not answer quality, but these datasets do double duty:
+Another great benchmarking resource is **open-source eval datasets**, from general evals like **MMLU** and **gsm8k** to
+domain-specific ones like **SWE-bench**. The purpose of benchmarking is to measure **performance**, not output quality,
+but eval datasets serve **two purposes** here:
 
-1. They're a ready supply of **varied, realistic prompts** to send.
-2. They let you **spot-check that an optimization hasn't quietly hurt output quality**.
+1. They act as a **set of varied and realistic inputs** to send.
+2. They let you **spot-check that performance optimizations haven’t hurt model output quality**. An optimization that
+   makes a model faster but wrong isn’t an optimization.
 
-Pick one that matches how your system will be used. For example, use **HumanEval** (a set of coding problems) when
-speeding up a code-completion product.
+When possible, choose an eval dataset that **matches the expected use** of your production system, like **HumanEval**
+when reducing latency for a **code completion** system.
 
 ## Tips for trustworthy benchmarks
 
-Besides being realistic, great benchmarks are **consistent**:
+Along with being realistic, great benchmarks are also **consistent**:
 
-- **Send enough traffic** to get a clear reading that a few outliers can't skew. When in doubt, **run it several times
-  and average** the results.
-- **Measure a baseline first**, before any optimization work, so you have something to compare against.
-- **Keep your benchmark setup fixed** while you test optimizations.
-- **Test each optimization on its own and in combination**, so you know what's really driving any improvement.
-  Optimizations can work *against* each other. For example, speculative decoding tends to fight with very large batch
-  sizes.
-- **Change one variable at a time**, in your benchmark settings too. You'll often need to test different traffic
-  patterns or sequence shapes, but as in any experiment, change only one thing per run so the results are clear.
+- **Send enough traffic** to get a good read on performance **without being swayed by outliers**. When in doubt, **run a
+  benchmark multiple times and average the results**.
+- **Start with a solid baseline** before you do any performance optimization work. Without one, you can’t attribute any
+  later change.
+- **Keep a consistent configuration** in your benchmarking setup while you test optimizations.
+- **Test each optimization individually as well as collectively**, to fully understand what’s driving an improvement. In
+  some cases, **optimizations work against each other**, like trying to run **speculative decoding with large batch
+  sizes**: speculation spends spare compute to guess tokens ahead, and big batches are exactly what use up that spare
+  compute ([Speculative decoding](/learn/speculative-decoding)).
+- **Change one thing at a time**, and that applies to your **benchmark configuration** too. You’ll often need to test
+  different traffic patterns or sequence shapes, but as in any experiment, change **one variable at a time** so the
+  results are clear.
+
+<Worked title="A benchmark plan for a code-completion product">
+  You want to lower latency for a code-completion feature, and you’re considering FP8 quantization and speculative
+  decoding.
+
+  1. **Traffic**: shadow production if you can. Otherwise, sample real ISL and OSL distributions from your logs (code
+     completion means long prompts full of existing code and short outputs), use HumanEval-style coding prompts as the
+     request contents, and set temperature to your production value.
+  2. **Baseline**: run a concurrency sweep on the current setup and record P50/P90 TTFT, per-user TPS and total
+     throughput. Repeat it a few times and average.
+  3. **One change at a time**: rerun the identical sweep with FP8 only, then with speculative decoding only, then with
+     both.
+  4. **Read the results**: if the combination beats each alone, keep both. If speculation only helps at low concurrency,
+     that’s the large-batch conflict showing up, and your operating concurrency decides whether it’s worth it.
+  5. **Quality check**: score the outputs of each configuration on the eval set to confirm nothing got worse before you
+     ship.
+</Worked>
 
 ## Profiling: finding out *why*
 
-**Profiling** goes one level deeper than benchmarking:
+**Profiling** is one click deeper than benchmarking:
 
-- A **benchmark** gives you a number, like *"the P90 time to first token is 350 ms"*. (P90 means 90% of requests were
-  at least that fast; Chapter 1 covers these percentiles.)
-- A **profiler** shows you **where every one of those milliseconds went**, operation by operation.
+- A **benchmark** gives you a single figure, like *“the P90 TTFT is 350 ms”* (90% of requests got their first token in
+  350 ms or less).
+- A **profiling tool** shows **where each of those milliseconds was spent** in the inference process.
 
-In short: **benchmarking tells you how your system is performing; profiling tells you why.** The book's Figure 4.7
-shows a kernel profiler timeline, with each operation inside a kernel laid out by how long it took, which makes
-bottlenecks jump out.
+In the book’s phrasing: **benchmarking tells you how your system is performing; profiling tells you why it’s performing
+that way.** The book’s Figure 4.7 shows a kernel profiler that lays out how long each operation within a kernel takes to
+execute, so the bottleneck stands out visually.
 
 ### Do you actually need it?
 
-Most inference engineers **won't profile day to day**. If you're using an already highly optimized engine like
-TensorRT-LLM, your workflow is a loop of *configure → benchmark → configure*, and profiling would be overkill.
+**Most inference engineers won’t need to profile as part of their daily work.** When you’re using an already
+high-performance tool like **TensorRT-LLM**, your workflow is a **cycle of configuration and benchmarking**, and profiling
+would be extraneous.
 
-Profiling becomes essential when you're:
+Profiling should be part of your toolkit when you’re:
 
-- **contributing** to an inference engine like vLLM or SGLang,
-- **writing your own inference service** in PyTorch, or
-- working at the **cutting edge of a new modality**, like video generation.
+- **contributing** to an inference framework like **vLLM or SGLang**,
+- **writing your own inference service in PyTorch**, or
+- operating at the **cutting edge of a new modality**, like **video generation**.
 
 ### Profiling tools
 
 | Tool | Best for |
 |---|---|
-| **PyTorch Profiler** | Easy step-by-step metrics during inference: CPU time, GPU time, memory usage |
-| **NVIDIA Nsight Systems (nsys)** | Powerful but complex system-wide tracing across CPUs, multiple GPUs and the links between them |
-| **NVIDIA Nsight Compute (ncu)** | Deep analysis of **individual CUDA kernels**, both compute and memory usage |
+| **PyTorch Profiler** | An **easy-to-use** profiling library for capturing step-by-step metrics during inference: **CPU time, GPU time, memory usage** |
+| **NVIDIA Nsight Systems (nsys)** | A featureful but complex tool for **GPU and CPU sampling and tracing**, with **system-wide analysis across multiple GPUs and their interconnects** |
+| **NVIDIA Nsight Compute (ncu)** | A profiling utility and CLI for **in-depth analysis of individual CUDA kernels**, on both compute and memory usage |
 
-Frameworks like TensorFlow and TensorRT also ship with their own built-in profilers.
+Frameworks like TensorFlow and TensorRT also ship with **their own built-in profilers**.
+
+<Note kind="beyond">
+  Getting a first profile out of PyTorch takes a few lines:
+
+  ```python
+  from torch.profiler import profile, ProfilerActivity
+
+  with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+      model(inputs)
+
+  print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+  prof.export_chrome_trace("trace.json")  # open in a trace viewer such as Perfetto
+  ```
+
+  The table ranks operations by GPU time; the exported trace shows them on a timeline. For a whole running server,
+  `nsys profile -o server_trace python serve.py` records everything the process does across CPUs and GPUs. To zoom into
+  one slow kernel, `ncu --set full -o kernels python bench.py` measures it in detail, including how close it gets to the
+  GPU’s peak memory bandwidth and compute: the [roofline](/learn/bottlenecks) question, answered per kernel.
+</Note>
+
+### Reading a trace
+
+Profilers are valuable because they give you **granular information about compute and memory usage**, which guides your
+optimization work toward **the most expensive steps** in your inference pipeline. A trace usually has a CPU row (Python
+code and kernel launches) and a GPU row (kernels actually running). Three things to look for:
+
+1. **The biggest bars.** Sort by GPU time: that’s where optimization pays most.
+2. **Suspiciously slow simple operations.** A small elementwise op that takes as long as a matmul is almost always
+   wasting memory traffic, which is a fusion opportunity.
+3. **Gaps on the GPU row.** Idle time between kernels usually means the CPU can’t launch work fast enough, which is what
+   CUDA graphs fix ([CUDA and kernels](/learn/cuda-and-kernels)).
+
+<ProfilerTrace />
 
 ### What profiling looks like in practice
 
-Profilers show you in detail where compute and memory are being spent, so you can aim your effort at the most
-expensive steps. A realistic example from the book:
+<Worked title="The book’s profiling example, step by step">
+  1. **Profile.** Using PyTorch Profiler, you find that **activation functions are taking an unusually long time** because
+     of **excess memory reads**: simple math, but the data is being read from memory more than it needs to be.
+  2. **Diagnose.** That pattern (cheap math, expensive memory traffic) is exactly what kernel fusion solves.
+  3. **Fix.** You figure out how to write a **fused kernel that runs activations alongside attention**, preventing the
+     excess reads. (The widget above shows the same move with the activation fused into the matmul next to it, the
+     classic matmul + activation pattern.)
+  4. **Integrate.** You **insert the new kernel into your PyTorch code**.
+  5. **Verify.** You **re-run system-level benchmarks** to see whether you’ve hit your latency targets. The profiler found
+     the problem; only the benchmark can confirm the fix mattered end to end.
+</Worked>
 
-1. The PyTorch Profiler shows that the **activation functions are taking unusually long**, because of excess memory
-   reads.
-2. You write a **fused kernel** that runs the activations together with attention, eliminating those extra reads
-   (kernel fusion, from the first lesson of this chapter).
-3. You plug the new kernel into your PyTorch code.
-4. You **re-run your system-level benchmarks** to see whether you've hit your latency target.
-
-Together, profiling and benchmarking tell you what to improve and give you the confidence to ship those improvements
-to production.
+Together, **profiling and benchmarking give you the information you need to improve system performance**, and,
+eventually, **the confidence to deploy your optimizations in production**.
 
 <KeyPoints>
-- The best benchmark is **shadowed real traffic**. Otherwise, simulate it by matching **sequence lengths, traffic
-  pattern (with jitter), request contents and input parameters**.
-- Tools: **genai-bench**, **GenAI-Perf**, **Locust**, plus **eval datasets** for realistic prompts and quality checks.
-- Be consistent: **baseline first**, enough traffic, repeat runs, and **change one thing at a time**. Optimizations can conflict.
-- **Benchmarks say how fast; profilers say why.** Tools: PyTorch Profiler, Nsight Systems, Nsight Compute.
-- Most engineers configure and benchmark. Profiling matters when you build engines, custom PyTorch services, or new modalities.
+- No precise, accurate benchmark means no way to know if an optimization worked.
+- Best: **shadow real traffic** (copy requests to the test system without affecting users). Otherwise simulate by
+  matching **sequence lengths (ISL/OSL), traffic volume and pattern (with jitter), request contents and input
+  parameters**.
+- Benchmarks record TTFT, ITL and end-to-end latency per request and report percentiles and throughput. A **concurrency
+  sweep** plus your latency targets picks each replica’s operating point.
+- Tools: **genai-bench**, **GenAI-Perf**, **Locust**, plus **eval datasets** (MMLU, gsm8k, SWE-bench, HumanEval) for
+  realistic prompts and quality spot-checks.
+- Be consistent: **baseline first**, enough traffic, repeat and average, test optimizations **individually and together**
+  (they can conflict, like speculation with big batches), **one variable at a time**.
+- **Benchmarks say how fast; profilers say why.** PyTorch Profiler (easy), Nsight Systems (system-wide), Nsight Compute
+  (single kernels).
+- Most engineers **configure and benchmark**. Profiling matters when you build engines, custom PyTorch services, or new
+  modalities.
 </KeyPoints>
 
 <Quiz questions={[
@@ -159,6 +305,18 @@ to production.
     why: "Input sequence length drives prefill time and KV cache memory. Unrealistic inputs lead to unrealistic results."
   },
   {
+    q: "Your benchmark sends the exact same prompt thousands of times. Which result is most likely inflated?",
+    options: ["Time to first token, because of prefix cache hits", "Model accuracy", "The number of GPUs needed"],
+    answer: 0,
+    why: "Identical prompts are perfect prefix cache hits, so prefill mostly gets skipped. Request contents affect cache hit rate, which is why they need to match production."
+  },
+  {
+    q: "In a concurrency sweep, per-user speed is 62 tok/s at 128 concurrent requests and 38 tok/s at 256. Your product needs at least 50 tok/s per user. What concurrency should each replica run at?",
+    options: ["256, for maximum throughput", "About 128", "1, for maximum speed"],
+    answer: 1,
+    why: "256 breaks the per-user target. 128 meets it while keeping throughput high, so it’s the operating point, and it becomes your autoscaler’s concurrency target."
+  },
+  {
     q: "You enabled quantization and speculative decoding together and speed improved. What should you do next?",
     options: [
       "Ship it right away",
@@ -166,12 +324,28 @@ to production.
       "Change the traffic pattern and the settings at the same time"
     ],
     answer: 1,
-    why: "Testing individually and together shows what’s actually helping. Some optimizations conflict, like speculation with big batches."
+    why: "Testing individually and together shows what’s actually helping. Some optimizations conflict, like speculation with big batches, and you should change one variable at a time."
   },
   {
     q: "Your benchmark says P90 TTFT is 350 ms and you want to know which operation is responsible. What do you use?",
     options: ["Another benchmark run", "A profiler", "A bigger GPU"],
     answer: 1,
     why: "Benchmarks tell you how the system performs; profilers show where each millisecond goes, which reveals the bottleneck."
+  },
+  {
+    q: "You need to analyze one specific slow CUDA kernel in depth, including its memory and compute usage. Which tool fits best?",
+    options: ["Locust", "NVIDIA Nsight Compute (ncu)", "GenAI-Perf"],
+    answer: 1,
+    why: "Nsight Compute is built for in-depth analysis of individual kernels. Locust and GenAI-Perf are load and benchmarking tools; Nsight Systems gives the system-wide view."
+  },
+  {
+    q: "You serve a supported model with TensorRT-LLM and just need to tune it for your traffic. According to the book, is profiling part of your routine?",
+    options: [
+      "Yes, every change needs a profile",
+      "Usually not: the workflow is a cycle of configuration and benchmarking",
+      "Only on weekends"
+    ],
+    answer: 1,
+    why: "With an already high-performance engine, you iterate on configuration and benchmark results. Profiling matters when building engines, custom PyTorch services, or new modalities."
   }
 ]} />

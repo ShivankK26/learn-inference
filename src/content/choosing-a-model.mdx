@@ -1,70 +1,112 @@
 import DistillCompare from "@/components/widgets/DistillCompare";
 
 <TLDR>
-  The biggest performance decision isn’t a clever GPU trick, it’s **which model you run**. A smaller model is faster and
-  cheaper on the same hardware. So once you’re scaling, find (or make) the **smallest model that’s smart enough**, and
-  use your own evals to prove it.
+  The biggest performance decision isn’t a clever GPU trick, it’s **which model you run**. On the same setup, a smaller
+  model is always faster and cheaper. So once you’re scaling, find (or create, through fine-tuning or distillation) the
+  **smallest model that’s smart enough**, on a **popular architecture**, and prove it with **your own evals**.
 </TLDR>
 
-## Smaller is faster, so choose carefully
+## Why model choice beats every other optimization
 
-If everything else is equal (same hardware, same software, same optimizations, same architecture), a model with
-**fewer parameters** will always be faster and cheaper to run than a bigger one. That makes model choice the single
-most important performance decision, more important than which inference engine or speculation algorithm you pick.
+The book’s starting point: **all else being equal** (same hardware, same runtime, same optimizations, same
+architecture), **inference on a smaller model with fewer parameters will be faster and cheaper** than on a larger
+model.
 
-The advice flips depending on your stage:
+That leads to a striking conclusion: **the most important decision in model performance optimization isn’t the runtime
+engine or the speculation algorithm. It’s which model you choose to work with in the first place.**
 
-- **Before product-market fit**: just use pay-per-token APIs for powerful frontier models (open ones like Kimi and
-  DeepSeek, or even closed ones like GPT and Gemini). It’s not worth spending time or money on your own inference yet.
-- **When it’s time to scale**: find, or create, the **smallest, easiest-to-run model that’s smart enough for the task**.
-  Sometimes that will still be a trillion-parameter frontier model, but it’s always worth checking whether something
-  smaller, cheaper, and faster will do.
-
-<Note kind="tip">
-  Your model choice also decides which optimizations you can use. Inference engines support some architectures much
-  better than others, so **stick with popular architectures** to get strong support from the whole performance tooling
-  ecosystem.
+<Note kind="beyond">
+  Why size matters so directly: as Chapter 2 explains, generating each token requires reading essentially all of a
+  model’s weights from GPU memory. A 70-billion-parameter model stored in 16-bit numbers is about 140 GB of weights; an
+  8-billion-parameter model is about 16 GB. On the same GPU, the smaller model can produce tokens several times faster,
+  and it may fit on one GPU instead of several. No engine setting comes close to a difference that large.
 </Note>
 
-## Evals: measuring whether a model is good enough
+### The advice flips with your stage
 
-**Model evaluation**, or **evals**, means systematically measuring how smart a model is *at your task*. Solid evals are
-a prerequisite for inference engineering, for two reasons:
+- **Early stage (before product-market fit)**: AI engineers iterating on a new product should **just use prebuilt
+  pay-per-token APIs for powerful frontier models**, open ones like **Kimi** and **DeepSeek**, or even closed ones like
+  **GPT** and **Gemini**. It’s not worth spending time or money on your own inference yet.
+- **When it’s time to scale**: the **opposite** advice applies. **Find, or create, the smallest, easiest-to-run model
+  that’s smart enough for the task.** In many cases that will *still* need to be a trillion-parameter frontier model,
+  but it’s **always worth checking** whether a smaller, cheaper, faster model can do the job.
 
-1. **They tell you where to spend your time.** Before you invest in making a model fast, make sure it’s actually
-   useful.
-2. **They give you a baseline.** Some speed-up techniques (like quantization, in Chapter 5) can slightly reduce
-   quality. You need a “before” score to check the “after” against.
+### Stick with popular architectures
+
+Which model you pick also decides **which inference optimizations are available to you**. Inference engines vary in
+how deeply they support different model architectures. The book’s advice: **stick with popular model architectures**
+so you’ll find robust support across the whole performance tooling landscape.
+
+<Note kind="beyond">
+  An *architecture* is the model’s structural design (how many layers, what kind of attention, whether it’s a Mixture
+  of Experts, and so on). Many different models share one architecture: every fine-tune of Llama 3 is still a Llama 3
+  architecture. Engines like vLLM, SGLang, and TensorRT-LLM ship optimized code for popular architectures first, so a
+  model with a rare or brand-new architecture may run slowly, or not at all, until support catches up. Chapter 2 shows
+  how to read a model’s architecture from its config file.
+</Note>
+
+## Model evaluation (evals)
+
+**Model evaluation**, or **evals**, is the practice of **systematically measuring model intelligence**. The book calls
+**high-conviction model evaluation a prerequisite for inference engineering**, for two reasons:
+
+1. **Spend time wisely.** Before investing effort in making a model fast, evals make sure the model is actually
+   **useful**. Optimizing the wrong model is wasted work.
+2. **Establish a baseline.** Some performance techniques **risk reducing model quality** (quantization in Chapter 5 is
+   the classic example). You need a **baseline** score to compare the optimized model against, or you can’t tell whether
+   your speedup quietly made the product worse.
 
 ### Benchmarks vs. evals
 
-Public **intelligence benchmarks** like MMLU (general knowledge) or SWE-bench (coding) measure models on common tasks.
-They’re handy for **shortlisting** candidates, but many are **saturated** (every top model aces them) or even
-**gamed**.
+| | Intelligence benchmarks | Evals |
+|---|---|---|
+| **What they measure** | Model capabilities on **common tasks** | Performance on **your** product, domain, and tasks |
+| **Examples** | **MMLU** (broad knowledge), **SWE-bench** (fixing real code issues) | A test set built from your own users’ hardest requests |
+| **Good for** | **Shortlisting** candidate models | Deciding whether a model is good enough to ship |
+| **Weakness** | Often **saturated** or even **gamed** | Takes work to build |
 
-That’s an example of **Goodhart’s Law**, roughly *“when a measure becomes a target, it stops being a good measure.”*
-Labs have a huge incentive to post record benchmark scores with every release, which makes those scores less
-trustworthy.
+<Note kind="beyond">
+  “Saturated” means top models all score near the maximum, so the benchmark can no longer tell them apart. “Gamed”
+  means models were tuned, deliberately or not, to do well on that specific test (for instance because test questions
+  leaked into training data), so the score overstates real ability.
+</Note>
 
-There are better ways to gauge general intelligence, like **Elo ratings** based on head-to-head win rates between
-models (the same idea as chess rankings). But nothing replaces **measuring directly how the model performs in your
-application.**
+Why do benchmarks get gamed? The book invokes **Goodhart’s Law**: *“When a measure becomes a target, it ceases to be a
+good measure.”* Frontier labs have a **heavy incentive to show new world-record benchmark scores** with each model
+release, and that pressure erodes what the scores mean.
 
-Tips for evals that are actually useful:
+There are **better ways to gauge overall intelligence**, like **Elo ratings** based on head-to-head win rates against
+other models (the same system used to rank chess players). But the book is clear: **there is no substitute for directly
+measuring how a model performs for your application.**
 
-- **Look at your data.** Check eval results against your own intuition about the product and the problem.
-- **Be precise.** Know the *hardest* problems the model has to solve, and focus the evals there.
-- **Use tools.** Evals are a core AI engineering problem, so don’t reinvent the wheel. (The book’s recommended-reading
-  appendix lists tools.)
+### Tips for useful evals
 
-## Fine-tuning: make a small model an expert
+The book’s three tips:
 
-**Fine-tuning** means taking a pre-trained foundation model and training it further on new data for your specific use.
-As the book’s figure shows, fine-tuning **changes the values of the weights but keeps the architecture exactly the
-same**. So a fine-tuned model runs just as fast as the original and gets all the same optimizations.
+- **Look at your data.** Check eval results against your intuition for the product and problem space. If a score
+  looks great but the outputs look wrong to you, trust your eyes and investigate.
+- **Be precise.** Have a clear idea of the **hardest problems** the model needs to solve, and focus evaluation there.
+  Easy cases don’t separate good models from great ones.
+- **Use tools.** Evals are one of the fundamental problems in AI engineering; **don’t reinvent the wheel**. (The book’s
+  recommended reading, on this site’s <a href="/reading">Further reading</a> page, lists tools and books on evals.)
 
-If you can fine-tune a **small** model until it passes your evals, you’ve made hitting your latency and cost targets
-much easier.
+## Fine-tuning for domain-specific quality
+
+**Fine-tuning** is taking a **pre-trained foundation model** and adapting it to a specific use case by **introducing new
+data**. As the chapter’s figure shows, fine-tuning **changes the values of the model weights while keeping the same
+overall architecture**.
+
+That last part is what makes fine-tuning so valuable for inference: a fine-tuned model is exactly as fast as the
+original and can use **every optimization built for that architecture**.
+
+<Note kind="beyond">
+  A popular lightweight form of fine-tuning is **LoRA** (low-rank adaptation), which trains a small set of extra weights
+  instead of changing all of them. LoRAs come back later in the course, because serving many LoRAs on one base model is
+  a common production pattern.
+</Note>
+
+The payoff: **if you can fine-tune a small model to pass your evals, you set yourself up for an easier time hitting
+your latency and cost targets.**
 
 <Analogy>
   A general-purpose model is like a brilliant generalist consultant: expensive and able to do anything. Fine-tuning is
@@ -72,57 +114,111 @@ much easier.
   fraction of the cost.
 </Analogy>
 
-The book’s favorite example is **text-to-SQL**: turning a plain-English question into a database query. General coding
-models write SQL well, but they have **hundreds of billions** of parameters. SQL is a fairly constrained language, so
-for an app that *only* needs to write SQL, a fine-tuned model of just **a few billion** parameters can perform as well
-on that task.
+### The text-to-SQL example
 
-That’s an extreme case, and many domains won’t allow such a dramatic shrink. It works when you have:
+The book’s example of a domain where fine-tuning shines is **translating English into SQL**, the language used to
+query databases:
 
-- a cleanly scoped domain,
-- strong evaluation criteria, and
-- high-quality labeled data to fine-tune on.
+1. **General-purpose coding models are good at writing SQL**, but these models have **hundreds of billions of
+   parameters**.
+2. **SQL is a relatively constrained language**: a limited vocabulary of keywords and a strict structure.
+3. So for an application that **only** needs to generate SQL from natural-language prompts, **a tiny fine-tuned model
+   of just a few billion parameters can reach equivalent performance on this specific task.**
 
-## Distillation: shrink a big model’s behavior
+The book calls text-to-SQL an **extreme example**: many domains won’t support such a vast reduction in model size. But
+it shows what’s possible when you have three ingredients:
 
-What if you could keep most of a big model’s intelligence at a fraction of the size? That’s **distillation**. A large
-**teacher** model trains a smaller **student** model to imitate it.
+- a **cleanly scoped domain**,
+- a **strong set of evaluation criteria**, and
+- **high-quality labeled data** to fine-tune on.
 
-The key difference from ordinary fine-tuning is *what the student learns from*. Fine-tuning on examples shows only the
-input and the final answer. Distillation shows the student the teacher’s **full probability distribution**: not just
-“the answer was X”, but how likely the teacher thought every option was.
+<Worked title="How much a fine-tune can save">
+  Suppose a general coding model with **300B** parameters handles your text-to-SQL feature, and a fine-tuned **3B**
+  model passes the same evals.
+
+  1. In 16-bit precision (2 bytes per parameter), 300B parameters is about **600 GB** of weights; 3B is about **6 GB**.
+  2. The big model needs a multi-GPU machine just to hold its weights. The small one fits comfortably on a single,
+     cheaper GPU, with plenty of room left for serving many users at once.
+  3. Since generating each token means reading the weights, the small model moves **100× less data per token**, on
+     far cheaper hardware.
+</Worked>
+
+<Note kind="beyond">
+  The sizes in this worked example are hypothetical, chosen to illustrate the book’s “hundreds of billions” versus “a
+  few billion.” Real speedups are smaller than the raw ratio, because other costs (network, overheads, attention over
+  long inputs) don’t shrink with the model.
+</Note>
+
+## Distillation
+
+What if you could keep **most of a large model’s intelligence at a fraction of the size**? That’s the idea behind
+**distillation**. As the chapter’s figure shows, distillation **preserves the behavior of a large model in a smaller,
+more efficient one**.
+
+In distillation, a large **teacher** model trains a smaller **student** model to **emulate the teacher’s behavior**. The
+key difference from fine-tuning on synthetic data:
+
+- **Fine-tuning on synthetic data** trains the student on **input-output pairs**: here’s a prompt, here’s the teacher’s
+  final answer.
+- **Distillation** shows the student the teacher’s **actual probability distributions**, not just its final answers.
 
 <DistillCompare />
 
+Why does the probability distribution matter? When a model picks its next token, it first assigns a probability to
+*every* token in its vocabulary (Chapter 2 shows how). The final answer throws most of that away. The full distribution
+carries much richer information: which alternatives the teacher considered nearly as good, which it ruled out
+entirely, how confident it was. Learning from that lets a student absorb the teacher’s *way of thinking*, not just its
+outputs.
+
 | | Fine-tuning | Distillation |
 |---|---|---|
-| **Learns from** | Input → correct output pairs | The teacher model’s full probabilities |
-| **Goal** | Get better at a specific domain | Imitate a bigger model’s behavior (good *and* bad habits) |
-| **How common** | Very common | Much less common in practice |
+| **Learns from** | Input → output pairs | The teacher model’s full probability distributions |
+| **Teaches the model to** | Perform better **in a specific domain** | **Emulate the behavior** of a larger model, **good and bad** |
+| **Real-world use** | Very common | **Substantially less common** |
 
-A surprising detail: when a lab releases a family of models in several sizes, the small ones usually **aren’t**
-distilled from the big one. They’re trained independently, so the big model’s biases don’t artificially limit the
-smaller ones. Distillation is most useful when a lab only trains one huge model and wants to make it more accessible.
+### How labs use (and don’t use) distillation
 
-**Example:** in January 2025, DeepSeek released **DeepSeek-R1**, a huge reasoning model with **671B** parameters. They
-also released distilled versions built on the most popular open architectures of the time, **Llama 3** and **Qwen
-2.5**. The distills reasoned in a similar style to R1, with lower benchmark scores, but they were small and could reuse
-all the existing performance work for Llama and Qwen. At the time the book was written, these R1 distills were still
-among the most popular distilled models on Hugging Face, alongside distills of Whisper (audio transcription) and some
-image generation models.
+A detail that surprises people: when a frontier lab releases a **family of models in different sizes**, the smaller
+models are **generally not distilled** from the larger ones. They’re **trained independently**, to **prevent the biases
+of the large model from artificially limiting the smaller models**. Distillation makes the most sense when a lab
+**only trains one large model** and wants to make it more accessible.
+
+### The DeepSeek-R1 distills
+
+The book’s example: in **January 2025**, open model lab DeepSeek released its then-flagship reasoning model,
+**DeepSeek-R1**. It was huge (**671B parameters**), so DeepSeek **also released distilled versions** built on the most
+popular open architectures of the time: **Llama 3** and **Qwen 2.5**.
+
+- The distills showed **similar reasoning behavior** to the full R1, albeit with **worse benchmark scores**.
+- But they were **relatively small**, and because they used Llama and Qwen architectures, they could **take advantage of
+  all the existing performance work** for those architectures. (This is the “stick with popular architectures” advice
+  paying off.)
+- At the book’s publication, these R1 distills were **still among the most popular distilled models on Hugging Face**,
+  alongside distills of **Whisper** (audio transcription) and some image generation models.
 
 <KeyPoints>
-- On the same setup, **fewer parameters = faster and cheaper**, which makes model choice the biggest performance
-  decision.
-- Early on, use frontier APIs. At scale, find the **smallest model that’s smart enough**, on a **popular architecture**.
-- **Evals** tailored to your product beat public benchmarks, which are often saturated or gamed (Goodhart’s Law).
-- **Fine-tuning** changes the weights, not the architecture, and can make a small model an expert (e.g. text-to-SQL).
-- **Distillation** trains a small student on a big teacher’s full probabilities. It’s rarer than fine-tuning.
+- On the same setup, **fewer parameters = faster and cheaper**, which makes model choice the single most important
+  performance decision.
+- Early on, use frontier APIs. At scale, find or create the **smallest model that’s smart enough**, on a **popular
+  architecture** for the best tooling support.
+- **Evals** let you spend effort wisely and set a **baseline** before quality-risking optimizations. Benchmarks are for
+  shortlisting; they’re often saturated or gamed (**Goodhart’s Law**). Elo is better, but nothing beats your own evals.
+- Eval tips: **look at your data, be precise about the hardest problems, use tools.**
+- **Fine-tuning** changes weights, not architecture; with a scoped domain, strong evals, and good labeled data, a
+  few-billion-parameter model can match a giant one (text-to-SQL).
+- **Distillation** trains a student on a teacher’s **probability distributions**. It’s rarer than fine-tuning; model
+  families are usually trained independently. The DeepSeek-R1 distills on Llama 3 and Qwen 2.5 are the classic example.
 </KeyPoints>
 
 <Quiz questions={[
   {
-    q: "Why are your own evals more useful than public benchmarks like MMLU?",
+    q: "According to the book, what is the single most important decision in model performance optimization?",
+    options: ["Which inference engine you use", "Which speculation algorithm you pick", "Which model you choose in the first place", "Which GPU generation you rent"],
+    answer: 2,
+    why: "All else being equal, a smaller model is faster and cheaper, so choosing the model outweighs engine or speculation choices."
+  },
+  {
+    q: "Why are your own evals more useful than public benchmarks like MMLU for deciding what to ship?",
     options: [
       "Public benchmarks are too hard for modern models",
       "Public benchmarks are often saturated or gamed, and don’t measure your specific task",
@@ -132,21 +228,51 @@ image generation models.
     why: "Benchmarks help shortlist models, but labs optimize for them (Goodhart’s Law). Only product-specific evals show how a model does on your job."
   },
   {
+    q: "You’re about to quantize a model to make it faster. What should you have in place first?",
+    options: ["A larger GPU", "A baseline eval score from the unquantized model", "A distilled version of the model"],
+    answer: 1,
+    why: "Quantization can reduce quality. Evals give you a baseline so you can check that the faster model is still good enough."
+  },
+  {
     q: "After fine-tuning a Llama model, does it still work with the same inference optimizations?",
     options: ["Yes, fine-tuning changes the weights but not the architecture", "No, it becomes a new architecture", "Only if you retrain from scratch"],
     answer: 0,
     why: "Fine-tuning only changes weight values, so everything optimized for that architecture still applies."
   },
   {
-    q: "What does a student model see during distillation that it wouldn’t see in normal fine-tuning?",
-    options: ["The teacher’s training data", "The teacher’s full probability distribution over possible outputs", "The teacher’s architecture diagram"],
+    q: "Which combination makes a dramatic fine-tuning size reduction (like text-to-SQL) possible?",
+    options: [
+      "A huge base model, a GPU cluster, and a new architecture",
+      "A cleanly scoped domain, strong evaluation criteria, and high-quality labeled data",
+      "A distilled teacher, a quantized student, and synthetic benchmarks"
+    ],
     answer: 1,
-    why: "Distillation exposes the teacher’s probabilities for every option, not just the final answer, so the student learns how the teacher behaves."
+    why: "The book lists exactly these three ingredients. Without them, most domains won’t support such a large reduction in model size."
   },
   {
-    q: "Why do evals matter before using a technique like quantization?",
-    options: ["They make quantization automatic", "They give you a quality baseline to check the optimized model against", "They aren’t needed"],
+    q: "What does a student model see during distillation that it wouldn’t see in fine-tuning on synthetic data?",
+    options: ["The teacher’s training data", "The teacher’s full probability distributions over possible outputs", "The teacher’s architecture diagram"],
     answer: 1,
-    why: "Some optimizations can reduce quality slightly. Without a baseline you can’t tell whether the speed-up cost you accuracy."
+    why: "Synthetic-data fine-tuning shows only input-output pairs. Distillation exposes the teacher’s probabilities, so the student learns how the teacher behaves, good and bad."
+  },
+  {
+    q: "A lab releases 8B, 70B, and 400B versions of a new model. According to the book, how were the smaller ones most likely made?",
+    options: [
+      "Distilled from the 400B model",
+      "Trained independently, so the large model’s biases don’t limit them",
+      "Fine-tuned from the 70B model"
+    ],
+    answer: 1,
+    why: "Model families are generally trained independently. Distillation is most useful when a lab has only one large model, as with DeepSeek-R1."
+  },
+  {
+    q: "Why were the DeepSeek-R1 distills built on Llama 3 and Qwen 2.5 so practical?",
+    options: [
+      "They scored higher than R1 on benchmarks",
+      "They were small and could reuse all the existing performance work for those popular architectures",
+      "They didn’t need GPUs"
+    ],
+    answer: 1,
+    why: "The distills scored lower than R1 but were small and ran on popular architectures, so existing optimizations applied immediately."
   }
 ]} />

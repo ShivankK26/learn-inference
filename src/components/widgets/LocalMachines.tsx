@@ -13,7 +13,7 @@ const models = [
   { name: "8B dense", total: 8, active: 8 },
   { name: "32B dense", total: 32, active: 32 },
   { name: "70B dense", total: 70, active: 70 },
-  { name: "120B MoE (≈5B active)", total: 120, active: 5 },
+  { name: "gpt-oss-120b (MoE, ~5B active)", total: 117, active: 5.1 },
 ];
 const precisions = [
   { name: "16-bit", bytes: 2 },
@@ -60,21 +60,22 @@ export default function LocalMachines() {
                 {mc.memGB} GB memory · {mc.gbps.toLocaleString("en-US")} GB/s · about {mc.cost}
               </div>
               <div className="mt-3 text-sm">
-                Needs <b>{weightGB} GB</b> for weights →{" "}
+                Needs <b>{Math.round(weightGB * 10) / 10} GB</b> for weights →{" "}
                 {fits ? <span className="text-good">fits</span> : <span className="text-bad">doesn’t fit</span>}
               </div>
               <div className="mt-2">
                 <div className="text-xs text-ink-faint">Max speed for one user</div>
-                <div className="text-2xl font-semibold text-accent">{fits ? `${Math.round(tps)} tok/s` : "–"}</div>
+                <div className="text-2xl font-semibold text-accent">{fits ? `${Math.round(tps).toLocaleString("en-US")} tok/s` : "–"}</div>
               </div>
             </div>
           );
         })}
       </div>
       <p className="mt-4 text-xs text-ink-faint">
-        Speed ceiling = memory bandwidth ÷ bytes read per token (only the active weights, for MoE). Real speeds are lower. The
-        5090 is faster when a model fits; the Mac fits far bigger models. Aggressive quantization and MoE make large models
-        possible at home.
+        Speed ceiling = memory bandwidth ÷ bytes read per token (only the active weights, for MoE). Real speeds are lower,
+        and the fit check here is weights only, plus about 10% slack. The 5090 is faster when a model fits; the Mac fits far
+        bigger models. The gpt-oss-120b sizes (about 117B total, 5.1B active parameters) are OpenAI’s published figures, not
+        from the book.
       </p>
     </Widget>
   );

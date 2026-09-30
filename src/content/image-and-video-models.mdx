@@ -1,93 +1,344 @@
 <TLDR>
-  Image generators don't write pixels one at a time. They start with **pure static** and clean the *whole* image up a
-  little on each of ~30–50 steps. Video models do the same thing, but for a whole clip at once, which makes them
-  enormously expensive.
+  Image generators don’t write pixels one at a time. They’re **pipelines of models**: a text encoder reads the prompt, a
+  denoising model starts from **pure noise** in a compressed **latent space** and refines the *whole* image a little on
+  each of ~30–50 steps (two forward passes per step), and a VAE turns the result into pixels. Video models do the same
+  thing for a whole clip at once, with a time axis added, which makes them some of the most compute-hungry models in
+  existence. And because they process everything at once, image and video inference is **compute-bound**.
 </TLDR>
+
+## The second style of generative model
+
+The [neural networks lesson](/learn/neural-networks) introduced the two styles of transformer-based model. LLMs use
+**autoregressive token generation**: start from a sequence and predict the next token, over and over. Image and video
+models mostly use **iterative denoising**: start from random noise and refine it, over and over, toward the most likely
+output. That process is called **diffusion**.
+
+Image generation models slightly **predate the public rise of LLMs**: both closed models from **Midjourney** and open
+**Stable Diffusion** models were first released in the summer of 2022, a few months before ChatGPT.
 
 ## Not one model, a pipeline
 
-An LLM is basically one big model. An image generator is a **team of models** working in sequence:
+An LLM is basically one monolithic model. An image generation model isn’t: it’s a **pipeline of multiple models**
+working together. Within a foundation model for image generation there are three essential components:
 
-1. **Text encoder**: turns your prompt into something the image model can understand.
-2. **Denoising model**: the heart of it. It turns noise into an image, guided by the prompt.
-3. **VAE** (<Term def="Variational Autoencoder: converts between the compact ‘latent’ version of an image and actual pixels.">variational autoencoder</Term>):
-   converts the finished result from the model's compact internal format into real pixels.
+1. **Text encoder**: converts the text prompt into instructions (embeddings) that the image model can understand.
+2. **Denoising model**: the heart of the model. It iterates from noise to an image, guided by the prompt.
+3. **VAE** (<Term def="Variational autoencoder: converts between the compact ‘latent’ version of an image and actual pixels.">variational autoencoder</Term>):
+   converts the model’s output from **latent space** to **pixel space**, the actual image.
 
-On top of that, people often bolt on extras: **LoRAs** (small add-ons that change the style) and **ControlNets**
-(outlines or poses that steer the composition). Tools like ComfyUI exist just for wiring these pipelines together.
+<Note kind="beyond">
+  The denoiser reads the prompt through **cross-attention** (from the [attention lesson](/learn/attention-and-kv-cache)):
+  the image being generated supplies the queries, and the text encoder’s embeddings supply the keys and values. That’s
+  how each patch of the image “looks at” the relevant words of the prompt. The VAE also has an encoder half, used to turn
+  real images into latents during training (and for image-to-image editing).
+</Note>
 
-## Working in "latent space"
+This **pipeline mentality** extends through the whole image-model ecosystem. Beyond the base model, image inference
+often includes:
 
-A 1024×1024 image has over a million pixels. Attention over every pixel would be impossibly expensive. So image
-models work on a **compressed version** of the image called **latent space**, something like a 128×128 grid, about
-**1% the size** of the real image. Only at the very end does the VAE blow it back up into pixels.
+- **LoRAs**: lightweight fine-tunes that change the style or enhance quality.
+- **ControlNets**: outlines and edges that steer the output image to match broad shapes and colors.
+
+The open-source ecosystem around image models is vast. Tools like **ComfyUI** exist for building complex pipelines of
+foundation models and adaptations, swapping components in and out to produce unique outputs.
+
+For an inference engineer, the pipeline structure matters: a single “image request” is really several models run in
+sequence, each with its own cost, and each of which can be swapped, cached or optimized on its own.
+
+## Latent space: why nobody denoises pixels
+
+The **entire pipeline operates in latent space**. An ordinary HD image of 1,024 × 1,024 pixels has well over a million
+pixels, and the denoising model needs to **calculate attention over the entire image in parallel**. Doing that in pixel
+space would be infeasible.
+
+**Latent space** is a low-dimensional representation of the image. A latent for a 1,024 × 1,024 image might be
+**128 × 128**: about one percent of the values of the pixel space it represents. Only at the very end does the VAE expand
+it back into full-resolution pixels.
+
+<Worked title="Why latent space makes attention affordable">
+
+1. **Pixel space**: 1,024 × 1,024 = 1,048,576 positions.
+2. **Latent space**: 128 × 128 = 16,384 positions, which is 16,384 ÷ 1,048,576 ≈ **1.6%** of the positions.
+3. Attention compares every position with every other, so its cost grows with the **square** of the number of positions:
+   - Pixel space: (1,048,576)² ≈ 1.1 × 10¹² pairs.
+   - Latent space: (16,384)² ≈ 2.7 × 10⁸ pairs.
+4. Ratio: (1,048,576 ÷ 16,384)² = 64² = **4,096× fewer** attention pairs.
+
+Shrinking the image by 8× on each side makes attention about four thousand times cheaper. That’s the difference between
+impossible and routine.
+
+</Worked>
+
+<Note kind="beyond">
+  In most modern pipelines, the VAE shrinks each side of the image by 8× (1,024 → 128), and the diffusion transformer
+  then groups the latent into small patches (commonly 2 × 2), each becoming one token. A 1,024 × 1,024 image ends up
+  as about 64 × 64 = **4,096 tokens** of attention: the same size as the sequence in the book’s attention example.
+</Note>
 
 <Analogy>
-  Like an artist working on a **small thumbnail sketch** instead of a giant canvas. All the real decisions happen on
-  the thumbnail, then it gets enlarged at the end.
+  Like an artist working on a **small, detailed thumbnail** instead of a giant canvas. Every real decision (composition,
+  color, what goes where) happens on the thumbnail. At the very end, an expert enlarger (the VAE) blows it up to full
+  size and fills in the fine texture.
 </Analogy>
 
-## From noise to picture
+## From noise to picture: the denoising loop
 
-The latent starts as random noise. On each **step**, the denoising model looks at the whole latent and nudges it to
-look a bit more like "a sunset over hills" (or whatever you asked for).
+The latent space is **initialized with random values**: pure noise. The denoising model then refines that noise into an
+image over a series of **steps**, based on the text prompt. The book’s Figure 2.10 shows this as a strip of frames: a
+field of static, then blurry blobs of color, then recognizable shapes, then a finished image, over **30 to 50 steps**.
+
+Two contrasts with LLMs are worth holding onto:
+
+- **Each step updates the entire latent space.** An LLM adds one token per forward pass; a denoising step rewrites
+  every part of the image at once.
+- **The number of steps is fixed up front.** An LLM runs until it emits a stop token. An image model runs its configured
+  number of steps, then stops.
 
 <Denoise />
 
-Some important details:
+### Two forward passes per step
 
-- Most models use **30 to 50 steps**.
-- Each step actually runs the model **twice**: once *with* your prompt and once *without*. The two results are blended,
-  and how strongly depends on the **guidance scale**. So a 50-step image is really **100 forward passes**.
-- Unlike an LLM, every step updates the **entire image**, not one piece.
+Within each step, the model actually runs **two forward passes**: one **with conditioning** (the text prompt) and one
+**without conditioning**. The two results are then combined, and how they’re combined is set by the **guidance scale**.
+Because of this two-part step, **a 50-step image generation actually takes 100 forward passes** of the denoiser.
 
-The main knobs you pass with a request:
+<Worked title="Counting forward passes">
 
-| Setting | What it does |
-|---|---|
-| **Prompt** | What the image should show |
-| **Negative prompt** | What it should *not* show |
-| **Steps** | More = better quality but slower (usually 30–50) |
-| **Guidance scale** | Creativity vs. sticking to the prompt (often around 4) |
-| **Image size** | Picked from a fixed menu of resolutions |
+1. 50 steps × 2 passes per step = **100** denoiser forward passes.
+2. 30 steps × 2 = **60** passes. Cutting steps from 50 to 30 removes 40% of the denoising work.
+3. Compare an LLM: a 100-token answer also takes about 100 forward passes, but each one processes a single new token,
+   while each image pass processes the entire latent. That’s why an image pass is so much heavier.
 
-## How the models have evolved
+</Worked>
 
-Modern image models are built on **diffusion transformers**: the same transformer idea as LLMs, but working on patches
-of image instead of tokens of text. The pipeline shape has stayed similar, but every component has grown:
+<Note kind="beyond">
 
-| Part | SDXL (2023) | Qwen Image (2025) |
+**What the guidance scale does, in math.** This technique is called **classifier-free guidance**. At each step the
+model predicts the noise to remove twice, once with the prompt (ε-conditional) and once without (ε-unconditional),
+then combines them:
+
+```
+guided prediction = ε_unconditional + s × (ε_conditional − ε_unconditional)
+```
+
+The difference (ε_conditional − ε_unconditional) is “the direction the prompt pushes the image.” With a guidance scale
+*s* of 1 you get the plain prompted prediction. Larger *s* exaggerates the prompt’s push: more prompt adherence, less
+creative freedom, and eventually over-saturated, unnatural images. In most pipelines the **negative prompt** is used in
+place of the empty prompt for the unconditional pass, which is how it steers the image *away* from what you describe.
+
+</Note>
+
+### The knobs on every request
+
+The generation process is controlled request by request through **inference arguments**. The most important ones:
+
+| Argument | What it does | Effect on cost |
 |---|---|---|
-| Text encoder | Small CLIP model | A full 7B vision-language model |
+| **Prompt** | Describes what the image should look like | Tiny (one text-encoder pass) |
+| **Negative prompt** | Separately describes styles or objects that should *not* be in the image | Usually free: it fills the unconditional pass that runs anyway |
+| **Number of steps** | Trades speed against quality; 30 to 50 for most models | Linear: half the steps, about half the denoising time |
+| **Guidance scale** | Balances creativity against prompt adherence; generally an integer around 4 | The *scale* is free, but guidance is why each step costs two passes |
+| **Image size** | Chosen from a fixed menu of resolutions and aspect ratios | Large: more pixels means a bigger latent, and attention grows with its square |
+
+<Note kind="beyond">
+  **Why image size is so expensive.** Doubling an image from 1,024 to 2,048 pixels per side gives 4× as many latent
+  positions, so attention in each pass does roughly 4² = **16×** the work, while the linear layers do about 4× the work.
+  Models also only produce good results at the resolutions they were trained on, which is why the size comes from a
+  fixed menu rather than being any number you like.
+</Note>
+
+## What’s inside: diffusion transformers
+
+While these core mechanisms are common to all image generation models, their architecture has evolved a lot. Modern
+image models are built on **diffusion transformers**. A diffusion transformer is very similar to the transformers LLMs
+use, but instead of processing embeddings of discrete tokens, it **processes image data**.
+
+Diffusion transformers look at images in **patches**. When a text-to-image model is trained, the images in the training
+data are fed in as **patches of 2 × 2 or 4 × 4** pixels, which are embedded into latent space. Inference runs in the
+opposite direction: the model works in latent space, and the latent is transformed back to pixels once the generation
+is final.
+
+### A worked pipeline: SDXL
+
+A clean example of the multi-model pipeline is **Stable Diffusion XL (SDXL)**. It’s an old model, but its architecture
+remains relevant. The book’s Figure 2.11 (adapted from the SDXL paper) traces a request through it:
+
+1. The **prompt** goes into the **text encoder**, which produces the conditioning embeddings.
+2. A latent full of **random noise** goes into the **base** diffusion model, which denoises it step by step into a
+   coherent (but not yet polished) latent image.
+3. That latent goes into the **refiner**, a second diffusion model, which adds details and improves prompt adherence.
+4. The **VAE decoder** turns the final latent into pixels.
+
+SDXL’s pipeline contains **two diffusion models for denoising**, the base and the refiner, trained for separate tasks:
+the base goes from pure noise to a coherent image, while the refiner adds details and makes sure the image follows the
+prompt.
+
+<Note kind="beyond">
+  Two details of SDXL: it actually uses **two** CLIP-family text encoders whose outputs are combined, and its denoiser
+  is a **U-Net** (a convolutional network with transformer attention blocks inside) rather than a pure diffusion
+  transformer. Pure diffusion transformers took over in the generations after SDXL, including the Qwen Image family
+  below.
+</Note>
+
+### How modern models compare
+
+Modern models **substantially outperform SDXL**: better prompt adherence; accurate faces, hands and details; legible
+text rendered inside the image; and support for image-to-image inference. Models like the **Qwen Image** family are
+broadly similar to the SDXL pipeline, but with **larger and more capable models at every step**:
+
+| Component | SDXL (2023) | Qwen Image (2025) |
+|---|---|---|
+| Text encoder | CLIP-based model | Qwen 2.5 VL (7B) |
 | Denoiser | Under 4B parameters | 20B parameters |
+| VAE | Single encoding | Dual encoding |
 
-Using a real LLM as the text encoder is a big reason modern models can render legible text and follow detailed prompts.
-The newest research even builds image models *like* LLMs, generating image tokens one at a time.
+According to the book, the big jump in capability comes from **larger component models and more complex pipelines**:
 
-## Fewer steps = faster
+- **Legible text and photorealistic faces** come from switching from tiny NLP models to **full LLMs** (here a 7B
+  vision-language model) for text encoding. A model that really understands language can follow a detailed prompt and
+  knows how words are spelled.
+- The **denoiser grew about 5×**, from under 4B to 20B parameters.
 
-Since the steps are the slow part, one obvious trick is to **use fewer of them**. **Few-step models** are trained to
-produce an image in **8 or fewer steps**, making them roughly **80–90% faster**, at some cost in quality. They're usually
-made by *distillation* (training a small, fast model to imitate a big one). They're great for things like real-time
-filters where speed beats perfection. (Tick the checkbox in the demo above.)
+These larger models take more resources to run. GPUs have become more powerful as models grew, but inference engineers
+**can’t rely on hardware gains alone** to run them efficiently.
 
-## Video: images, but much bigger
+### Image models that work like LLMs
 
-Video models are like image models with an extra dimension: **time**. Early approaches generated one frame, then the
-next, and so on, but small errors piled up until the video fell apart. Modern models hold the **entire clip** in
-latent space and refine all frames together, with every frame attending to every other frame.
+The latest research direction is **blending diffusion transformer architecture with LLM architecture**. The book’s
+reasoning:
 
-The cost is brutal. Video models have 3–5× more parameters than image models, 10–100× more data in latent space, and
-typically need **a whole machine of 8 GPUs working on one video**, taking several seconds per second of footage. The
-book compares today's video models to where LLMs were a couple of years ago: slow, sometimes unrealistic, and limited
-to short outputs.
+- **Anything that can be tokenized can be modeled as an LLM**, and images can be tokenized.
+- LLMs have **baked-in text understanding**, and they’re already an important component of image pipelines (as the text
+  encoder).
+- LLMs solve problems inherent to diffusion. Diffusion models can only produce a **fixed-size output**; LLMs are
+  autoregressive and can produce **variable-length output**. And where image models need **up to 100 forward passes** to
+  produce an image, an LLM generates each token in a **single forward pass**.
+
+Models like **HunyuanImage-3.0** use this LLM-style architecture.
+
+<Note kind="beyond">
+  One pass per token doesn’t automatically mean faster: an image still has to be represented by thousands of tokens,
+  and each needs its own pass. The trade-off is different rather than strictly better, which is part of why this is
+  still a research frontier rather than the default.
+</Note>
+
+## Few-step models: skip most of the steps
+
+The most time-consuming part of image generation is the **30 to 50 denoising steps**. Rather than making each step
+faster, what if a model could just use **fewer steps**?
+
+**Few-step image generation models** are trained to do exactly that: create high-resolution images in **eight or fewer
+denoising steps**. They’re **80 to 90 percent faster** out of the box than traditional image models, though their output
+quality is **noticeably lower**.
+
+There are two main ways to create them:
+
+- **Latent consistency**: train a model to **predict the target latent directly**, then repeat the prediction **two to four
+  times** to improve quality.
+- **Distillation**: use **adversarial distillation** and/or **progressive distillation** to train a small model to
+  emulate a larger one in fewer steps.
+
+**Distillation is more common today.** When new image models like **FLUX** and **Qwen Image** are released, the open
+community creates distilled versions alongside quality- and style-oriented LoRAs.
+
+The book’s advice: if you have a **latency-sensitive** use case where **quality is less important**, like real-time
+generative filters, consider a few-step model. (Tick the few-step box in the demo above to feel the difference.)
+
+<Worked title="Where “80–90% faster” comes from">
+
+1. Standard model: 50 steps × 2 passes = **100** denoiser passes.
+2. Few-step model at 4 steps × 2 passes = **8** passes, which is 92% fewer.
+3. The measured end-to-end speedup (80–90%) is a bit smaller than the pass count suggests, because some work doesn’t
+   shrink with the step count: running the text encoder once and the VAE decoder once.
+
+</Worked>
+
+<Note kind="beyond">
+  Many distilled models also have guidance “baked in” during distillation, so they run **one** pass per step instead of
+  two, which roughly halves the remaining denoising cost. Adversarial distillation is the technique behind models like
+  SDXL Turbo, and latent consistency models (LCMs) come from the paper of the same name. Both are in the book’s reading
+  list.
+</Note>
+
+## Video generation: images plus time
+
+Video generation models are **architecturally similar to image generation models, just bigger**. They have **three to
+five times more parameters** and encode **ten to one hundred times more information** in latent space.
+
+### Why not just generate frame by frame?
+
+The naive approach is to work frame by frame, and early video generation did exactly that: generate a starting frame,
+then use that frame to generate the next one, and so on. The problem is **error accumulation**. Small issues early on
+compound with every frame, and the video **goes off the rails quickly**.
+
+Instead, modern video models **hold the entire video in latent space** and modify all of it on each denoising step.
+**Each frame attends to every other frame**, and every frame is updated on every forward pass.
+
+If the latent space of an image model represents two physical dimensions, **X and Y**, the latent space of a video model
+represents three: **X, Y and T (time)**.
+
+### The limits of video models
+
+- **Fixed length.** Just as image models have fixed aspect ratios, videos have a **fixed number of frames**. Modern video
+  models create sequences of **a few seconds**.
+- **The constraint is compute.** Even on the latest GPUs, attention over such a massive latent space is extremely
+  expensive, taking **several seconds of inference for each second of video**.
+- **Batch size of one.** Video models are so compute-intensive that they typically run with a **batch size of one**: a
+  **full node of eight GPUs** works on a single request.
+- **Same step count.** Although each denoising step is expensive, video models use about the same total number of steps
+  as image models, **generally around 50**.
+
+<Worked title="Why “10–100× more information” is so painful">
+
+Attention cost grows with the **square** of the number of latent positions that attend to each other.
+
+1. Suppose an image is ≈ 4,096 latent tokens (see the note on latent space above).
+2. A video with 10× the latent information is ≈ 41,000 tokens; with 100× it’s ≈ 410,000 tokens.
+3. If every position attends to every other, attention per pass grows by 10² = **100×** up to 100² = **10,000×**.
+
+That squared growth, not the parameter count, is why a single short clip can occupy a whole 8-GPU node.
+
+</Worked>
+
+### Where video is today
+
+Video generation is a recent modality compared with LLMs and image generation. The book observes that **its limitations
+line up with the limitations LLMs had about two years earlier**:
+
+| LLMs (late 2023) | Video generation models (late 2025) |
+|---|---|
+| High time to first token, low tokens per second | Slow generation times |
+| Frequent hallucinations | Unrealistic physics |
+| Maxed out Ampere GPUs | Max out Blackwell GPUs |
+| Limited context windows | Short video outputs |
+
+Today those limitations are mostly gone from LLMs. Removing them from cinematic video generation, and from related areas
+like **world models**, **3D object generation** (which works in X, Y and Z rather than X, Y and T), and other generative
+rendering models, is a **highly active area of research**.
+
+One important direction comes back around to **autoregressive generation**, just like blending LLM architecture into
+image models. Rather than pure frame-by-frame generation, with its unusable error accumulation, new techniques like
+**Self Forcing** combine a **global view of quality** with an **iterative approach** to generation. Adding
+autoregressive components to video models can **partially address the attention bottleneck**, though attention remains
+the most important and most expensive component of inference.
+
+## What this means for inference
+
+Image and video models are relatively small, about **a tenth as many parameters as frontier language models**, but
+their attention is **just as computationally demanding**. Like LLM prefill, attention for media has to consider the
+**entire image or video at once** in latent space. So image and video inference is **bottlenecked on compute**, not
+memory. The [next lesson](/learn/bottlenecks) explains exactly what that means, and
+[Serving image & video models](/learn/serving-images-video) covers the specific optimizations for these modalities.
 
 <KeyPoints>
-- Image generation is a **pipeline**: text encoder → denoiser → VAE.
-- It works in compressed **latent space** (~1% of the pixels).
-- It starts from noise and refines the **whole image** over ~30–50 steps, with 2 forward passes per step.
-- **Few-step** models trade some quality for ~80–90% speedups.
-- Video = the same idea across time, and it's extremely compute-hungry.
+- Image generation is a **pipeline**: text encoder → denoiser → VAE, often plus LoRAs and ControlNets (assembled in tools like ComfyUI).
+- Everything happens in **latent space**: 128 × 128 instead of 1,024 × 1,024, about 1% of the values and ~4,096× fewer attention pairs.
+- The latent starts as **noise** and the **whole image** is refined over **30–50 steps**; each step is **two forward passes** (with and without the prompt), so 50 steps = 100 passes.
+- Request knobs: prompt, negative prompt, steps, guidance scale (≈ 4), image size (fixed menu).
+- Modern models (e.g. Qwen Image: 7B VLM text encoder, 20B denoiser) beat SDXL mainly through **bigger components**, especially LLM text encoders.
+- **Few-step** models (≤ 8 steps, via latent consistency or distillation) are 80–90% faster with noticeably lower quality.
+- **Video** = the same idea over X, Y and T: 3–5× the parameters, 10–100× the latent, all frames attending to all frames, batch size 1 on an 8-GPU node.
+- Image and video models are compute-bound.
 </KeyPoints>
 
 <Quiz questions={[
@@ -98,19 +349,53 @@ to short outputs.
     why: "Each step runs once with the prompt and once without, then blends them. So 40 steps × 2 = 80 passes."
   },
   {
-    q: "Why do image models work in latent space instead of on pixels?",
-    options: [
-      "Pixels can’t be stored on GPUs",
-      "Latent space is far smaller (~1%), which makes attention affordable",
-      "It makes images more colorful"
-    ],
-    answer: 1,
-    why: "Attention over a million pixels would be infeasible. The compressed latent is about 1% the size."
+    q: "A latent is 8× smaller than the image on each side. Roughly how much cheaper is attention over the latent than over pixels?",
+    options: ["8×", "64×", "About 4,096×"],
+    answer: 2,
+    why: "8× per side means 64× fewer positions. Attention compares every position with every other, so the cost drops by 64² ≈ 4,096×."
   },
   {
-    q: "Why did early frame-by-frame video generation go 'off the rails'?",
+    q: "What do SDXL’s two diffusion models (base and refiner) each do?",
+    options: [
+      "The base encodes text; the refiner decodes pixels",
+      "The base goes from pure noise to a coherent image; the refiner adds details and improves prompt adherence",
+      "They generate the left and right halves of the image"
+    ],
+    answer: 1,
+    why: "They were trained for separate tasks: the base handles noise-to-coherent-image, and the refiner polishes details and prompt adherence."
+  },
+  {
+    q: "According to the book, what is the main source of modern image models’ ability to render legible text and realistic faces?",
+    options: [
+      "Faster GPUs",
+      "Switching from tiny NLP text encoders to full LLMs, plus much larger denoisers",
+      "Using more denoising steps"
+    ],
+    answer: 1,
+    why: "Qwen Image, for example, uses a 7B vision-language model as its text encoder and a 20B denoiser (about 5× SDXL’s)."
+  },
+  {
+    q: "You need real-time generative filters on live video and can accept lower image quality. What should you consider?",
+    options: ["A larger denoiser", "A few-step model (8 or fewer steps)", "A higher guidance scale"],
+    answer: 1,
+    why: "Few-step models, made by latent consistency or distillation, are 80–90% faster out of the box, with noticeably lower quality: a good fit for latency-sensitive uses."
+  },
+  {
+    q: "Why did early frame-by-frame video generation go ‘off the rails’?",
     options: ["Too few GPUs", "Small errors accumulated with every new frame", "The prompt was too long"],
     answer: 1,
-    why: "Each frame was built on the last, so mistakes compounded. Modern models refine the entire clip together instead."
+    why: "Each frame was built on the previous one, so mistakes compounded. Modern models hold the entire clip in latent space and refine all frames together."
+  },
+  {
+    q: "A video latent holds 10× as much information as an image latent, and every position attends to every other. Roughly how much more attention work per pass is that?",
+    options: ["10×", "100×", "1,000×"],
+    answer: 1,
+    why: "Attention grows with the square of the number of positions: 10² = 100×. At 100× more information it would be 10,000×."
+  },
+  {
+    q: "Image and video models have about a tenth the parameters of frontier LLMs. What’s their inference bottleneck?",
+    options: ["Memory bandwidth, like decode", "Compute, like prefill", "Network bandwidth"],
+    answer: 1,
+    why: "Their attention works over the entire latent at once, like LLM prefill, which is a lot of math for each byte moved, so they’re compute-bound."
   }
 ]} />

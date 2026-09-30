@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import type { Metadata } from "next";
 import { course, findLesson, readyLessons } from "@/lib/course";
 import { DoneCheck, MarkComplete } from "@/components/Progress";
+import { lessonToc } from "@/lib/toc";
 
 export const dynamicParams = false;
 
@@ -22,6 +23,7 @@ export default async function LessonPage({ params }: PageProps<"/learn/[slug]">)
   if (!found) notFound();
   const { lesson, prev, next } = found;
   const { default: Content } = await import(`@/content/${slug}.mdx`);
+  const toc = lessonToc(slug);
 
   return (
     <div className="mx-auto flex max-w-6xl gap-10 px-4 sm:px-6">
@@ -67,6 +69,23 @@ export default async function LessonPage({ params }: PageProps<"/learn/[slug]">)
             <span>{lesson.minutes} min read</span>
             <span>Book: {lesson.bookSections}</span>
           </div>
+          {toc.length > 2 && (
+            <details open className="mt-8 rounded-xl border border-line bg-card px-5 py-4 text-[0.95rem]">
+              <summary className="cursor-pointer font-semibold text-ink-soft select-none">
+                In this lesson <span className="font-normal text-ink-faint">· {toc.length} sections</span>
+              </summary>
+              <ol className="mt-3 grid gap-x-6 gap-y-1.5 sm:grid-cols-2">
+                {toc.map((t, i) => (
+                  <li key={t.id} className="flex gap-2">
+                    <span className="w-5 shrink-0 text-right tabular-nums text-ink-faint">{i + 1}</span>
+                    <a href={`#${t.id}`} className="text-ink hover:text-accent hover:underline hover:underline-offset-4">
+                      {t.text}
+                    </a>
+                  </li>
+                ))}
+              </ol>
+            </details>
+          )}
           <div className="prose mt-10">
             <Content />
           </div>

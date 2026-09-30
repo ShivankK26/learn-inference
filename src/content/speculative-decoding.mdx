@@ -3,183 +3,402 @@ import NgramSpec from "@/components/widgets/NgramSpec";
 
 <TLDR>
   Decode normally makes **one token per trip through the model**, while the GPU’s math units sit mostly idle.
-  **Speculative decoding** uses that spare compute: something cheap *guesses* several upcoming tokens, and the big model
-  *checks* them all in one pass. Every guess it accepts is a token you got for free.
+  **Speculative decoding** spends that idle compute: something cheap *guesses* several upcoming tokens, and the big model
+  *checks* them all in one pass. Every guess it accepts is a token you got almost for free, and the output is exactly
+  what the big model would have written anyway.
 </TLDR>
 
 ## The opportunity: idle compute during decode
 
-Recall from Chapter 2 that <Memory>decode</Memory> is **memory-bound**. To make each token, the GPU reads every weight
-from memory, and at low or moderate batch sizes its compute mostly waits around.
+The decode phase of LLM inference is **autoregressive**: tokens are generated one at a time, each depending on all the
+ones before it. From Chapter 2, the bottleneck on <Memory>decode</Memory> is **memory bandwidth**. At low to moderate
+batch sizes, the GPU spends each step streaming the model’s weights out of memory while its <Compute>compute</Compute>
+sits mostly idle.
 
-What if one trip through the weights could produce **two, three, or more** tokens instead of one? Tokens per second
-would jump. That’s the idea behind speculative decoding.
+Speculative decoding takes advantage of that spare compute to try to generate **multiple tokens per forward pass through
+the target model**. If an engine could produce two, three, or more tokens for each round trip of the weights through
+memory, it would generate far more tokens per second.
+
+### Why checking five tokens costs about the same as making one
+
+The key fact that makes this work: in a memory-bound pass, the cost is dominated by **reading the weights**, and the
+weights are read **once per pass no matter how many token positions the pass processes**. Processing five positions
+instead of one is like a tiny prefill: five times the math, same memory traffic. As long as the extra math fits in the
+idle compute, the pass takes about the same time.
+
+<Worked title="When verification is free, and when it isn’t">
+
+Use the simplified model from the bottlenecks lesson: an 8B-parameter model in FP16 on an H100 (989 TFLOPS,
+3.35 TB/s). Each token position in a forward pass costs about 2 × 8 × 10<sup>9</sup> = 16 GFLOP of math.
+
+1. **Memory time per pass** (reading 16 GB of weights): 16 GB ÷ 3,350 GB/s ≈ **4.8 ms**, regardless of how many positions
+   the pass processes.
+2. **Compute time per pass**: 16 GFLOP × (positions in the pass) ÷ 989 TFLOPS ≈ **0.016 ms per position**.
+3. **One user, 4 drafts**: the pass verifies 1 + 4 = 5 positions → 0.08 ms of math. That’s far below 4.8 ms, so the pass
+   still takes about **4.8 ms**. The four extra positions were free.
+4. **The crossover** is where compute time equals memory time: 4.8 ÷ 0.016 ≈ **295 positions per pass**, which is exactly
+   the H100’s ops:byte ratio from Chapter 2.
+5. **A busy server, 256 users, 4 drafts each**: 256 × 5 = 1,280 positions → 1,280 × 0.016 ≈ **20.7 ms** of math per pass,
+   now far above 4.8 ms. The pass is compute-bound and more than 4× slower. Even if each user gets 3.36 tokens per pass
+   (see below), that’s 20.7 ÷ 3.36 ≈ 6.2 ms per token, versus 4.8 ms without speculation. **Speculation made everyone
+   slower.**
+
+</Worked>
+
+That single calculation explains most of the rules in this lesson: why speculation works, why it needs spare compute,
+and why it must be switched off at high batch sizes.
 
 <Note kind="tip">
-  Speculative decoding speeds up **tokens per second** (and <Term def="Inter-token latency: the time between one output token and the next. The flip side of tokens per second.">inter-token latency</Term>).
-  It does **not** improve time to first token, since prefill is unchanged.
+  Speculative decoding speeds up **tokens per second** and
+  <Term def="Inter-token latency: the time between one output token and the next. The flip side of tokens per second.">inter-token latency</Term>.
+  It does **not** improve time to first token: prefill is unchanged.
 </Note>
 
-## How every version of it works
+## The mechanism every version shares
 
-There are several algorithms, but they all share the same three steps:
+There are several algorithms for speculative decoding, but they share one mechanism:
 
-1. A **speculator** produces one or more **draft tokens**, its guesses at what comes next.
-2. The **target model** (the big model you’re actually trying to speed up) **checks** those drafts to see whether they
-   match what it would have produced itself.
-3. The target model **accepts** every correct draft up to the first wrong one, then produces **one more token of its
-   own** to finish the pass.
+1. The **speculator** generates one or more **draft tokens**.
+2. The **target model** (the underlying model you’re trying to accelerate) **validates** these tokens, checking whether
+   they match what it would have generated.
+3. The target model **accepts any valid draft tokens** and **generates one additional token itself**, completing the
+   forward pass.
 
-So each forward pass yields **N + 1 tokens**, where N is the number of accepted drafts. Even if every guess is wrong,
-you still get the one token you would have gotten anyway. The book’s Figure 5.3 shows this cycle: generate drafts,
-validate them, accept the correct prefix, then add the target’s own next token.
+So each forward pass (each iteration of the decode loop) produces **N + 1 tokens**, where N is the number of accepted
+drafts. The book’s Figure 5.3 shows this cycle: draft tokens are generated, validated, the correct prefix is accepted,
+and the target adds its own next token.
+
+<Worked title="One forward pass, token by token">
+
+The text so far is “The capital of France is”. The speculator proposes four drafts:
+**“ Paris”, “,”, “ a”, “ city”**.
+
+1. The target runs **one** forward pass over the last real token plus all four drafts. At each position it computes what
+   *it* would have produced next:
+
+| Position | Target’s own choice | Draft | Result |
+|---|---|---|---|
+| after “is” | “ Paris” | “ Paris” | ✓ accept |
+| after “Paris” | “,” | “,” | ✓ accept |
+| after “,” | “ which” | “ a” | ✗ reject |
+| after “ a” | (not used) | “ city” | discarded |
+
+2. The first two drafts match, so they’re accepted.
+3. The third draft doesn’t match. It’s rejected, and **everything after it is discarded too**, because the fourth draft
+   was a guess about what follows “ a”, which never happened.
+4. At the rejected position the target already computed its own choice, “ which”, so that becomes the bonus token.
+
+Result: **3 tokens** (“ Paris”, “,”, “ which”) from one pass, where plain decode would have produced 1. If every draft
+had been rejected, the pass would still produce the target’s own first token, so you never get *fewer* than one.
+
+</Worked>
+
+<Note kind="beyond">
+  **Why the output is identical to the target’s.** With greedy decoding (temperature 0), each accepted draft is by
+  definition the token the target itself would have picked, and at the first mismatch the target’s own token is used.
+  So the final text is exactly what the target alone would have written, just produced in fewer passes. With
+  temperature above 0, engines use **speculative sampling**: a draft token is accepted with probability
+  min(1, p<sub>target</sub> ÷ p<sub>draft</sub>), and on a rejection the replacement is sampled from the leftover
+  probability the draft under-weighted. That rule provably produces the same probability distribution as sampling from
+  the target directly (Leviathan et al., 2022, which is in the book’s reading list). This is why the book counts
+  speculation among the **lossless** techniques. The rejected drafts’ entries are also rolled back out of the KV cache.
+</Note>
 
 <Analogy title="Think of it like a sudoku">
-  Solving a sudoku is hard. Checking whether a filled-in sudoku is correct is easy. For the target model, *generating*
-  a token is solving the puzzle, while *verifying* a draft token is just checking someone else’s answer. That’s why
-  checking several guesses costs far less than producing each token from scratch.
+  Solving a sudoku is hard. Checking whether a filled-in sudoku is correct is easy. For the target model, *generating* a
+  token is like solving the puzzle, while *validating* a draft token is like checking a finished one.
 </Analogy>
 
-Drafts aren’t free, though: making them takes compute and memory. How much you gain depends on three factors:
+## What determines the speedup
 
-1. **Draft token cost**: how long it takes to produce each guess.
-2. **Draft sequence length**: how many guesses are made per pass.
-3. **Token acceptance rate**: what fraction of guesses the target model accepts.
+Generating drafts isn’t free: it takes both compute and memory. But validating a draft is much faster for the target
+than generating an original token. The performance uplift of any speculative decoding strategy depends on three factors:
 
-Acceptance is high for the first guess and gets worse deeper into the sequence. On top of that, **once one guess is
-rejected, every guess after it is thrown away too**. So the winning strategy is **short draft sequences with a high
-acceptance rate**. Try it:
+1. **Draft token cost**: the time it takes to generate one draft token.
+2. **Draft sequence length**: how many draft tokens are generated per forward pass.
+3. **Token acceptance rate**: the percentage of draft tokens the target model accepts.
+
+The acceptance rate is **high early in the draft sequence**, and draft tokens get **less reliable deeper in the
+sequence**. Combined with the rule that **once one draft is rejected, all later drafts are rejected too**, this leads to
+the book’s advice: **aim for short, high-percentage sequences**. Generating and validating drafts, while cheap compared
+with generating tokens in the original model, still comes with meaningful overhead.
+
+### The math behind “short and high-percentage”
+
+<Note kind="beyond">
+  The standard way to model this: say each draft is accepted with probability **α** (given that all drafts before it
+  were accepted), and the speculator proposes **k** drafts. You get j + 1 tokens when the first j drafts are accepted.
+  Adding up the chances that each draft survives gives the expected tokens per pass:
+
+  ```
+  expected tokens per pass = 1 + α + α² + … + α^k = (1 − α^(k+1)) ÷ (1 − α)
+  ```
+
+  Each extra draft only adds α<sup>i</sup>, the chance that *all* drafts up to that one were right, which shrinks
+  fast. And the total can never exceed 1 ÷ (1 − α), however many drafts you add. Real acceptance also falls deeper into
+  the sequence (as the book notes), which makes long drafts even less rewarding than this formula suggests.
+</Note>
+
+<Worked title="Tokens per pass, and the real speedup after paying for drafts">
+
+**Step 1: expected tokens per pass** at α = 0.8:
+
+| Drafts (k) | Calculation | Tokens per pass |
+|---|---|---|
+| 1 | (1 − 0.8²) ÷ 0.2 | 1.80 |
+| 2 | (1 − 0.8³) ÷ 0.2 | 2.44 |
+| 4 | (1 − 0.8⁵) ÷ 0.2 | 3.36 |
+| 8 | (1 − 0.8⁹) ÷ 0.2 | 4.33 |
+| ∞ | 1 ÷ 0.2 | 5.00 (ceiling) |
+
+Doubling from 4 to 8 drafts adds only 29% more tokens.
+
+**Step 2: pay for the drafts.** If each draft costs a fraction **c** of a target pass, one speculative pass costs
+(1 + k × c) target passes, so:
+
+```
+speedup = tokens per pass ÷ (1 + k × c)
+```
+
+| Drafts (k) | Cheap drafts, c = 0.05 | Pricier drafts, c = 0.15 |
+|---|---|---|
+| 1 | 1.80 ÷ 1.05 = 1.71× | 1.80 ÷ 1.15 = 1.57× |
+| 2 | 2.44 ÷ 1.10 = 2.22× | 2.44 ÷ 1.30 = 1.88× |
+| 4 | 3.36 ÷ 1.20 = 2.80× | 3.36 ÷ 1.60 = 2.10× |
+| 8 | 4.33 ÷ 1.40 = 3.09× | 4.33 ÷ 2.20 = 1.97× |
+
+With pricier drafts, 8 drafts is *worse* than 4: the extra guesses cost more than they return.
+
+**Step 3: what the user feels.** Say a plain decode pass takes 20 ms (50 tokens/s). With k = 4 and c = 0.05, one
+speculative pass takes 20 × 1.2 = 24 ms and yields 3.36 tokens: 24 ÷ 3.36 ≈ 7.1 ms per token, about **140 tokens/s**.
+
+</Worked>
+
+Try it. The simulator draws real accept/reject outcomes pass by pass and shows the same formulas with your settings:
 
 <SpecDecode />
 
-Play with the sliders and notice:
+Things to notice:
 
 - With a high acceptance rate, each pass produces several tokens. Drop the rate and you’re back near one per pass.
-- Longer drafts help less and less, because the chance that *all* of them are right shrinks quickly. Look at the
-  speedup bars: there’s a sweet spot, and beyond it extra drafts cost more than they return.
-- Tick **Busy server** and the speedup shrinks or even goes below 1×.
+- The speedup bars show a **sweet spot**: beyond it, extra drafts cost more than they return. Raise the draft cost and
+  watch the sweet spot move left.
+- Tick **Busy server**. The verify cost jumps (it’s an illustrative number standing in for the compute crunch in the
+  first worked example), and the speedup shrinks or goes below 1×.
 
 ## What changes the acceptance rate
 
-Lots of things affect how often guesses are right:
+As the book puts it, working with speculation is interesting precisely because so many factors affect the acceptance rate:
 
-- **Temperature** is the big one. Higher temperatures make the target model’s choices more random and therefore harder
-  to predict, which lowers acceptance.
-- **Subject matter** matters too. A speculator that’s better at math than history will do better on math questions.
+- **Temperature is the big one.** Higher temperatures produce token distributions that are harder to predict, which
+  lowers acceptance and reduces the benefit.
+- **Subject matter** makes a difference too. If the draft model (or extra head) is better versed in, say, math than
+  history, acceptance will be higher on math.
 
-And one hard limit: speculative decoding only helps when there’s **spare compute**, which means **low batch sizes**. At
-high batch sizes the GPU’s compute is already saturated, so there’s nothing left for checking drafts. Engines have to
-**turn speculation off dynamically** when load is high.
+<Note kind="beyond">
+  Why temperature hurts: at temperature 0 the target always picks its single top token, and a decent speculator often
+  guesses it. At high temperature the target spreads probability over many tokens and samples among them, so even a
+  perfect speculator can’t reliably predict *which* one gets drawn. With speculative sampling, the acceptance
+  probability for a position is the overlap between the two models’ distributions, and flatter distributions overlap
+  less at the top.
+</Note>
 
-Each algorithm below handles these trade-offs differently, and picking and tuning the right one can improve tokens per
-second a lot.
+**The hard limit is batch size.** Speculative decoding is most useful at **low batch sizes** where there are spare
+compute cycles. At higher batch sizes, compute is too saturated to afford verification, so speculative decoding **must
+be dynamically disabled**. This is the conflict from the chapter intro: increasing the batch size reduces the compute
+available for speculation. It also means speculation trades **throughput and cost** for **latency**: to keep it
+switched on, you run smaller batches, which serves fewer users per GPU.
 
-## Method 1: draft-target (the original)
+Each algorithm below navigates these trade-offs differently. Careful implementation of the right algorithm for the
+situation can lead to major improvements in tokens per second.
 
-The first version of speculative decoding uses two separate models:
+## Method 1: draft-target speculative decoding
 
-- A **draft model**: a small extra model that makes the guesses.
-- The **target model**: your original model, which now checks drafts on top of its normal decoding.
+The original method uses **two models**:
 
-The key decision is **which draft model to use**. You want a high acceptance rate at minimal cost. Usually the draft
-model is a **smaller member of the same model family**, since it shares the tokenizer and behaves similarly. Rule of
-thumb: the draft model should be **at least 10× smaller** (by parameter count) than the target. Fine-tuning or
-distillation can raise its acceptance rate by teaching it to behave more like the target.
+- A **draft model**: an additional model that generates draft tokens.
+- The **target model**: the original model, which now verifies drafts in addition to its ordinary decoding.
 
-**Pros:** it works out of the box, with no training or fine-tuning needed.
+**The most important decision is which draft model to use.** A good draft model has a **high acceptance rate** while
+requiring **minimal resources** to run. Draft models are most often **smaller members of the same family** as the
+target, because they share its tokenizer and much of its behavior. The rule of thumb: **the draft model should be at
+least ten times smaller** by parameter count than the target. **Fine-tuning or distillation** can raise a small draft
+model’s acceptance rate by teaching it to behave more like the target.
 
-**Cons:** it has the **most overhead** of any method. Even a small draft model needs its own weights, activations, and
-KV cache in memory, plus compute for its own prefill. The two models also have to be coordinated so they don’t fight
-over resources (engines like TensorRT-LLM handle this orchestration). Other methods generally perform better.
+<Note kind="beyond">
+  A shared tokenizer isn’t optional: verification compares token IDs position by position, so the draft and target must
+  split text into exactly the same tokens. A typical pairing would be a 70B target with a 1B–3B draft from the same
+  model family.
+</Note>
 
-## Method 2: Medusa (extra heads on the model itself)
+**When to use it:** draft-target is a good choice when you want something **quick to set up out of the box**, with no
+training or fine-tuning.
 
-**Medusa** was one of the first alternatives. Instead of running a separate draft model, you **fine-tune the target
-model** so that one forward pass produces extra guesses.
+**Why other methods usually win:** draft-target introduces **the most overhead of any speculative decoding method**.
+Even though the draft model is small, the engine must:
 
-It works by grafting **additional decoder heads** onto the model. A normal LLM has one head that predicts the next
-token. Medusa adds **two to four more heads**, each predicting a token further ahead. The book’s Figure 5.4 shows these
-heads stacked on top of the target model, each producing one draft token. As usual, the drafts are checked on the next
-forward pass.
+- store the draft model’s **weights, activations, and KV cache** in GPU memory;
+- dedicate compute cycles to the draft model’s own **prefill**;
+- run the draft and target **in coordination** so they don’t compete for resources (engines like **TensorRT-LLM**
+  handle this orchestration).
 
-Medusa is still limited in how many drafts it makes and how often they’re accepted, and it isn’t widely used in
-production today. But it **inspired EAGLE**, which is.
+<Worked title="The hidden memory bill of a draft model">
 
-## Method 3: EAGLE (a purpose-built speculator)
+A 3B-parameter draft model in BF16 needs 3 × 10<sup>9</sup> × 2 bytes = **6 GB** just for its weights, plus its own KV
+cache for every active request. On an 80 GB GPU that might already be tight holding a large target’s weights, that’s 6
+GB less for the target’s KV cache, which means fewer concurrent requests or shorter contexts. The draft model also has
+to prefill every prompt itself before it can start guessing.
 
-The problem with using an off-the-shelf small model as a draft model is that it was designed for a different job. A
-model like Qwen 0.5B is built to be a decent **standalone** chatbot on cheap hardware, not to guess tokens alongside a
-huge model on a B200. It’s inefficient for this job and its acceptance rate is fairly low.
+</Worked>
 
-**EAGLE** is a draft model **built from scratch for speculation**. It generates up to about **eight draft tokens**
-(twice as many as Medusa) with a **very high acceptance rate**.
+## Method 2: Medusa
 
-Its trick is to use information the target model has already computed. As an LLM works, it builds up rich
-**hidden states** between its layers, and ordinary draft models never see them. EAGLE is trained to take
-**three hidden states** as input (one from an **early** layer, one from a **middle** layer, and one from a **late**
-layer) and to output draft tokens. That’s the diagram in the book’s Figure 5.5: hidden states in, draft tokens out.
+**Medusa** was one of the first alternatives to draft-target speculation. It tackles the complexity and overhead of
+running a separate draft model by instead **fine-tuning the target model** to generate additional tokens per forward
+pass.
 
-A few practical details:
+Fine-tuning for Medusa means **grafting additional decoder heads** onto the model. An ordinary LLM has a **single**
+decoder head that predicts the next token; Medusa adds **two to four more heads**, which generate **sequential draft
+tokens**: one head guesses the token after next, the next head the one after that, and so on. The book’s Figure 5.4
+shows these heads stacked on top of the target model, each producing one draft token on top of the token the target
+generates itself. As with draft-target, the drafts are **validated on the next forward pass**.
 
-- EAGLE models are usually **under one billion parameters** and get better with more training data.
-- With engines like TensorRT-LLM, setup is fairly straightforward: you create the EAGLE head after training and run
-  single-sequence speculation.
-- EAGLE can be attached to the **same module** (the same PyTorch class) as the target model, so every forward pass runs
-  both together. That fixes another draft-target problem: repeated round trips to the CPU to coordinate two models.
+Medusa is still **limited in draft token count and acceptance rate**, and it isn’t widely used in production today. But
+it **inspired more popular techniques like EAGLE**.
 
-EAGLE is the **go-to general-purpose method** for teams that can train EAGLE heads, and inference engines support it
-well. Like all speculation, though, it needs **smaller batch sizes**, which means lower throughput and higher cost per
-token in exchange for lower latency.
+<Note kind="beyond">
+  A reason Medusa’s acceptance is limited: every head looks at the same final hidden state and guesses its position
+  independently. The head predicting three tokens ahead doesn’t know what the heads before it guessed, so its guesses
+  often don’t fit together. Medusa partly compensates by verifying several candidate combinations at once in a tree.
+</Note>
+
+## Method 3: EAGLE
+
+The main problem with using an **off-the-shelf pretrained model** as a draft model is that it was designed for a
+different job. A model like **Qwen 0.5B** is designed to be a good **standalone LLM on cheap hardware**, not to
+speculate draft tokens on a B200. Such draft models are **inefficient to run** and offer a **relatively low acceptance
+rate**.
+
+**EAGLE** offers an alternative: a **purpose-built draft model trained from scratch** to generate sequences of **up to
+eight draft tokens** (twice as many as Medusa) with a **very high acceptance rate**.
+
+Its key insight: during inference, LLMs accumulate a lot of context about upcoming tokens in the form of **hidden states
+between layers**. Traditional draft models never see this information. EAGLE is a draft model **trained to accept
+hidden states as input and generate speculative tokens as output**. Specifically, it’s trained on **three hidden
+states: one from an early layer, one from a middle layer, and one from a late layer**. That’s the book’s Figure 5.5:
+hidden states in, draft tokens out.
+
+The practical details from the book:
+
+- EAGLE models are often **under one billion parameters** and **scale well with more training data**.
+- With an engine like **TensorRT-LLM**, implementations tend to be straightforward, with **post-training EAGLE
+  creation** (you train the EAGLE head for an already-finished model) and **single-sequence speculation**.
+- EAGLE can be attached to the **same module (PyTorch class) as the target model**, so **each forward pass runs both the
+  target and the EAGLE speculator**. This unified pipeline solves draft-target’s other problem: **multiple round trips
+  to the CPU** to orchestrate two separate models.
+
+**EAGLE is the go-to speculation algorithm for general use** among inference engineers who have the knowledge and
+means to train EAGLE heads, and it’s **well supported by inference engines**. Like every speculation technique, though,
+using it for lower latency requires **reduced batch sizes**, which **lowers throughput and increases cost**.
+
+<Note kind="beyond">
+  EAGLE has gone through several versions, all in the book’s reading list. EAGLE-2 added dynamic draft trees (proposing
+  a small tree of alternatives and extending only the promising branches), and EAGLE-3 moved to combining features from
+  low, middle and high layers of the target, which is the three-hidden-state design the book describes. The reason
+  hidden states help so much is that the target has already done most of the thinking about what comes next; EAGLE
+  only has to read it out, rather than re-derive it from raw tokens the way a separate small model must.
+</Note>
 
 ## Method 4: n-gram speculation and lookahead decoding
 
-**N-gram speculation** takes a completely different approach: there’s **no draft model at all**.
+**N-gram speculation** uses a different mechanism entirely: **there is no draft model**.
 
-While building the KV cache during prefill, the engine also builds an
-<Term def="A lookup table mapping a token to the sequence of tokens that followed it earlier in the text.">n-gram dictionary</Term>:
-for each token in the input, it records the sequence of *N* tokens that followed it. During decode, each newly generated
-token is looked up in the dictionary, and if there’s a match, the stored continuation becomes the draft. The target
-model then checks those drafts as usual. (This is the book’s Figure 5.6: a dictionary mapping prefixes to likely
-suffixes.)
+Instead, **in parallel with generating the KV cache**, the engine constructs an
+<Term def="A lookup table mapping a token to a sequence of tokens that followed it earlier in the text.">n-gram dictionary</Term>.
+The dictionary maps a **single starting token** to an **observed sequence of N tokens** (the n-gram) that followed it.
+It contains common sequences from the input text and is **first built during prefill**. During decode, each newly
+generated token is **fed into the dictionary**, and any available suffix is selected as **draft tokens**. In the next
+forward pass, the target verifies them as normal. The book’s Figure 5.6 shows such a dictionary matching prefixes to
+likely suffixes, noting it’s especially useful for **constrained languages like code**.
+
+<Worked title="N-gram speculation while editing code">
+
+The user pastes this function and asks the model to multiply by quantity (treating each word and symbol as one token
+for simplicity):
+
+```python
+total = 0
+for item in cart:
+    total += item.price
+```
+
+1. **Prefill** builds the dictionary from the input, including entries like
+   `for → item in cart :` and `+= → item . price`.
+2. The model writes “total = 0”, then generates **“for”**. The dictionary suggests **“item in cart :”**, four drafts.
+   The target accepts all four and adds its own bonus token (the line break): **5 tokens in one pass**.
+3. Later it generates **“+=”**. The dictionary suggests **“item . price”**; all accepted, plus a bonus: 4 tokens.
+4. Next the target wants **“*”**, which never followed “price” in the input, so there’s no useful draft. From here
+   (“item . quantity”) the output is new text, and decode falls back to about one token per pass.
+
+Because most of an edit repeats the input, most passes produce many tokens.
+
+</Worked>
+
+Try both scenarios:
 
 <NgramSpec />
 
-Compare the two scenarios:
+The trade-off, per the book:
 
-- **Editing code**: the output mostly repeats the input with small changes, so long runs of drafts get accepted.
-- **Writing something new**: the output doesn’t resemble the input, the dictionary rarely helps, and you’re back to
-  about one token per pass.
+- **Longer drafts:** while EAGLE generates around eight draft tokens with decent acceptance, n-gram sequences **can
+  exceed ten tokens**.
+- **Narrow usefulness:** acceptance is only high when the **model’s output is similar to its input**. So n-gram
+  speculation is mostly used for **code completion and code revision**, where syntax is predictable and output closely
+  matches input. **Within that domain, it easily outperforms EAGLE.**
 
-That’s exactly the trade-off. N-gram drafts can be **much longer** than EAGLE’s, often **more than ten tokens**
-compared with about eight. But acceptance is only high when the **output closely resembles the input**. So n-gram
-speculation is mostly used for **code completion and code revision**, where syntax is predictable and the output copies
-much of the input. In that niche it **easily beats EAGLE**.
+**Lookahead decoding** is a similar method that **generates n-grams during inference** to fill the dictionary, rather
+than relying only on the input. It’s **more general** than n-gram speculation because it doesn’t depend as much on
+highly repetitive context, but it **requires extra compute** to generate the n-grams.
 
-**Lookahead decoding** is a close cousin. Instead of only harvesting n-grams from the input, it **generates n-grams
-during inference** to fill the dictionary. That makes it more general (it doesn’t need such repetitive context), but it
-costs extra compute to produce those n-grams.
+<Note kind="beyond">
+  Lookahead decoding fills its dictionary by guessing several future positions at once and refining those guesses over
+  successive passes (a technique called Jacobi iteration). The refined guesses become n-grams that later passes can
+  propose as drafts. That guessing is the extra compute the book mentions, which is why it suits systems that have
+  compute to spare.
+</Note>
 
 ## The methods side by side
 
-| Method | Where drafts come from | Needs training? | Strengths | Weaknesses |
-|---|---|---|---|---|
-| **Draft-target** | A separate small model (≥10× smaller, same family) | No (fine-tuning helps) | Quick to set up | Most overhead; lower acceptance |
-| **Medusa** | 2–4 extra decoder heads on the target | Yes (fine-tune the target) | No second model | Limited drafts and acceptance; rarely used now |
-| **EAGLE** | A small purpose-built model reading the target’s hidden states | Yes (train the EAGLE head) | Up to ~8 drafts, high acceptance, runs in the same pass | Needs training; requires smaller batches |
-| **N-gram** | A dictionary built from the prompt | No | Very long drafts (10+); best for code | Only works when output resembles input |
-| **Lookahead** | N-grams generated during inference | No | More general than n-gram | Uses extra compute |
+| Method | Where drafts come from | Training needed? | Typical drafts | Best for | Main cost |
+|---|---|---|---|---|---|
+| **Draft-target** | Separate small model, ≥10× smaller, same family | No (fine-tuning helps) | Few | Quick setup | Most overhead: extra weights, KV cache, prefill, coordination |
+| **Medusa** | 2–4 extra decoder heads on the target | Yes, fine-tune the target | 2–4 | Historical; inspired EAGLE | Limited drafts and acceptance |
+| **EAGLE** | Small purpose-built model reading 3 hidden states | Yes, train the EAGLE head | Up to ~8 | General use; the default | Training effort; needs smaller batches |
+| **N-gram** | Dictionary built from the prompt during prefill | No | 10+ | Code completion and revision | Useless when output differs from input |
+| **Lookahead** | N-grams generated during inference | No | Varies | Systems with excess compute | Extra compute |
 
-Every one of these has the same goal: **fewer forward passes** to produce the full answer, which means lower latency
-and more tokens per second for each user during decode. N-gram speculation shines for code; lookahead decoding
-generalizes when you have compute to spare; EAGLE is the default everywhere else.
+Every speculative decoding algorithm aims to **reduce the total number of forward passes** needed to generate a
+complete output sequence. That improves overall latency, and specifically **tokens per second per user during decode**.
+To summarize the book’s guidance: **n-gram speculation excels at code completion and similar tasks, lookahead decoding
+generalizes in systems with excess compute**, and **EAGLE** is the go-to everywhere else if you can train it.
+
+### Choosing in practice
+
+1. **Is the system latency-sensitive and running small batches?** If traffic is throughput-bound with big batches,
+   speculation will mostly be switched off anyway.
+2. **Does the output copy the input** (code edits, rewrites, templated text)? Start with **n-gram**.
+3. **Can you train a speculator?** If yes, **EAGLE**. If not, and you need something today, **draft-target** with a
+   same-family model at least 10× smaller.
+4. **Measure** acceptance rate and tokens per second at your real temperature, subject matter and batch sizes, and tune
+   the draft length. The sweet spot is found, not assumed.
 
 <KeyPoints>
-- Decode leaves compute idle. Speculation spends it on **guessing tokens** that the target checks in one pass: **N + 1 tokens per pass**.
-- Checking is cheap, like verifying a solved sudoku. Gains depend on **draft cost, draft length, and acceptance rate**.
-- Prefer **short, high-acceptance** drafts: one rejection discards the rest of the draft.
-- Acceptance drops with **higher temperature** and depends on subject matter. Speculation only pays off at **low batch sizes**.
-- **Draft-target** is easy but heavy; **Medusa** adds heads; **EAGLE** reads hidden states and is the go-to; **n-gram** wins on code; **lookahead** is the general version.
-- Speculation improves **TPS**, not TTFT, and trades throughput for latency.
+- Decode is memory-bound, so a pass costs about the same whether it processes 1 position or a handful. Speculation uses that slack: **N + 1 tokens per pass**.
+- Verification checks each draft against the target’s own choice; the first mismatch is replaced by the target’s token, so output quality is unchanged.
+- Expected tokens per pass = (1 − α<sup>k+1</sup>) ÷ (1 − α), capped at 1 ÷ (1 − α). Real speedup = that ÷ (1 + k × draft cost). Hence **short, high-acceptance drafts**.
+- Acceptance falls with **temperature** and depends on **subject matter**. At **high batch sizes** compute saturates and speculation must be **disabled dynamically**.
+- **Draft-target**: easy, most overhead. **Medusa**: 2–4 extra heads, rarely used now. **EAGLE**: reads 3 hidden states, up to ~8 drafts, the go-to. **N-gram**: 10+ drafts, wins on code. **Lookahead**: general, costs compute.
+- Speculation improves **TPS/ITL, not TTFT**, and trades throughput and cost for latency.
 </KeyPoints>
 
 <Quiz questions={[
@@ -187,32 +406,64 @@ generalizes when you have compute to spare; EAGLE is the default everywhere else
     q: "A speculator proposes 4 draft tokens. The target accepts the first 2 and rejects the 3rd. How many tokens does this forward pass produce?",
     options: ["2", "3", "4"],
     answer: 1,
-    why: "The 2 accepted drafts, plus the one token the target model generates itself. The 4th draft is discarded because it came after a rejection."
+    why: "The 2 accepted drafts plus the one token the target computed itself at the rejected position. The 4th draft is discarded because it guessed what follows a token that was never produced."
   },
   {
-    q: "Your server is under heavy load with large batches. What should happen to speculative decoding?",
+    q: "With a per-draft acceptance rate of 0.8 and 3 drafts per pass, about how many tokens do you expect per forward pass?",
+    options: ["About 2.4", "About 2.95", "4"],
+    answer: 1,
+    why: "(1 − 0.8⁴) ÷ (1 − 0.8) = (1 − 0.4096) ÷ 0.2 ≈ 2.95. You only get all 4 tokens when every draft is accepted, which happens 41% of the time."
+  },
+  {
+    q: "Acceptance is 0.8, you use 4 drafts, and each draft costs 10% of a target pass. What’s the approximate speedup?",
+    options: ["About 3.4×", "About 2.4×", "About 1.2×"],
+    answer: 1,
+    why: "Tokens per pass = (1 − 0.8⁵) ÷ 0.2 ≈ 3.36. Each pass costs 1 + 4 × 0.1 = 1.4 target passes. 3.36 ÷ 1.4 ≈ 2.4×."
+  },
+  {
+    q: "No matter how many drafts you add, what’s the most tokens per pass you can expect with an acceptance rate of 0.75?",
+    options: ["4", "8", "Unlimited"],
+    answer: 0,
+    why: "The ceiling is 1 ÷ (1 − α) = 1 ÷ 0.25 = 4. Each additional draft contributes α^i, which shrinks toward zero."
+  },
+  {
+    q: "Your server is under heavy load with large batches. What should happen to speculative decoding, and why?",
     options: [
-      "Use more draft tokens to catch up",
-      "Turn it off, because there’s no spare compute left for checking drafts",
-      "Switch to a higher temperature"
+      "Use more drafts to catch up",
+      "Disable it dynamically: verification multiplies the math per pass, and with compute already saturated, passes get slower than the tokens gained",
+      "Raise the temperature"
     ],
     answer: 1,
-    why: "Speculation spends idle compute. At high batch sizes compute is saturated, so engines disable speculation dynamically."
+    why: "Speculation only spends idle compute. With 256 users × 5 positions, an 8B model on an H100 goes from about 4.8 ms per pass to about 20 ms, making every user slower. Engines switch it off under load."
   },
   {
-    q: "What makes EAGLE different from a regular draft model?",
+    q: "Why does speculative decoding (with greedy decoding) produce exactly the same text as the target model alone?",
     options: [
-      "It’s a bigger model than the target",
-      "It’s trained to read the target’s hidden states (early, middle, late layers) and predict draft tokens",
+      "Because the draft model is fine-tuned to match",
+      "Because each draft is kept only if it equals the target’s own choice at that position, and the first mismatch is replaced by the target’s token",
+      "It doesn’t; it’s a small approximation"
+    ],
+    answer: 1,
+    why: "Every accepted token is one the target would have picked anyway. With sampling, speculative sampling’s acceptance rule preserves the target’s distribution exactly, which is why the book calls it lossless."
+  },
+  {
+    q: "What makes EAGLE a better speculator than an off-the-shelf small model like Qwen 0.5B?",
+    options: [
+      "It’s bigger than the target",
+      "It’s purpose-built and reads the target’s hidden states from early, middle and late layers, runs in the same module (no CPU round trips), and proposes up to ~8 drafts with high acceptance",
       "It needs no training"
     ],
     answer: 1,
-    why: "EAGLE is purpose-built for speculation and uses hidden states the target already computed, giving up to ~8 drafts with high acceptance."
+    why: "A standalone small LLM is designed to run on cheap hardware, not to guess for a big model. EAGLE uses the context the target already computed, which raises acceptance, and runs in the same forward pass."
   },
   {
-    q: "For which job does n-gram speculation beat EAGLE?",
-    options: ["Writing a new poem", "Revising existing code", "Translating to another language"],
+    q: "Users complain about long waits before the first token when they paste 50-page documents. Will speculative decoding help?",
+    options: [
+      "Yes, it speeds up everything",
+      "No: speculation only speeds up decode (TPS/ITL); the wait before the first token is prefill",
+      "Only with n-gram speculation"
+    ],
     answer: 1,
-    why: "N-gram drafts come from the prompt itself, so they work when the output closely matches the input, as in code completion and code revision."
+    why: "Time to first token is set by prefill of the long input, which speculation doesn’t touch. Caching or more prefill compute are the relevant tools there."
   }
 ]} />

@@ -51,6 +51,12 @@ export default function FlashCompare() {
         {mode === "standard"
           ? "The big S and P matrices get written out and immediately read back. That’s pure waste."
           : "The answer is exactly the same (no quality loss), but most of the slow memory traffic is gone."}
+        <div className="mt-2 text-xs text-ink-faint">
+          In the book’s example (N = 4,096, d = 128, FP16):{" "}
+          {mode === "standard"
+            ? "132 MiB of memory traffic, 128 MiB of it just S and P going out and back. About 62 FLOPs per byte: memory-bound."
+            : "about 4 MiB in the ideal case (read Q, K, V once, write O once). About 2,048 FLOPs per byte: compute-bound. Real kernels re-read some K and V tiles, so actual traffic is somewhat higher."}
+        </div>
       </div>
     </Widget>
   );

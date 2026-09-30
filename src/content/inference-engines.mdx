@@ -1,4 +1,5 @@
 import EngineChooser from "@/components/widgets/EngineChooser";
+import ChunkedPrefill from "@/components/widgets/ChunkedPrefill";
 
 <TLDR>
   An **inference engine** is a ready-made, highly configurable model server. There are three serious options:
@@ -9,20 +10,83 @@ import EngineChooser from "@/components/widgets/EngineChooser";
 
 ## Why inference engines exist
 
-You *could* hand-write optimized PyTorch for every model. Inference engines save you from that. They ship with
-pre-optimized components for common architectures, so instead of re-implementing the same things over and over, you
-spend your time **testing combinations of techniques** through configuration. Their power comes from being
-**configurable**.
+According to the book, there are **three competitive inference engines on the market: vLLM, SGLang and TensorRT-LLM.**
+They offer good out-of-the-box performance for LLMs and for other modalities with similar architectures (vision,
+embedding and speech models, [Chapter 6](/learn/vision-and-embeddings)).
 
-They give great out-of-the-box performance for LLMs and for other kinds of model built on similar architectures
-(Chapter 6). As of late 2025, **vLLM** (via *vLLM Omni*) and **SGLang** (via *SGLang Diffusion*) also started
-supporting some **image and video generation** models. **TensorRT-LLM does not**; for those models you'd use TensorRT
-or PyTorch directly (Chapter 6).
+You *could* hand-write optimized PyTorch for every model you serve. Engines save you from that. Their power comes from
+being **configurable**: they ship pre-optimized components for common architectures, so instead of **repeating routine
+implementations**, inference engineers spend their time **testing combinations of techniques** through configuration.
 
-All three include the essentials out of the box, like
-<Term def="Mixing new requests into the running batch token by token, instead of waiting for a whole batch to finish. Also called in-flight batching.">continuous batching</Term>,
-and they support all the main speed-up techniques you'll meet in Chapter 5: quantization, speculative decoding, prefix
-caching, parallelism and disaggregation.
+Image and video models are a partial exception. In **late 2025**, vLLM and SGLang began supporting some image and video
+generation models, via **vLLM Omni** and **SGLang Diffusion** respectively. **TensorRT-LLM does not support image or
+video generation models.** For those, you can also use TensorRT or PyTorch directly
+([Serving image & video models](/learn/serving-images-video)).
+
+All three engines run **out of the box with core features like continuous batching**, and all three support the main
+performance techniques of [Chapter 5](/learn/quantization): **post-training quantization, speculative decoding, prefix
+caching, parallelism and disaggregation**.
+
+## What an engine actually does
+
+The book treats engines mostly as black boxes you configure. To configure them well, it helps to know what’s inside.
+
+<Note kind="beyond">
+  Every modern LLM engine is built from roughly the same parts:
+
+  - **An API server** that accepts requests over HTTP (all three offer an OpenAI-compatible API, so the same client code
+    works against any of them), applies the chat template, tokenizes the prompt, and streams tokens back.
+  - **A scheduler** that decides, many times per second, which requests get to run in the next step.
+  - **A KV cache manager** that hands out GPU memory for each request’s KV cache in small fixed-size blocks (the
+    PagedAttention idea from [Making attention faster](/learn/faster-attention)) and frees it when a request finishes.
+  - **A model runner** that executes one forward pass for everything the scheduler picked, using optimized kernels
+    (FlashAttention-style attention, tuned GEMMs, fused operations), often replayed as CUDA graphs.
+  - **A sampler** that turns each request’s logits into its next token (temperature, top-k, top-p, structured output).
+
+  The engine runs these in a loop: **schedule → forward pass → sample → stream tokens → free finished requests →
+  schedule again**. One trip around that loop is an *iteration*, and during decode each iteration produces one new token
+  for every request in the batch.
+</Note>
+
+### Continuous batching
+
+The book lists continuous batching as the core feature every engine ships with. The idea is easiest to see by comparing
+it with the naive alternative.
+
+<Worked title="Static vs. continuous batching">
+  Four requests share a batch with 4 slots. They need **10, 50, 200 and 20** output tokens.
+
+  1. **Static batching**: the batch starts together and runs until its longest member finishes, **200 iterations**.
+     Slots are busy for 10 + 50 + 200 + 20 = 280 token-steps out of 4 × 200 = 800 available, so the GPU’s batch is only
+     **35% full** on average. Worse, a fifth request that arrives at iteration 11 waits until iteration 200 to start.
+  2. **Continuous batching**: the scheduler re-forms the batch **every iteration**. When the 10-token request finishes at
+     iteration 10, the waiting fifth request takes its slot at iteration 11. Slots stay full as long as there’s demand.
+  3. **Result**: much higher throughput from the same GPU, and much lower waiting time for new requests, because work
+     joins and leaves the batch **token by token** instead of batch by batch.
+
+  You can watch static, dynamic and continuous batching side by side in [Autoscaling](/learn/autoscaling).
+</Worked>
+
+TensorRT-LLM calls its token-level version **in-flight batching**; it’s the same concept.
+
+### Chunked prefill
+
+Continuous batching mixes requests that are *prefilling* (processing a new prompt) with requests that are *decoding*
+(generating tokens). That creates a new problem. A single **huge prompt** needs a long, compute-heavy prefill, and if it
+runs as one giant iteration, **every other user’s token stream freezes** until it’s done.
+
+**Chunked prefill** splits a long prompt’s prefill into chunks and interleaves them with other requests’ decode steps.
+(The book lists it among TensorRT-LLM’s features; the glossary describes it as preventing single long sequences from
+monopolizing resources.)
+
+<ChunkedPrefill />
+
+<Note kind="beyond">
+  vLLM and SGLang support chunked prefill too. The chunk size is a real trade-off you’ll see in engine configs: **smaller
+  chunks** keep everyone else’s streaming smooth (lower inter-token latency), while **larger chunks** finish the long
+  prompt’s prefill sooner (lower time to first token for that request) and use the GPU more efficiently. It’s the same
+  kind of interference that, at larger scale, motivates [disaggregation](/learn/disaggregation).
+</Note>
 
 ## The three engines at a glance
 
@@ -34,105 +98,169 @@ caching, parallelism and disaggregation.
 | **Hardware** | GPU, TPU | NVIDIA, AMD | NVIDIA only |
 | **License** | Apache 2.0 | Apache 2.0 | Apache 2.0 |
 
-In one sentence: **vLLM and SGLang are general, easy to adopt, and support new models from day zero; TensorRT-LLM has a
-steeper learning curve but usually wins on performance.** At Baseten (where the author works) all three are used, with
-TensorRT-LLM the most common. A good inference engineer knows all three and **chooses per deployment**.
+At a very high level: **vLLM and SGLang are more general tools that are easier to adopt and have day-zero support for
+more models, while TensorRT-LLM has a steeper learning curve but usually achieves the best performance.**
+
+The book is explicit that this isn’t a “pick one forever” decision. At Baseten (where the author works), all three
+frameworks are used, with **TensorRT-LLM used the most**. The recommendation: **be familiar with all three and select on
+a deployment-by-deployment basis.**
 
 ## vLLM
 
-**vLLM has the largest market share.** At the time the book was written, it had twice as many GitHub stars as SGLang
-and TensorRT-LLM combined. (Stars are only a rough measure of popularity.)
+**vLLM has the largest market share among inference engines.** GitHub stars are only a rough measure of popularity, but
+at the time the book was published, vLLM had **twice as many stars as SGLang and TensorRT-LLM combined**.
 
-- **History**: released in summer 2023, a few months before the others. Created at UC Berkeley, now hosted by the
-  PyTorch project within the Linux Foundation.
-- **Biggest strength: breadth.** It runs on the most hardware (NVIDIA, AMD and Intel GPUs, plus Google TPUs) and
-  supports the most models. Nearly every open LLM works with vLLM from the day it's released.
-- **Multimodal**: *vLLM Omni* extends it to image, audio and video inputs and outputs.
-- **Setup**: `pip install`, or official Docker images with dependencies pre-bundled for different hardware.
+- **History**: first released in the **summer of 2023**, making it the oldest of the three by a few months. Originally
+  created at **UC Berkeley**, it’s now hosted by **the PyTorch Project within the Linux Foundation**.
+- **Best selling point: broad support.** It supports the **most hardware** (NVIDIA, AMD and Intel GPUs, plus Google
+  TPUs) and the **most models and architectures**. Just about every open LLM integrates with vLLM **from day zero**.
+- **Multimodal**: **vLLM Omni** extends the engine to image, audio and video **inputs and outputs**.
+- **Installation**: it’s **pip-installable**, and there are **official Docker images** with pre-bundled dependencies and
+  support for various hardware architectures.
 
-You run it with the `vllm serve` command, passing settings as flags. For example, serving a model across 8 GPUs looks
-something like this:
+<Note kind="beyond">
+  vLLM grew out of the research paper that introduced **PagedAttention** (Kwon et al., 2023, in the
+  [reading list](/reading)): managing the KV cache in small pages was the idea that let it fit far more concurrent
+  requests on a GPU than earlier servers, and it’s now standard across engines.
+</Note>
+
+### The constraints principle
+
+The book uses vLLM to illustrate one of the **core principles of inference engineering: the more constraints you can
+introduce, the better performance you can achieve.** A tool that runs every model on every piece of hardware can’t
+specialize as deeply as one that targets a narrow set. Properly configured, vLLM can achieve **impressive** results, but
+in the author’s experience it **falls short of the highest-end performance possible with narrow frameworks like
+TensorRT-LLM**. Breadth and peak speed pull in opposite directions.
+
+### Running it
+
+vLLM’s developer experience is built around the **`vllm serve`** command, with server configuration passed in as
+**flags**. The book’s Figure 4.4 shows an example on eight GPUs. A sketch of the idea (exact flags vary by version):
 
 ```bash
 vllm serve <model-name> --tensor-parallel-size 8
 ```
 
-<Note kind="deeper">
-  A core principle of inference engineering: **the more constraints you accept, the more performance you can get.** A
-  tool that runs everything everywhere can't specialize as deeply. Well configured, vLLM performs impressively, but in
-  the author's experience it falls short of the very top end that a narrower tool like TensorRT-LLM reaches.
-</Note>
+`--tensor-parallel-size 8` splits the model across all eight GPUs of a node, the technique covered in
+[Using many GPUs](/learn/parallelism).
 
 **Use vLLM when:**
-- You want a model server up quickly, with solid performance, for almost any open model.
-- You're running an "omni" model with multiple input and output types.
-- You're on a smaller GPU or an older architecture, where TensorRT-LLM offers little extra performance.
+- You want to **quickly stand up a model server** that offers solid performance out of the box for **almost any open
+  model**.
+- You want to run an **“Omni” model** with multiple input and output modalities.
+- You’re using a **smaller GPU or an older architecture**, where TensorRT-LLM offers few performance benefits.
 
 ## SGLang
 
-SGLang is the other big community-driven engine. It was released in **December 2023**, rose to prominence alongside
-Chinese open models like **DeepSeek** and **Qwen**, and is the engine of choice at **xAI**.
+**SGLang** is the other major community-driven fast inference framework. It was first released in **December 2023**, rose
+to prominence alongside **Chinese open models like DeepSeek and Qwen**, and is the **engine of choice for inference at
+xAI**.
 
-- **Its unique angle**: a fast backend runtime paired with a flexible frontend language. In practice, you can swap
-  out or customize **individual components** of the engine without rewriting everything else.
+- **Its unique angle**: SGLang pairs a **fast backend runtime** with a **flexible frontend language**. In practice, you
+  can **choose individual components of your engine for deep customization** without rewriting everything else from
+  scratch.
 - **Hardware**: NVIDIA and AMD GPUs.
-- **New models**: strong day-zero support. SGLang works directly with labs like DeepSeek, Qwen, Kimi and Z AI to ship
-  optimized versions of new architectural features, such as DeepSeek's Multi-Latent Attention.
-- **Big MoE at scale**: heavy investment in serving huge Mixture of Experts models across multiple machines, on systems
-  like **GB200 NVL72**. These setups are extremely cost-efficient for large models with a lot of traffic.
-- **Images and video**: *SGLang Diffusion* adds a **pipeline abstraction** that orchestrates the stages of an image or
-  video model (a close match to how those models are built, as you saw in Chapter 2). It adds diffusion-specific
-  parallelism and reuses SGLang's scheduler and optimized kernels.
+- **Day-zero support**: strong, for a wide range of models. SGLang works closely with labs like **DeepSeek, Qwen, Kimi
+  and Z AI** to release optimized implementations of new architectural features, such as DeepSeek’s **Multi-Latent
+  Attention**.
+- **Big MoE at scale**: SGLang has invested heavily in **large-scale deployments of MoE LLMs**, specifically **multi-node
+  deployments on systems like GB200 NVL72** ([Renting GPUs](/learn/instances)) for high throughput. These systems offer
+  **extremely cost-efficient inference for large models with significant traffic**.
 
-You launch it with `sglang.launch_server`, again with flags:
+<Note kind="beyond">
+  SGLang is also known for **RadixAttention**, its approach to prefix caching: it keeps cached KV blocks in a tree keyed
+  by token sequences, so any new request that shares a beginning with an earlier one (the same system prompt, the same
+  conversation so far) can reuse that work automatically. You’ll see why this matters in [Caching](/learn/caching).
+</Note>
+
+### Running it
+
+SGLang’s developer experience is built around the **`sglang.launch_server`** command, again with configuration passed as
+flags (the book’s Figure 4.5 shows an eight-GPU example). A sketch:
 
 ```bash
 python -m sglang.launch_server --model-path <model-name> --tp 8
 ```
 
+### SGLang Diffusion
+
+SGLang also supports image and video generation through **SGLang Diffusion**. It introduces a **pipeline abstraction**
+that **orchestrates a number of stages**, a flexible approach that maps closely to how image and video models are
+actually built (text encoder → denoiser → VAE, from [How image & video models work](/learn/image-and-video-models)). For
+performance, SGLang Diffusion adds support for **various diffusion-specific parallelism methods** and **reuses the
+scheduler and optimized kernels** from the main SGLang package.
+
 **Use SGLang when:**
-- You want excellent out-of-the-box throughput with decent latency on large MoE models like DeepSeek and Kimi.
-- You want an inference-engine experience for image and video generation models.
-- You want control and customization, and you're keen to take part in the SGLang community.
+- You want **excellent out-of-the-box throughput with decent latency on large MoE models** like DeepSeek and Kimi.
+- You want the **inference-engine experience for image and video generation** models.
+- You want **control and customization** and are excited to participate in the SGLang community.
 
 ## TensorRT-LLM
 
-TensorRT-LLM is **NVIDIA's open-source inference engine**, and of the three it offers the **highest performance** and
-the **most flexibility for experts**.
+**TensorRT-LLM is NVIDIA’s open-source inference engine.** Of the three main options, it offers the **highest
+performance** and the **most flexibility to expert users**.
 
 <Note kind="warn">
-  **The name is confusing.** There are two major versions, and only the old one is actually related to TensorRT:
-  - **V0 (versions 0.x.y)** was a plugin that built a TensorRT engine for serving language models.
-  - **V1 (versions 1.x.y)**, released in summer 2025, is a standalone package built on **PyTorch**, with no TensorRT
-    dependency at all.
+  **The name is confusing.** There are two major versions of TensorRT-LLM, and only the older one is actually related to
+  TensorRT:
 
-  Deployments of the old version are still common, so always check which one you're using.
+  - **TensorRT-LLM V0 (versions 0.x.y)**: a **plugin for NVIDIA TensorRT**. It built a TensorRT engine for serving
+    language models.
+  - **TensorRT-LLM V1 (versions 1.x.y)**: a **standalone package based on PyTorch**, with **no dependency on TensorRT**.
+    It bypasses TensorRT’s intermediate representation and uses PyTorch directly.
+
+  V1 was released in the **summer of 2025**. Deployments of the previous major version are still common, so **always
+  check which version you’re using**: docs, flags and behavior differ between them.
 </Note>
 
-**Why it's the fastest**: it has access to kernels written by NVIDIA's own engineers, including some that are closed
-source. These handwritten, hand-fused kernels have excellent support for the newest GPUs (Hopper, Blackwell) and for
-NVIDIA-specific number formats like **NVFP4** (Chapter 5).
+### Why it’s the fastest
 
-It has a robust implementation of **in-flight batching** (NVIDIA's name for continuous batching at the token level),
-which helps throughput. It also supports just about every optimization setting you could ask for: quantization,
-speculation algorithms, prefix caching,
-<Term def="Splitting a long prompt’s prefill into smaller chunks so it can be interleaved with other requests’ decode steps.">chunked prefill</Term>,
-flexible parallelism and disaggregation.
+TensorRT-LLM achieves the best performance largely because it has **access to kernels written by NVIDIA engineers,
+including some closed-source kernels**. These **handwritten and manually fused kernels** (the kind of work from
+[CUDA and kernels](/learn/cuda-and-kernels)) offer excellent support for the **latest hardware architectures like
+Hopper and Blackwell**, and for **NVIDIA-specific number formats like NVFP4** ([Quantization](/learn/quantization)). It’s
+the constraints principle in action: NVIDIA-only, so it can specialize all the way down.
 
-V1 feels a lot like vLLM and SGLang: a `trtllm-serve` command with flags, plus a `config.yaml` file for deeper
-customization. The recommended way to install it is through one of NVIDIA's official Docker containers.
+It also offers:
+
+- A **robust implementation of in-flight batching** (token-level continuous batching), which helps with throughput.
+- Support for **just about every model performance setting you could ask for**: quantization, speculation algorithms,
+  prefix caching, **chunked prefill**, flexible parallelism and disaggregation.
+
+### Running it
+
+With V1, TensorRT-LLM introduces a developer experience that looks a lot like vLLM and SGLang: a **`trtllm-serve`**
+command with flag arguments. In addition, it expects a **`config.yaml`** file for deeper customization (the book’s Figure
+4.6 shows an eight-GPU example). A sketch:
 
 ```bash
 trtllm-serve <model-name> --tp_size 8 --extra_llm_api_options config.yaml
 ```
 
-**Use TensorRT-LLM when:**
-- You're running a well-supported model architecture on a **Hopper or newer** GPU.
-- You're willing to do extra engineering work for the best possible performance.
-- (Optionally) you plan to use NVIDIA Dynamo and want the most deeply integrated engine.
+The best way to install TensorRT-LLM is by running it via **one of NVIDIA’s official Docker containers**, which bundle
+the exact library versions it needs.
 
-*The commands above are simplified sketches; the book shows full 8-GPU examples for each engine, and exact flags
-change between versions, so check each engine's docs.*
+**Use TensorRT-LLM when:**
+- You’re running a **well-supported model architecture on a Hopper or later GPU**.
+- You’re **willing to do extra engineering work** to get the best possible performance.
+- (Optionally) you’re planning to use **NVIDIA Dynamo** for serving and want the **most deeply integrated** engine.
+
+*The commands above are simplified sketches of the book’s figures. Exact flags change between versions, so check each
+engine’s docs.*
+
+<Note kind="beyond">
+  **Talking to any of them.** Because all three expose an OpenAI-compatible API, a client request looks the same
+  whichever engine you chose (the port depends on your setup):
+
+  ```bash
+  curl http://localhost:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model": "<model-name>", "messages": [{"role": "user", "content": "Hi!"}], "stream": true}'
+  ```
+
+  That’s a big practical advantage: you can benchmark vLLM, SGLang and TensorRT-LLM against the same traffic and switch
+  engines per deployment without changing your application code.
+</Note>
 
 ## Try it: pick an engine
 
@@ -140,52 +268,85 @@ change between versions, so check each engine's docs.*
 
 ## NVIDIA Dynamo: the layer on top
 
-**NVIDIA Dynamo** is a **distributed system for model serving**, announced at NVIDIA's GTC conference in March 2025. It
-doesn't replace inference engines. It **uses any of them (vLLM, SGLang or TensorRT-LLM) as backends** and adds an
-orchestration layer for large-scale deployments.
+**NVIDIA Dynamo** is a **distributed system for model serving**, first announced at **NVIDIA GTC in March 2025**. It
+doesn’t replace inference engines. It **works with every inference engine (vLLM, SGLang and TensorRT-LLM) as
+backends**, with Dynamo itself providing an **orchestration layer for large-scale deployments**.
 
 <Analogy>
   If an inference engine is one very well-run restaurant kitchen, Dynamo is the **head office running a chain of
-  kitchens**. It decides which kitchen gets each order, splits prep and cooking between specialized teams, and opens
-  or closes stations as the dinner rush comes and goes.
+  kitchens**. It decides which kitchen gets each order (sending regulars back to the kitchen that already knows their
+  usual), splits prep and cooking between specialized teams, and opens or closes stations as the dinner rush comes and
+  goes.
 </Analogy>
 
-It supports three big techniques (each explained fully in Chapter 5):
+Dynamo provides support for three essential techniques, each detailed in Chapter 5:
 
-- **KV cache re-use**: keeping KV cache data between requests and **routing requests to the machine that already has
-  a matching prefix** cached.
-- **Disaggregation**: running prefill and decode on **separate, individually optimized engines** that scale
-  independently.
-- **Multi-node parallelism**: optionally spreading one copy of a model across **two or more machines** of GPUs,
-  usually with expert parallelism.
+- **KV cache re-use**: retaining KV information **between requests** and **routing requests based on prefix match**, so a
+  request lands on the replica that already holds its prefix ([Caching](/learn/caching)).
+- **Disaggregation**: separating prefill and decode onto **individually optimized engines with independent scaling**
+  ([Disaggregation](/learn/disaggregation)).
+- **Multi-node parallelism**: optionally using **two or more nodes of GPUs in a single replica** of a model, usually with
+  **Expert Parallelism** ([Using many GPUs](/learn/parallelism)).
 
-Because Dynamo sees what's happening across the whole deployment in real time, it can **adjust as traffic changes**.
-For example, an **SLA-based planner** can automatically add or remove prefill and decode workers to meet the time to
-first token and tokens-per-second targets you set.
+As with the engines themselves, there’s a lot of work to do to **configure Dynamo for your use case** and achieve maximum
+performance. What you get for that work is visibility: Dynamo’s abstractions for distributed KV routing, disaggregation
+and multi-node parallelism **aggregate information across the whole deployment at runtime**, which allows **real-time
+adjustments to configuration as traffic fluctuates**.
+
+The book’s example: an **SLA-based planner** can automatically **scale prefill and decode workers up and down** to meet
+**user-defined TTFT and TPS constraints**. If long prompts start piling up, it adds prefill workers; if streaming slows,
+it adds decode workers.
 (<Term def="Service Level Agreement: a promised performance or reliability target, such as ‘first token in under 500 ms’.">SLA</Term>
-means the performance targets you've promised.)
+means the performance targets you’ve promised; see [Know your app](/learn/know-your-app).)
 
-### When Dynamo is (and isn't) worth it
+### When Dynamo is (and isn’t) worth it
 
-A general principle: **the more scale you have, the more optimization tools become available.** Dynamo is built for
-scale: big models, big traffic. It shines when serving foundation models like the **trillion-parameter Kimi** family
-to huge numbers of concurrent users. For smaller models on large deployments, it can still give moderate gains.
+A general principle from the book: **the more scale you have, the more tools and techniques are available to you** for
+inference optimization. Disaggregation, KV-aware routing and multi-node serving only pay off when there’s enough traffic
+to keep the extra machinery busy.
 
-It's a great choice if you're building an API for your own foundation model, or serving an open model inside a
-high-traffic product. **But many deployments don't need it.** Unless you have enough volume for disaggregation and
-KV-aware routing to matter, Dynamo is extra work and overhead, and you're better off using an inference engine
-directly.
+**Dynamo is built for scale: big models, big traffic.** It excels at serving foundation models like the
+**trillion-parameter Kimi** family to a large number of concurrent users. For **smaller models**, it can still offer
+**moderate improvements on large-scale deployments**.
 
-Dynamo is the newest project in this chapter and still gaining features. It's open source (Apache 2.0), with an active
-community, public CI and support from NVIDIA engineers.
+- **A great choice** if you’re building an inference API for a **built-from-scratch foundation model**, or serving an
+  **open model in a high-usage product**.
+- **Unnecessary** for many deployments. Unless you’re operating with **enough volume for disaggregation and KV-aware
+  routing to matter**, Dynamo is unnecessary work and excess overhead. In those cases, **use inference engines
+  directly**.
+
+Dynamo is the **newest project** in this chapter, and features are still being built out. It’s **open source under the
+Apache 2.0 license**, with an **active community**, a **public CI**, and support from NVIDIA engineers for contributors.
+
+<Worked title="Choosing a setup for three deployments">
+  1. **An internal tool on a single L4 GPU running a small open model.** Older, smaller hardware is where TensorRT-LLM
+     offers few benefits, and ease matters more than peak speed: **vLLM**, no Dynamo.
+  2. **A popular product serving a mid-size dense LLM on H100s, where latency is a selling point.** A well-supported
+     architecture on Hopper, with the team willing to put in engineering work for the best performance:
+     **TensorRT-LLM**. Add Dynamo only if traffic grows enough for KV-aware routing and disaggregation to pay off.
+  3. **A public API for a trillion-parameter MoE model at huge traffic on GB200 NVL72 racks.** Big MoE, multi-node,
+     throughput-focused: **SGLang (or TensorRT-LLM) as the engine, with Dynamo on top** for prefix-aware routing,
+     disaggregated prefill and decode, and multi-node expert parallelism.
+
+  In every case the book’s advice still applies: benchmark the candidates on your real traffic
+  ([Benchmarking & profiling](/learn/benchmarking)) before committing.
+</Worked>
 
 <KeyPoints>
-- Inference engines are **configurable, pre-optimized model servers**. All three support the main Chapter 5 techniques.
-- **vLLM**: most popular, easiest, broadest hardware and model support (including TPUs), plus vLLM Omni.
-- **SGLang**: flexible and customizable, excellent for giant MoE models at scale, plus SGLang Diffusion for images and video.
-- **TensorRT-LLM**: usually the fastest (NVIDIA's own kernels), NVIDIA-only, harder to use. V1 is PyTorch-based; V0 was a TensorRT plugin.
-- **Dynamo** orchestrates engines at large scale (KV-aware routing, disaggregation, multi-node), but it's overkill for
-  small deployments.
+- Inference engines are **configurable, pre-optimized model servers**: you test combinations of techniques instead of
+  re-implementing routine code. All three ship continuous batching and support quantization, speculation, prefix
+  caching, parallelism and disaggregation.
+- Inside, an engine loops **schedule → forward pass → sample → stream → free**. **Continuous (in-flight) batching**
+  re-forms the batch every iteration; **chunked prefill** stops one long prompt from freezing everyone else.
+- **vLLM**: largest market share (2× the stars of the other two combined), broadest hardware (NVIDIA, AMD, Intel, TPU)
+  and model support, vLLM Omni, pip or Docker, `vllm serve`.
+- **SGLang**: backend runtime + frontend language for customization, close work with DeepSeek/Qwen/Kimi/Z AI, multi-node
+  MoE on GB200 NVL72, SGLang Diffusion, `sglang.launch_server`. Used at xAI.
+- **TensorRT-LLM**: highest performance via NVIDIA’s (partly closed-source) handwritten kernels, NVFP4, in-flight
+  batching; NVIDIA-only and harder. **V1 (1.x) is PyTorch-based; V0 (0.x) was a TensorRT plugin.**
+- **The constraints principle**: the narrower the target, the higher the ceiling.
+- **Dynamo** orchestrates any engine at scale (KV-aware routing, disaggregation, multi-node, SLA-based planner), but it’s
+  overkill without enough volume.
 </KeyPoints>
 
 <Quiz questions={[
@@ -193,7 +354,19 @@ community, public CI and support from NVIDIA engineers.
     q: "You need to serve a brand-new open model today on a mix of older GPUs, with minimal effort. Best first pick?",
     options: ["TensorRT-LLM", "vLLM", "NVIDIA Dynamo on its own"],
     answer: 1,
-    why: "vLLM has the broadest day-zero model support and is the easiest to stand up. On older GPUs, TensorRT-LLM’s edge mostly disappears."
+    why: "vLLM has the broadest day-zero model support and is the easiest to stand up. On older GPUs, TensorRT-LLM’s edge mostly disappears. Dynamo isn’t an engine; it needs one underneath."
+  },
+  {
+    q: "A static batch holds requests needing 8, 40, 16 and 16 output tokens. What fraction of the batch’s slots does useful work on average?",
+    options: ["50%", "25%", "100%"],
+    answer: 0,
+    why: "The batch runs 40 iterations (the longest request). Useful token-steps: 8 + 40 + 16 + 16 = 80, out of 4 × 40 = 160 slot-steps, so 50%. Continuous batching fills the freed slots with new requests."
+  },
+  {
+    q: "Users complain that their streaming output freezes for about half a second whenever someone pastes a huge document. Which engine feature targets exactly this?",
+    options: ["Speculative decoding", "Chunked prefill", "A bigger vocabulary"],
+    answer: 1,
+    why: "One huge prefill running as a single iteration stalls everyone’s decode. Chunked prefill splits it up and interleaves it with decode steps, smoothing everyone else’s streaming."
   },
   {
     q: "Which engine cannot serve image or video generation models?",
@@ -209,7 +382,27 @@ community, public CI and support from NVIDIA engineers.
       "It only runs on AMD GPUs"
     ],
     answer: 1,
-    why: "Only the older 0.x versions were TensorRT plugins. V1 (summer 2025) is built on PyTorch."
+    why: "Only the older 0.x versions were TensorRT plugins. V1 (summer 2025) is built on PyTorch and bypasses TensorRT’s intermediate representation."
+  },
+  {
+    q: "Why does TensorRT-LLM usually beat vLLM on peak performance, according to the book?",
+    options: [
+      "It uses a better algorithm for attention",
+      "It targets only NVIDIA hardware and has NVIDIA’s handwritten, sometimes closed-source kernels",
+      "It supports more models"
+    ],
+    answer: 1,
+    why: "It’s the constraints principle: a narrow target (NVIDIA only, well-supported architectures) lets it use deeply specialized, hand-fused kernels for Hopper, Blackwell and NVFP4."
+  },
+  {
+    q: "Which of these does Dynamo NOT do by itself?",
+    options: [
+      "Route requests to replicas that already hold a matching prefix",
+      "Run the model’s forward pass with its own kernels, replacing the inference engine",
+      "Scale prefill and decode workers to meet TTFT and TPS targets"
+    ],
+    answer: 1,
+    why: "Dynamo is an orchestration layer that uses vLLM, SGLang or TensorRT-LLM as backends. The engines still run the model; Dynamo handles routing, disaggregation, multi-node and planning."
   },
   {
     q: "A startup serves a small model to a few hundred users a day. Should they add Dynamo?",

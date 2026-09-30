@@ -1,113 +1,330 @@
 <TLDR>
-  A neural network is a huge stack of very simple math steps: *multiply, add, squish*, repeated billions of times. You
-  don't need the math. You need the intuition that it's **mostly multiplying big grids of numbers**, because that's
-  what GPUs are good at.
+  A neural network is a huge stack of very simple math steps: *multiply, add, squish*, repeated billions of times. The
+  operation that dominates all of it is **matrix multiplication**, which is exactly what GPUs are built to do. Understand
+  that, and most of inference engineering starts to make sense.
 </TLDR>
 
-## Why an inference engineer needs this
+## Why an inference engineer needs to know how models work
 
-Your job is to make models faster *without making them worse*. You can't do either if the model is a total black box.
-The good news is you only need a working picture, not a PhD.
+The book defines inference engineering as making generative AI models **faster, less expensive, and more reliable,
+without sacrificing the quality that makes them valuable**. Both halves of that job depend on knowing what’s inside the
+model:
 
-A tiny bit of history for context: neural networks date back to the 1950s, got much deeper in the 2000s and 2010s, and
-then in **2017** a paper called *"Attention Is All You Need"* introduced the **transformer**. Transformers power nearly
-every generative AI model today: chatbots, image generators, voice models, all of it.
+- To make a model **faster**, you need to know which parts do the most work and what they’re waiting on.
+- To avoid making it **worse**, you need to know which parts are fragile and which can be simplified safely.
 
-Transformers generate things in one of two styles:
+Every generative AI model, whether it writes text, draws pictures, or speaks, is built by composing big, complex
+**neural networks**. This lesson builds up the vocabulary for them from nothing. You don’t need a PhD, but you do need
+a working mental model, and that’s what we’ll build here.
 
-- **One piece at a time** (<Term def="Generating output one step at a time, where each new piece depends on all the pieces before it.">autoregressive</Term>):
-  predict the next token, add it, repeat. This is how **LLMs** write text.
-- **Refine the whole thing** (<Term def="Starting from random noise and gradually cleaning it up into an image or video.">denoising / diffusion</Term>):
-  start with static and clean it up step by step. This is how most **image and video** models work.
+## A short history, and why it matters
 
-## The smallest building block: a neuron
+The ideas are older than most people think:
 
-A **neuron** (also called a *node*) is a tiny calculation. It takes a number in, multiplies it by a **weight**, adds a
-**bias**, and passes the result on. The weight and bias are the numbers the model learned during training.
+| When | What happened | Why it matters |
+|---|---|---|
+| 1950s | The first **perceptrons**, built in hardware, did simple yes/no classification. | The basic unit: weighted inputs, one output. |
+| Later decades | Perceptrons were abandoned, then reinvented as **multi-layer perceptrons** trained with **back-propagation**. | Back-propagation introduced *hidden states* between layers and a procedure that repeatedly nudges the weights. |
+| 2000s | Research into **deep** networks with dozens of layers. | More layers meant more capacity. |
+| 2012 | **AlexNet** became the first deep network to show strong real-world results, and showed that **GPUs** were the right hardware for deep learning. | This led to word-embedding models for text and GANs (generative adversarial networks) for images. |
+| 2017 | Vaswani and colleagues published *“Attention Is All You Need,”* introducing the **transformer**. | The foundation of all modern generative AI. |
+
+A **transformer** is a neural network with an **attention mechanism** that can learn relationships between different
+parts of a sequence (for example, which earlier word a pronoun refers to). Transformers aren’t just for chatbots: they
+power every modality, from embedding models to voice to image and video generation.
+
+### The two styles of generative model
+
+Across all modalities, transformer-based models come in two important styles:
+
+- **Autoregressive token generation**: start from a tokenized sequence and predict the most likely **next** token, add
+  it, and repeat. This is how **LLMs** work, and it’s covered in the next two lessons.
+- **Iterative denoising**: start from **random noise** and refine it, step by step, toward the most likely output. This
+  process is called **diffusion**, and it’s how most **image and video** models work (covered in the image lesson).
+
+These two styles have very different performance characteristics, so it’s worth keeping them separate in your head
+from the start.
+
+## The smallest building block: a node
+
+The fundamental unit of a neural network is a **node** (also called a **neuron**). The book describes it as a short
+program that:
+
+1. takes an input,
+2. multiplies it by some **weights**,
+3. adds a **bias**,
+4. and returns the result.
+
+The weights and bias are numbers that were **learned during training**. At inference time they’re fixed; the node just
+applies them. Try one:
 
 <Neuron />
 
-That's genuinely it. A single neuron is trivial. The power comes from having *billions* of them, organized in layers.
+<Note kind="beyond">
+  Real nodes take many inputs, not one. A node with 4,096 inputs has 4,096 weights: it multiplies each input by its own
+  weight, adds up all the products, adds the bias, and outputs one number. The single-input version above is the same
+  idea with the list shortened to one.
+</Note>
 
-## Layers
+## Layers and hidden states
 
-Neurons are grouped into **layers**, and each layer passes its output to the next:
+Nodes are grouped into **layers**. Two facts about layers matter a lot for performance:
 
-- **Input layer**: takes in the raw input (e.g. your words, converted to numbers).
-- **Hidden layers**: the middle layers that gradually transform the input. Their in-between outputs are called
-  <Term def="The intermediate output of a hidden layer: a list of numbers representing what the model ‘thinks’ at that point.">hidden states</Term>.
-- **Output layer**: produces the final prediction.
+- **Nodes within a layer are independent.** Each does its own calculation without waiting for its neighbors.
+- **The connections run between layers.** Every node in a layer receives the output of the previous layer.
 
-LLMs have dozens to hundreds of layers.
+Because the nodes inside a layer don’t depend on each other, they can all be computed **at the same time**. That’s the
+first hint of why massively parallel hardware like GPUs fits neural networks so well.
+
+The networks behind LLMs have **dozens to hundreds of layers**, of three types:
+
+- **Input layer**: the first layer, which accepts and processes the input.
+- **Hidden layers**: every layer between the first and the last. They transform the input step by step toward an
+  answer.
+- **Output layer**: the last layer, which returns the network’s prediction.
+
+The book’s Figure 2.1 shows this shape: one input layer on the left, a stack of hidden layers in the middle, and one
+output layer on the right, with lines connecting every node in one layer to every node in the next.
+
+Each layer’s output becomes the next layer’s input. For the hidden layers, these outputs are called **hidden states**.
 
 <Analogy title="Think of it like an assembly line">
-  Each station (layer) takes what the previous station made, does one small transformation, and passes it along. No
-  single station builds the car. The car emerges from the whole line.
+  Each station (layer) takes what the previous station produced, does one transformation, and passes it on. Every worker
+  at a station works in parallel on their own part. No single station builds the car; the car emerges from the whole
+  line.
 </Analogy>
 
-## The one operation that matters: matmul
+### Internal representations and dimensionality
 
-Doing each neuron one at a time would be slow. Instead, a whole layer is done at once as a **matrix multiplication**,
-or **matmul**: multiply a list of numbers (a *vector*) by a grid of numbers (a *matrix*, which holds the weights), then
-add the biases.
+Hidden states are one kind of **internal representation**: the model’s own numerical way of describing its input. A
+key property of any representation is its **dimensionality**, meaning how many numbers are in each vector.
+
+Here’s a detail that surprises people: text and images go in **opposite** directions.
+
+- **Text gets bigger.** A chunk of text (a token) is expanded into a vector of **hundreds or thousands** of numbers, so
+  there’s room to capture its meaning and its relationships with other words.
+- **Images get smaller.** A picture with **millions** of pixels is compressed down to a manageable size, because
+  working on every pixel would be far too expensive.
+
+<Note kind="beyond">
+  For a sense of scale: Llama 3 8B represents every token as a vector of 4,096 numbers. A 1024 × 1024 color image has
+  1024 × 1024 × 3 ≈ 3.1 million values, which image models compress into a much smaller latent grid (the image lesson
+  goes into this).
+</Note>
+
+### Encoders and decoders
+
+Some networks **create** internal representations and some **use** them:
+
+- An **encoder** takes an input like text or an image and produces an internal representation enriched with extra
+  information and semantic meaning.
+- A **decoder** uses an internal representation to **generate** an output like text or an image.
+
+Neural networks are **composable**: you can combine several into one model, or run them one after another as a
+**pipeline**. Three patterns show up in practice:
+
+| Pattern | Example | Notes |
+|---|---|---|
+| Decoder-only | Modern LLMs (Llama, Qwen, DeepSeek…) | The standard design for text generation today. |
+| Encoder-only | BERT-family text embedding models | Somewhat rare today; the best-known example is older embedding models. |
+| Encoder-decoder | Whisper (speech-to-text) | An encoder processes the audio; a decoder writes the text tokens. Common in non-text modalities. |
+
+## The one operation that matters: matrix multiplication
+
+Doing nodes one at a time would be hopelessly slow. Instead, a whole layer is computed at once as a **matrix
+multiplication**, or **matmul**. The book calls it the most essential operation in a neural network.
+
+<Note kind="beyond">
+  **Vectors and matrices, quickly.** A *vector* is a list of numbers, like `[1, 2]`. A *matrix* is a grid of numbers
+  with rows and columns. Multiplying a vector by a matrix produces a new vector: each output number is the input list
+  multiplied, position by position, against one column of the matrix, with the products added up. If the input has
+  *d_in* numbers and the matrix has *d_in* rows and *d_out* columns, the output has *d_out* numbers.
+</Note>
+
+The simplest version of this inside a network is a **linear layer**. Given an input vector, it applies a **weight
+matrix** and adds a **bias vector**. This is the book’s Figure 2.2:
 
 ```
-output = input × Weights + bias
+y = x·W + b
+
+x : input vector
+W : weight matrix (learned in training)
+b : bias vector   (learned in training)
+y : output vector
 ```
 
-This is the heartbeat of every AI model. When people say GPUs are good at AI, what they really mean is that **GPUs are
-extremely good at matmul**. Keep this in your head: most of inference is just matmul, over and over.
+<Worked title="A linear layer by hand">
+  Take a 2-number input and a layer with 3 outputs:
 
-## Why we need a "squish" step (activation functions)
+  ```
+  x = [1, 2]
 
-There's a catch. If you multiply by one matrix and then another, that's mathematically the same as multiplying by a
-single combined matrix. So a stack of 100 plain matmul layers would collapse into **one** layer. All that depth would
-be wasted.
+  W = [ 3   0   1 ]      b = [0.5, 0, 1]
+      [ 1   2  -1 ]
+  ```
 
-The fix is to put an **activation function** between layers: a small non-linear "squish" that breaks the collapse. The
-classic one is **ReLU**: *if the number is negative, make it zero; otherwise keep it.* (Try the checkbox in the neuron
-demo above.) Modern models use fancier cousins with names like SiLU, Swish, and SwiGLU, but they all do roughly the
-same thing.
+  Each output is the input multiplied against one column of W, plus that output’s bias:
 
-## Encoders and decoders
+  1. First output: 1×3 + 2×1 + 0.5 = **5.5**
+  2. Second output: 1×0 + 2×2 + 0 = **4**
+  3. Third output: 1×1 + 2×(−1) + 1 = **0**
 
-Two more words you'll see everywhere:
+  So `y = [5.5, 4, 0]`. That took 6 multiplications (2 inputs × 3 outputs). Every single weight was used exactly once.
+</Worked>
 
-- An **encoder** reads an input (text, an image, audio) and turns it into a rich internal representation.
-- A **decoder** uses a representation to *generate* an output (text, an image).
+That last observation is worth holding on to. In a real model, a linear layer might have 4,096 inputs and 14,336
+outputs, which is 4,096 × 14,336 ≈ **58.7 million weights**, and **every one of them is used for every token**. The
+weights of any single linear layer are still only a small part of the model’s total; a large model has hundreds of
+these matrices. All of their values were set during training.
 
-Networks can be snapped together like Lego. **Modern LLMs are decoder-only.** Some other models use both: for example,
-**Whisper** (a popular speech-to-text model) uses an encoder to listen to the audio and a decoder to write out the text.
+<Note kind="beyond">
+  A common rule of thumb follows directly from this: each weight contributes one multiply and one add per token, so a
+  model does roughly **2 floating-point operations per parameter per token**. An 8-billion-parameter model does about
+  16 billion operations to process one token. You’ll use this idea in the bottlenecks lesson.
+</Note>
+
+## Why we need a “squish” step: activation functions
+
+Matrix multiplication has a mathematical property that causes a problem: it’s **composable**. Multiplying a vector by
+two matrices in a row gives exactly the same answer as multiplying it by the single matrix you get from multiplying
+those two matrices together. The book’s Figure 2.3 shows two layer equations collapsing into one:
+
+```
+layer 1:  h = x·W₁
+layer 2:  y = h·W₂
+
+substitute:  y = (x·W₁)·W₂ = x·(W₁·W₂) = x·W
+```
+
+The same thing happens with biases included: `(x·W₁ + b₁)·W₂ + b₂` rearranges to `x·(W₁·W₂) + (b₁·W₂ + b₂)`, which is
+again one weight matrix plus one bias. So a stack of 100 plain linear layers would **collapse into a single layer**,
+and all that depth would buy you nothing.
+
+Depth is the whole point. The book notes that deep networks are useful because **more layers use more parameters
+effectively and encode more meaning in hidden states**.
+
+The fix is to put an **activation function** between layers. To do its job, an activation function must be:
+
+- **Non-linear**, so that consecutive matmuls can’t merge into one.
+- **Differentiable, or mostly differentiable**, so that back-propagation can still train the network.
+
+The classic example is **ReLU** (Rectified Linear Unit): *if the input is greater than zero, return it; otherwise
+return zero.* The book’s Figure 2.4 shows its shape: flat at zero for negative inputs, then a straight 45° line for
+positive inputs. Tick the ReLU checkbox in the neuron demo above to see it in action.
+
+<Worked title="Why ReLU breaks the collapse">
+  A purely linear function (no bias) always treats negative inputs as mirror images of positive ones: whatever it does
+  to 2, it does the negative of to −2.
+
+  1. ReLU(2) = **2**
+  2. ReLU(−2) = **0**, not −2
+
+  That lopsidedness is the non-linearity. Once it sits between two matmuls, there is no single matrix that reproduces
+  the combined result for every input, so the layers stay separate and depth adds real power.
+</Worked>
+
+There are dozens of activation functions. One is named **Swish** because its curve resembles the Nike logo. Most
+follow the same general pattern as ReLU: map negative values to zero or near-zero, and keep positive values roughly
+unchanged. The ones you’ll see in modern models are **ReLU, SiLU, Swish, and SwiGLU**, and they share three useful
+properties:
+
+1. **Fast to run**: a few simple operations per number.
+2. **Easy to train with**: they’re mostly differentiable, so they have a gradient for most input values.
+3. **They break linearity**, which is what makes multi-layer networks work.
+
+<Note kind="beyond">
+  **What “differentiable” buys you.** Training works by measuring how wrong the model’s output was, then working out,
+  for every weight, which direction to nudge it to be a little less wrong. That direction comes from the *gradient*
+  (the slope) of each step in the network, and back-propagation computes it layer by layer from the output back to the
+  input. A function needs a slope almost everywhere for this to work. ReLU has one everywhere except exactly at zero,
+  which is good enough in practice.
+</Note>
+
+## Putting it together
+
+Here’s the picture you should now have of any neural network:
+
+1. The input is turned into a vector of numbers.
+2. Each layer multiplies that vector by a weight matrix, adds a bias, and applies an activation function.
+3. Because the nodes in a layer are independent, the whole layer is one big matmul that can be computed in parallel.
+4. Dozens to hundreds of these layers are stacked, each producing a hidden state for the next.
+5. The output layer turns the final hidden state into a prediction.
+
+Almost all of the arithmetic is **matmul**. When people say GPUs are good at AI, what they mean is that GPUs can do an
+enormous number of multiply-and-add operations in parallel. The rest of the course is largely about keeping that
+hardware fed and busy.
 
 <KeyPoints>
-- A neuron = **multiply by a weight, add a bias**. Layers of neurons = a neural network.
-- A whole layer runs as one **matmul** (matrix multiplication), and matmul is most of what a GPU does during inference.
-- **Activation functions** (like ReLU) sit between layers so that depth actually adds power.
-- **Encoders** understand inputs; **decoders** generate outputs. Today's LLMs are decoder-only.
+- Inference engineering = **faster, cheaper, more reliable** without losing quality, which requires knowing the model’s internals.
+- The **transformer** (2017) underpins every modality. Two styles: **autoregressive** (LLMs) and **iterative denoising** (images, video).
+- A **node** multiplies inputs by weights and adds a bias. Nodes in a layer are **independent**, so a layer runs as one parallel **matmul**: `y = x·W + b`.
+- Hidden layers produce **hidden states**. Text representations **expand** to thousands of dimensions; image representations **compress** millions of pixels.
+- **Encoders** build representations, **decoders** generate from them. LLMs are decoder-only; Whisper is encoder-decoder; BERT-style embedders are encoder-only.
+- Stacked linear layers **collapse** into one. **Activation functions** (ReLU, SiLU, Swish, SwiGLU) prevent that and must be mostly differentiable for training.
 </KeyPoints>
 
 <Quiz questions={[
   {
-    q: "What is the single most important math operation inside a neural network?",
-    options: ["Addition", "Matrix multiplication (matmul)", "Division", "Sorting"],
-    answer: 1,
-    why: "Each layer applies its weights with a matmul. It’s so dominant that GPUs are essentially matmul machines."
+    q: "A linear layer has weights W = [[1, 3], [0, −1]] (row 1 is [1, 3], row 2 is [0, −1]) and bias b = [1, 1]. What is the output for input x = [2, 1]?",
+    options: ["[3, 6]", "[2, 5]", "[3, 5]", "[2, 6]"],
+    answer: 0,
+    why: "First output: 2×1 + 1×0 + 1 = 3. Second output: 2×3 + 1×(−1) + 1 = 6. Each output is the input multiplied against one column of W, plus its bias."
   },
   {
-    q: "Why do neural networks need activation functions like ReLU?",
+    q: "Why do neural networks put an activation function between linear layers?",
     options: [
       "To make the model smaller",
-      "To stop many layers from collapsing into the equivalent of one layer",
+      "To stop consecutive matmuls from collapsing into the equivalent of one layer",
       "To convert words into numbers",
-      "To speed up training"
+      "To make inference deterministic"
     ],
     answer: 1,
-    why: "Stacked matmuls combine into a single matmul. A non-linear step between layers prevents that, so depth adds real power."
+    why: "Matmul is composable: x·W₁·W₂ equals x·(W₁·W₂). A non-linear step in between prevents that merge, so extra layers add real capacity."
   },
   {
-    q: "Modern LLMs like Llama or Qwen use which architecture?",
-    options: ["Encoder-only", "Decoder-only", "Encoder-decoder"],
+    q: "Besides being non-linear, what property does an activation function need?",
+    options: ["It must be (mostly) differentiable, so back-propagation can train through it", "It must output only positive numbers", "It must be a matrix", "It must be slow enough to measure"],
+    answer: 0,
+    why: "Training relies on gradients flowing back through every step. ReLU, SiLU, Swish, and SwiGLU all have a gradient for nearly every input."
+  },
+  {
+    q: "A linear layer maps 4,096 inputs to 14,336 outputs. Roughly how many weights does it have (ignoring the bias)?",
+    options: ["18,432", "About 58.7 million", "About 4 billion", "14,336"],
     answer: 1,
-    why: "Modern LLMs are decoder-only. Encoder-decoder shows up in models like Whisper, and encoder-only in older models like BERT."
+    why: "One weight per input–output pair: 4,096 × 14,336 = 58,720,256. And every one of them is used for every token that passes through."
+  },
+  {
+    q: "How do internal representations for text and for images differ?",
+    options: [
+      "Both are compressed to save memory",
+      "Text is expanded into large vectors to capture meaning; images are compressed from millions of pixels",
+      "Text is compressed; images are expanded",
+      "Both keep exactly the input size"
+    ],
+    answer: 1,
+    why: "A token becomes a vector of hundreds or thousands of numbers, while an image’s millions of pixels are reduced to a manageable latent representation."
+  },
+  {
+    q: "What is ReLU(−3.5), and what is ReLU(2)?",
+    options: ["−3.5 and 2", "0 and 2", "0 and 0", "3.5 and 2"],
+    answer: 1,
+    why: "ReLU returns the input if it’s greater than zero, otherwise zero. That asymmetry is exactly the non-linearity that keeps layers from collapsing."
+  },
+  {
+    q: "Whisper turns speech into text. Which architecture does it use?",
+    options: ["Decoder-only", "Encoder-only", "Encoder-decoder"],
+    answer: 2,
+    why: "An encoder processes the audio into an internal representation, and a decoder generates the text tokens from it."
+  },
+  {
+    q: "Why are GPUs such a good fit for neural networks?",
+    options: [
+      "Nodes within a layer are independent, so each layer is a large matmul whose multiply-adds can run in parallel",
+      "GPUs store text more efficiently",
+      "Neural networks need very little memory",
+      "GPUs were designed specifically for back-propagation"
+    ],
+    answer: 0,
+    why: "Because no node in a layer waits on its neighbors, the whole layer is one parallel matrix multiplication, which is exactly what GPUs are built for."
   }
 ]} />

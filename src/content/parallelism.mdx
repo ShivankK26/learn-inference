@@ -1,135 +1,278 @@
 import GpuCount from "@/components/widgets/GpuCount";
 import TensorParallel from "@/components/widgets/TensorParallel";
+import TPSplit from "@/components/widgets/TPSplit";
 
 <TLDR>
-  Big models don't fit on one GPU, and even when the weights squeeze in, there's no room left for the KV cache. So
+  Big models don’t fit on one GPU, and even when the weights squeeze in, there’s no room left for the KV cache. So
   you split the model across GPUs. **Tensor parallelism** splits every layer and is the default for speed.
-  **Expert parallelism** spreads MoE experts across GPUs for throughput. The limit is always the same: GPUs talking to
-  each other is much slower than GPUs reading their own memory.
+  **Expert parallelism** spreads MoE experts across GPUs for throughput. **Pipeline parallelism** is only for going
+  across machines. The limit is always the same: GPUs talking to each other is much slower than GPUs reading their own
+  memory.
 </TLDR>
 
-## Why one GPU isn't enough
+## Why one GPU isn’t enough
 
-Every frontier LLM today is too big to serve on a single GPU. GPUs keep getting bigger, but so do models, and that
-trend isn't reversing.
+Every frontier LLM on the market today is too big to fit on a single GPU for batch inference. GPUs keep getting
+bigger, but so do models, and that trend shows no sign of reversing.
 
-A handy rule: **in FP8, each billion parameters takes about 1 GB** of memory. Take **DeepSeek-V3.1**, with **671
-billion** parameters:
+A handy rule: **in FP8, each billion parameters takes roughly 1 GB** of memory (one byte per parameter). In FP16 it’s
+2 GB per billion, and in FP4 about 0.5 GB.
 
-- On **one B200**, the weights alone would immediately cause an
-  <Term def="Out-of-memory error: the GPU is asked to hold more data than its memory can fit, so the job crashes.">out-of-memory (OOM) error</Term>.
-- On **four B200s** (720 GB total), the weights technically fit, but there's nothing left for the KV cache. The KV
-  cache often takes **80% or more** of the memory left after the weights, so four GPUs couldn't serve any realistic
-  batch size or sequence length.
-- In practice you need **a full machine of eight B200s** to serve real traffic on a model this size.
+<Worked title="The book’s DeepSeek example, step by step">
 
-To estimate the minimum, multiply **precision × parameter count**, add the room you expect the **KV cache** to need,
-then **round up to the next instance size** you can actually rent (1, 2, 4 or 8 GPUs per machine):
+**DeepSeek-V3.1** has **671 billion** parameters. In FP8, the weights alone are about **671 GB**.
+
+1. **One B200** (180 GB): the weights alone immediately trigger an
+   <Term def="Out-of-memory error: the GPU is asked to hold more data than its memory can fit, so the job crashes.">out-of-memory (OOM) error</Term>.
+2. **Four B200s** (4 × 180 = 720 GB): the weights technically fit, but only 720 − 671 = **49 GB** is left over, under 7%
+   of the total. The KV cache often takes **80% or more** of the memory remaining after the weights, and here there’s
+   almost nothing to give it. Four GPUs couldn’t serve DeepSeek at any reasonable sequence length or batch size.
+3. **Eight B200s**, a full node (8 × 180 = 1,440 GB): 1,440 − 671 = **769 GB** is left, and 80% of that is ~615 GB for
+   the KV cache. This is the configuration the book says you need for real production traffic.
+
+</Worked>
+
+You can estimate the minimum GPU count for any model by **multiplying the precision (bytes per parameter), the
+parameter count, and your expected KV cache allocation together**, then **rounding up to the next instance size**
+you can actually rent (usually 1, 2, 4, or 8 GPUs per machine).
+
+<Worked title="A GPU-count estimate you can reuse">
+
+Say you want the KV cache to get about as much memory as the weights, a KV multiplier of **2×**:
+
+1. **DeepSeek-V3.1 in FP8:** 671B × 1 byte × 2 = 1,342 GB. On B200s: 1,342 ÷ 180 ≈ 7.5 → round up to **8 GPUs**,
+   matching the book.
+2. **Llama 3.1 405B in FP8:** 405B × 1 byte × 2 = 810 GB. On H200s (141 GB): 810 ÷ 141 ≈ 5.7 → **8 GPUs**. On H100s
+   (80 GB): 810 ÷ 80 ≈ 10.1 → **16 GPUs**, which means two machines.
+3. You could still squeeze 405B onto 8 × H100 (640 GB), leaving 640 − 405 = 235 GB for the cache. It works, but with a
+   smaller KV multiplier (about 1.6×), so fewer concurrent users or shorter contexts.
+
+</Worked>
 
 <GpuCount />
 
-It often makes sense to use **more than the minimum**, even for mid-size models like GPT OSS. Extra GPUs give you a
-larger KV cache (more users and longer conversations) and better per-user speed.
+In many cases, even for mid-size models like **GPT OSS**, you’ll want **more than the minimum** number of GPUs. The
+extra GPUs give you a bigger KV cache (more concurrent users and longer conversations) and unlock better per-user
+latency, because the work of every token gets shared across more GPUs.
+
+<Note kind="beyond">
+  GPT OSS 120B stores its expert weights in a 4-bit format, so the whole model is only about 60–65 GB and fits on a
+  single 80 GB GPU. That’s why it counts as mid-size. Running it on one GPU leaves very little room for the KV cache,
+  so production deployments often use 2, 4, or 8 GPUs anyway.
+</Note>
 
 ## The catch: GPUs have to talk
 
-All of this only works if splitting across GPUs doesn't create a new bottleneck. GPUs connect to each other through
-**NVLink** and **NVSwitch** inside a machine and **InfiniBand** between machines (more in Chapter 3). These are fast,
-but still only a fraction of the speed of a GPU reading its own memory. Since <Memory>decode</Memory> is already
-limited by memory bandwidth, a careless split quickly stalls on communication.
+All of this requires that inference **scales efficiently** from one GPU to many. The limit on scaling is the
+**communication overhead** between GPUs. From [Chapter 3](/learn/instances), GPUs connect through **NVLink** and
+**NVSwitch** inside a node, and **InfiniBand** between nodes:
 
-Designing splits around how GPUs are wired together is called
-<Term def="Choosing how to split a model across GPUs based on how fast each pair of GPUs can communicate: fast links inside a machine, slower ones between machines.">topology-aware parallelism</Term>.
+| Link | What it connects | Bandwidth (per GPU) |
+|---|---|---|
+| **VRAM (HBM)** | A GPU to its own memory | 3.35 TB/s (H100) · 8 TB/s (B200) |
+| **NVLink + NVSwitch** | GPUs inside one node | 900 GB/s (Hopper) · 1,800 GB/s (Blackwell) |
+| **InfiniBand** | Different nodes | ~50 GB/s (a 400 Gb/s network card) |
+
+NVLink and InfiniBand are high-bandwidth links, but they’re only a fraction of the speed of VRAM. On a B200, NVLink is
+about 4× slower than the GPU’s own memory, and InfiniBand is another ~36× slower than NVLink. Since
+<Memory>decode</Memory> is already bound on memory bandwidth, multi-GPU inference has to be carefully designed so it
+doesn’t stall on inter-GPU communication.
+
+This field of study is called
+<Term def="Choosing how to split a model across GPUs based on how fast each pair of GPUs can communicate: fast links inside a machine, slower ones between machines.">topology-aware parallelism</Term>:
+choosing *how* to split the model based on *how the GPUs are wired together*.
 
 ## Three ways to split a model
 
-| Method | How it splits | Downside |
-|---|---|---|
-| **Pipeline parallelism (PP)** | Different GPUs get different *layers*; each handles one stage in turn | Poor latency and utilization: GPUs wait for each other step by step |
-| **Tensor parallelism (TP)** | Every *layer* is cut into pieces, and the big matmuls are shared across GPUs | GPUs must sync after every layer, so it isn't suited to multi-machine setups |
-| **Expert parallelism (EP)** | Whole *experts* of an MoE model live on different GPUs | Tokens must be routed between GPUs to reach their experts, so it favors throughput over latency |
+There are three primary forms of model parallelism in inference:
 
-In short: **TP** is best for low latency within one machine, **EP** raises throughput for MoE models, and **PP** is
-only used when you go multi-machine.
+- **Pipeline parallelism (PP):** splits the *layers* of the model across GPUs.
+- **Tensor parallelism (TP):** splits the *tensors within each layer* across GPUs.
+- **Expert parallelism (EP):** puts entire *experts* of an MoE model on different GPUs.
+
+| Method | Mechanism | Drawback |
+|---|---|---|
+| **PP** | Each GPU handles one stage (a group of layers) of the pass | Not recommended: poor latency and utilization from the step-by-step pipeline |
+| **TP** | Compute-heavy operations like matmuls are split across GPUs | Requires synchronization across GPUs after every layer; not suitable for multi-node |
+| **EP** | Each expert lives within a single GPU, so work inside an expert is fast | Tokens must be routed between GPUs to reach their experts; better for throughput than latency |
+
+In short: **TP** is generally best for low-latency inference within a single node. **EP** improves throughput for MoE
+LLMs. **PP** is only used for multi-node inference. You’ll see these written with the number of GPUs attached:
+**TP8** is tensor parallelism across 8 GPUs, **EP16** is expert parallelism across 16, and **TP8PP2** is 8-way TP inside
+each of 2 pipeline stages (16 GPUs in total).
 
 <Analogy title="Think of it like a kitchen team">
   **Pipeline**: one chef chops, the next cooks, the next plates. Each dish passes down the line, and everyone waits on
   the slowest station. **Tensor**: several chefs work on every dish together, each doing a slice, and they huddle
-  after every step. That's fast, but only if they stand close together. **Expert**: each chef is a specialist (pastry,
-  grill, sauces), and orders are sent to whoever's needed. No constant huddling, so the kitchen handles lots of orders
-  at once.
+  after every step. That’s fast, but only if they stand close together. **Expert**: each chef is a specialist (pastry,
+  grill, sauces), and orders are sent to whoever’s needed. There’s no constant huddling, so the kitchen handles lots
+  of orders at once.
 </Analogy>
 
-There's also a fourth family: data-parallel strategies like **context parallelism**, which split the *input* across
-devices. They're rare for LLMs but essential for video generation (Chapter 6).
+There’s also a family of **data-parallel** strategies, like **context parallelism**, that split the *computation
+over the input* across devices instead of splitting the model. They’re rare in LLM inference but essential for video
+generation ([Chapter 6](/learn/serving-images-video)).
 
 ## Tensor parallelism: lower latency
 
-**TP should be your default** when a model needs multiple GPUs. It works for dense models (like Llama 405B) and for the
-MoE models that dominate open models today.
+**Tensor parallelism should be your default strategy** for multi-GPU inference. It supports both dense models like
+Llama 405B and the MoE models that dominate the open model landscape today.
 
-TP cuts each layer into fragments and gives one fragment to each GPU. For every layer, the work of **reading the
-weights from memory** and **doing the matmul** is shared, so each GPU does a fraction of the reading. The book's
-figures show a weight matrix sliced across GPUs. For MoE models, each expert is itself sliced across the GPUs.
+TP works by splitting each layer apart (unlike pipeline parallelism, which keeps layers intact) and distributing the
+layer fragments across the GPUs. For each layer, the two expensive things, **reading the weights from memory** and
+**executing the matrix multiplication**, are shared across the GPUs. With TP4, each GPU stores and reads only a
+quarter of every layer’s weights. Because decode is memory-bound, reading a quarter of the bytes makes each token
+roughly four times faster, before communication costs. For MoE models, each **expert** is itself sliced across the
+GPUs in the same way.
 
-The cost: after every layer, the partial results from all GPUs must be combined into one output (an
-<Term def="A communication step where every GPU contributes its partial result and every GPU receives the combined total.">all-reduce</Term>)
-before the next layer can start. Inside one machine, NVLink and NVSwitch keep that overhead small.
+### How the split actually works
+
+The book describes TP at a high level. Here’s the standard way it’s done (introduced in the Megatron-LM paper), which
+explains exactly where the communication comes from:
+
+<TPSplit />
+
+1. **The first matrix is split by columns.** In the feed-forward block, the up-projection is cut into vertical
+   slices, and each GPU computes its own slice of the hidden units. Activation functions work on each number
+   independently, so no GPU needs anything from the others at this point.
+2. **The second matrix is split by rows.** The down-projection is cut horizontally, matching the slices above. Each
+   GPU multiplies *its* slice of hidden units by *its* rows and gets a **partial** version of the full output.
+3. **An all-reduce combines them.** The partial outputs are summed across all GPUs, and every GPU receives the full
+   result. This step is the
+   <Term def="A communication step where every GPU contributes its partial result and every GPU receives the combined total.">all-reduce</Term>,
+   and the next layer can’t start until it finishes.
+4. **Attention is split by heads.** Each GPU owns a group of whole attention heads, computes them, and keeps the **KV
+   cache for its own heads**. The attention output projection is row-split, so there’s another all-reduce there too.
+
+That’s **two all-reduces per transformer layer, every forward pass**. In a node with high-bandwidth NVLink and
+NVSwitch, that overhead is small. Across nodes, it isn’t.
+
+<Note kind="beyond">
+  Splitting attention by heads also splits the **KV cache**: with TP8, each GPU holds one-eighth of every request’s
+  cache, so TP multiplies how much cache the system can hold. There’s a limit. A model with 8 KV heads (like Llama 3.1
+  70B) divides cleanly up to TP8. Beyond that, engines have to duplicate KV heads across GPUs, which wastes memory.
+</Note>
+
+### Does more TP always help?
+
+Increasing tensor parallelism improves **tokens per second for each user**, *assuming* the model is large enough and
+the sequences long enough that the communication overhead doesn’t outweigh the faster forward pass. That’s the case
+for most frontier models. The demo shows this for a 70B model:
 
 <TensorParallel />
 
-More TP generally means **more tokens per second for each user**, as long as the model is big enough and sequences are
-long enough that the faster forward pass outweighs the communication. That's true for most frontier models. Notice
-in the demo how TP16 gets *slower*: once the split crosses machines, the huddles get expensive.
+<Worked title="TP2 → TP4 → TP8 for a 70B model on H100s">
+
+Llama 70B in FP16 is **140 GB** of weights. Each decode step reads all of them (split across the GPUs). Assume each
+all-reduce inside a node costs about **10 µs** (an illustrative figure: at small batch sizes, fixed latency matters
+more than bandwidth, since each all-reduce only moves a few kilobytes per token).
+
+1. **Weight reading per token:** 140 GB ÷ N GPUs ÷ 3.35 TB/s. TP2 → **20.9 ms**, TP4 → **10.4 ms**, TP8 → **5.2 ms**.
+2. **Communication per token:** 80 layers × 2 all-reduces × 10 µs = **1.6 ms**, roughly the same at every TP size.
+3. **Totals:** TP2 ≈ 22.5 ms (~44 tokens/s), TP4 ≈ 12.0 ms (~83 tokens/s), TP8 ≈ 6.8 ms (~147 tokens/s).
+4. Notice the diminishing returns. Communication is 7% of the step at TP2, 13% at TP4, and 24% at TP8. Doubling the GPUs
+   no longer doubles the speed.
+5. **TP16 across two nodes:** weight reading halves again to 2.6 ms, but each all-reduce now crosses InfiniBand.
+   At ~80 µs each, that’s 160 × 80 µs = **12.8 ms**, for a total of ~15.4 ms. That’s **slower than TP8**, which is why
+   TP isn’t used across nodes.
+
+</Worked>
 
 ## Expert parallelism: higher throughput
 
-**EP** spreads whole experts across GPUs. A model with **128 experts** served with **EP8** across eight GPUs puts **16
-complete experts** on each GPU.
+**Expert parallelism** neatly divides whole experts across GPUs. In a model with **128 experts** served with **EP8**
+across eight GPUs, each GPU hosts **16 complete experts**. (The book’s figure contrasts this with TP for MoE, where
+every expert is sliced across all eight GPUs.)
 
-EP improves **total system throughput**, which makes serving cheaper and more scalable. Each token takes just as
-long as before, but the system as a whole handles far more tokens at once. (Remember from the
-[MoE demo](/learn/attention-and-kv-cache) that a large batch wakes up almost every expert; EP is how you put all
-those busy experts to good use.)
+EP improves **total system throughput**, which makes inference more scalable and less expensive. Each expert
+processes its tokens whole, on one GPU, so **each token takes just as long** as before. But the system as a whole can
+handle many more tokens at the same time. Remember from [the MoE demo](/learn/attention-and-kv-cache) that a large
+batch wakes up almost every expert. EP gives each GPU its own set of busy experts to work through.
 
-Many deployments **mix TP and EP**: one common layout uses **TP for the attention layers** and **EP for the MoE
-layers**.
+Many deployments **mix TP and EP** to get both benefits. A common layout, shown in the book’s figure, uses **TP for the
+attention layers** and **EP for the sparse MoE layers**.
 
-EP also needs **less communication than TP**. The router (the tiny network that picks experts) is small, so a copy
-lives on every GPU. GPUs still have to pass tokens to wherever their experts live, but they don't have to collect
-and combine every layer's results. That's why EP **scales well across machines** and on systems with slower
-connections between GPUs.
+### Why EP needs less communication
+
+EP requires **less inter-GPU communication than TP**. Here is what happens at each MoE layer:
+
+1. **Routing happens locally.** The expert **router**, the small network that decides which experts each token
+   activates, is a tiny part of the model, so a copy lives on every GPU.
+2. **Dispatch.** Each token’s hidden state is sent to whichever GPUs host its chosen experts.
+3. **Expert work.** Each GPU runs its experts on all the tokens it received, at full size, with no splitting.
+4. **Combine.** The results travel back and are blended together, weighted by the router’s scores.
+
+Communication is still necessary to pass tokens to their experts. But unlike TP, there’s no need to all-reduce the
+results of every layer across every GPU. Thanks to this lower overhead, **EP scales well to multi-node deployments**
+and to systems with limited interconnect bandwidth.
+
+<Note kind="beyond">
+  Take Qwen3-235B-A22B from Chapter 2: 128 experts with 8 active per token. With EP8, a token’s 8 experts are spread
+  over the GPUs at random. If routing were perfectly uniform, a token would visit about 5 of the 8 GPUs at each MoE
+  layer on average. Real routing is uneven, though, and some experts are far more popular than others. Those experts’
+  GPUs become hotspots, so large deployments often **duplicate the most popular experts** onto extra GPUs to balance
+  the load.
+</Note>
 
 ## Multi-node inference
 
-Sometimes eight GPUs aren't enough: a huge model at high precision, inputs of **millions of tokens**, or simply chasing
-the fastest possible speed. Multi-machine training has been standard for years, but multi-node *inference* brings
-two challenges:
+Sometimes eight GPUs aren’t enough. You might be serving a huge model at high precision, supporting input sequences
+of **millions of tokens**, or just trying to run inference as fast as possible. GPUs are designed to work together
+across nodes, and multi-node training has been standard for years for building frontier models. But multi-node
+**inference** introduces new challenges:
 
-- **Infrastructure**: reliably getting two or more connected GPU machines, and building the tooling to manage them
-  across cloud providers (Chapter 7).
-- **Parallelism**: making the split work over **InfiniBand**, which is much slower than NVLink.
+- **Infrastructure:** How do you reliably provision two or more interconnected GPU nodes, and build abstractions that
+  work across cloud providers ([Chapter 7](/learn/multi-cloud))?
+- **Parallelism:** How do you communicate effectively over InfiniBand, which is much slower than NVLink?
 
-TP needs too much chatter to work well over InfiniBand. Two layouts that do work:
+InfiniBand adds a new wrinkle to topology-aware parallelism. Tensor parallelism generally needs too much communication
+to be a good fit across nodes (the TP16 example above). You have two options that work well over InfiniBand:
 
-1. **Dense models**: TP inside each machine, PP between machines. For example, **TP8PP2** is 8-way TP within each of 2
-   machines.
-2. **MoE models**: you can also try pure **EP**, e.g. **EP16**, which communicates less than TP.
+1. **For dense models,** use tensor parallelism **within** each node and pipeline parallelism **between** nodes, for
+   example **TP8PP2**.
+2. **For MoE models,** you can also try **expert parallelism**, for example **EP16**, because it has lower communication
+   overhead than TP.
 
-For MoE models, **TP8PP2 usually gives lower latency per user**, while **EP16 gives higher total throughput**.
+For MoE models, **TP8PP2 will generally offer lower latency per user**, and **EP16 will yield higher overall system
+throughput**.
 
-<Note kind="tip">
-  Unless your model and KV cache truly *require* multiple machines, spreading one copy across nodes usually isn't the
-  best use of the hardware. You're often better off using extra machines as **more replicas**, or for
-  **disaggregation** (next lesson).
+### Why pipeline parallelism works across nodes, and why it’s slow
+
+With TP8PP2, the first node holds the first half of the layers (split 8 ways by TP), and the second node holds the
+second half. The only thing that crosses InfiniBand is the **activation handed from the last layer of stage 1 to the
+first layer of stage 2**. That’s one vector per token per forward pass.
+
+<Worked title="How little TP8PP2 sends between nodes">
+
+For a model with a hidden size of 8,192 in 16-bit precision:
+
+1. **PP boundary:** one activation of 8,192 × 2 bytes ≈ **16 KB per token**, sent **once** per forward pass.
+2. **TP16 across nodes instead:** 2 all-reduces × 80 layers = **160** latency-bound exchanges per forward pass, every one
+   of them crossing InfiniBand.
+3. That one-handoff-versus-160-exchanges difference is why PP tolerates slow links and TP doesn’t.
+
+</Worked>
+
+The weakness is the pipeline itself. A token has to go through stage 1 *and then* stage 2, one after the other, so
+per-token latency doesn’t improve, and while stage 2 works on a token, stage 1 sits idle unless there’s other work to
+fill it. Those idle gaps are called **pipeline bubbles**.
+
+<Note kind="beyond">
+  To keep S pipeline stages busy, you need at least S batches in flight at once, each at a different stage. With M
+  batches in flight, stage utilization is roughly M ÷ (M + S − 1). The book’s table phrases PP in training terms
+  (“forward and backward pass”). In inference there’s only a forward pass, but the bubble problem is the same.
 </Note>
 
+Unless your model and KV cache are so large that they *require* multi-node inference, spreading one model copy across
+nodes probably isn’t the best use of the extra hardware. You’re often better off using extra nodes for **horizontal
+scaling** (more independent replicas) or for **disaggregated serving**, the next lesson.
+
 <KeyPoints>
-- Estimate GPUs as **precision × parameters + KV cache room**, then round up to an instance size. In FP8, ~1 GB per billion parameters.
-- Communication between GPUs is the limiting factor, so match the split to the wiring (**topology-aware parallelism**).
-- **TP** (split every layer) is the default: lower per-user latency within one machine, but it needs fast links.
-- **EP** (whole experts per GPU) boosts throughput for MoE models and communicates less, so it scales across machines.
-- **PP** is only for multi-node setups. Multi-node options: **TP8PP2** for lower latency, **EP16** for higher throughput.
+- In FP8, a billion parameters ≈ **1 GB**. Estimate GPUs as **precision × parameters × KV multiplier**, then round up to an instance size: DeepSeek-V3.1 (671 GB in FP8) needs a full 8 × B200 node.
+- Inter-GPU links are a fraction of VRAM speed (B200: 8 TB/s VRAM vs. 1.8 TB/s NVLink vs. ~50 GB/s InfiniBand), so splits must follow the wiring: **topology-aware parallelism**.
+- **TP** (the default) splits every matmul, column-wise then row-wise, with **two all-reduces per layer**. It gives the best per-user latency in one node, with diminishing returns as communication grows.
+- **EP** puts whole experts on each GPU (128 experts at EP8 = 16 per GPU). Tokens are dispatched to their experts and combined back, with no per-layer all-reduce. That means higher throughput and good scaling across nodes.
+- **PP** sends only one activation per token between stages, so it suits InfiniBand, but pipeline bubbles hurt latency. Multi-node options: **TP8PP2** (lower latency) or **EP16** (higher throughput). Otherwise, prefer more replicas or disaggregation.
 </KeyPoints>
 
 <Quiz questions={[
@@ -143,26 +286,58 @@ For MoE models, **TP8PP2 usually gives lower latency per user**, while **EP16 gi
     q: "Why can’t you serve that model on 4 B200s (720 GB), even though the weights fit?",
     options: [
       "B200s don’t support FP8",
-      "There’s no memory left for the KV cache, so you couldn’t handle real batch sizes or sequence lengths",
+      "Only ~49 GB would be left for the KV cache, too little for real batch sizes or sequence lengths",
       "Four GPUs can’t communicate"
     ],
     answer: 1,
-    why: "The KV cache usually needs a large share of memory. With the weights filling everything, serving real traffic is impossible, so you need a full 8-GPU node."
+    why: "720 − 671 = 49 GB, under 7% of the memory. The KV cache usually needs a large share, so you need the full 8-GPU node (769 GB left over)."
   },
   {
-    q: "You want the lowest latency per user for a large model on one 8-GPU machine. Which parallelism is the default?",
-    options: ["Pipeline parallelism", "Tensor parallelism", "Expert parallelism"],
+    q: "A 120B-parameter dense model in FP16, with a KV multiplier of 2×, on H200s (141 GB each). What’s the minimum instance size?",
+    options: ["2 GPUs", "4 GPUs", "8 GPUs"],
     answer: 1,
-    why: "TP shares every layer’s weight reads and matmuls across GPUs. With fast NVLink inside the machine, per-user speed goes up."
+    why: "120B × 2 bytes × 2 = 480 GB. 480 ÷ 141 ≈ 3.4 GPUs, which rounds up to the next instance size: 4 GPUs (564 GB). That leaves 564 − 240 = 324 GB for the cache, more than the 240 GB the 2× multiplier asked for."
   },
   {
-    q: "Why does expert parallelism scale better across machines than tensor parallelism?",
+    q: "In tensor parallelism, where does the all-reduce happen in a feed-forward block?",
     options: [
-      "It uses less memory",
-      "It doesn’t need to gather every layer’s results across GPUs, so it communicates less",
-      "It skips the router"
+      "Before the first matrix, to share the input",
+      "After the second (row-split) matrix, to sum each GPU’s partial output",
+      "Between every single neuron"
     ],
     answer: 1,
-    why: "EP only passes tokens to the GPUs holding their experts. TP must all-reduce after every layer, which is too much traffic for slower links."
+    why: "The first matrix is split by columns, so each GPU computes its own slice of hidden units with no communication. The second is split by rows, which leaves each GPU with a partial output, and the all-reduce sums those partials."
+  },
+  {
+    q: "Going from TP4 to TP8 on the same model roughly halves weight-reading time, but the speedup is less than 2×. Why?",
+    options: [
+      "The GPUs get slower when there are more of them",
+      "Per-layer all-reduce communication doesn’t shrink, so it becomes a bigger share of each step",
+      "TP8 uses more precision"
+    ],
+    answer: 1,
+    why: "Each token still needs two all-reduces per layer regardless of TP size. As the weight-reading part shrinks, that fixed communication cost takes a larger fraction of the step."
+  },
+  {
+    q: "A model with 256 experts is served with EP16. How many complete experts does each GPU host?",
+    options: ["8", "16", "32"],
+    answer: 1,
+    why: "EP divides whole experts evenly: 256 ÷ 16 = 16 experts per GPU."
+  },
+  {
+    q: "You must serve a huge dense model across two 8-GPU nodes. Which layout makes sense?",
+    options: ["TP16", "TP8PP2", "EP16"],
+    answer: 1,
+    why: "TP16 would put per-layer all-reduces on slow InfiniBand. TP8PP2 keeps the chatty TP traffic on NVLink inside each node and only passes one activation per token between nodes. EP needs a MoE model."
+  },
+  {
+    q: "You have 16 GPUs and a model that fits comfortably on one 8-GPU node. Traffic keeps growing. What does the book suggest?",
+    options: [
+      "Spread one copy over both nodes with TP8PP2",
+      "Run two independent replicas (or use the extra node for disaggregation)",
+      "Switch to pipeline parallelism on one node"
+    ],
+    answer: 1,
+    why: "Multi-node inference only pays off when the model and KV cache truly require it. Otherwise horizontal scaling or disaggregated serving uses the hardware better."
   }
 ]} />

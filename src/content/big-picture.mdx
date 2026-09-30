@@ -1,17 +1,20 @@
 <TLDR>
   A trained AI model is just a big file of numbers. **Inference** is everything it takes to turn that file into a fast,
-  cheap, reliable service that answers millions of people. That's what this whole course is about.
+  cheap, reliable service that answers millions of people. Doing that well takes three layers of work (**runtime**,
+  **infrastructure**, and **tooling**) and a toolbox of six recurring techniques. That’s what this whole course is about.
 </TLDR>
 
-## Two stages in every model's life
+## Two stages in every model’s life
 
-Every AI model goes through two stages:
+Every generative AI model goes through two stages:
 
-1. **Training**: the model learns. You show it a mountain of data and it slowly adjusts billions of internal numbers
-   (called <Term def="The numbers inside a model that were learned during training. A ‘70B’ model has 70 billion of them.">weights</Term>)
+1. **Training**: the process of *learning the model’s weights from data*. You show the model a mountain of examples and
+   it slowly adjusts billions of internal numbers (called
+   <Term def="The numbers inside a model that were learned during training. A ‘70B’ model has 70 billion of them.">weights</Term>)
    until it gets good at its task. This happens once (or a few times) and costs a fortune.
-2. **Inference**: the model *works*. Someone sends a question, and the model uses its weights to produce an answer. This
-   happens every time anyone uses the model: millions of times a day, forever.
+2. **Inference**: *serving the model in production*. Someone sends a request, and the model uses its weights to produce
+   an answer. This happens every time anyone uses the model: millions of times a day, for as long as the model is in
+   use.
 
 <Analogy>
   Training is like **going to culinary school**: years of expensive learning, done once. Inference is like **running
@@ -19,72 +22,315 @@ Every AI model goes through two stages:
   on how well the kitchen runs.
 </Analogy>
 
-Old-school machine learning models were small enough that inference was easy: put them on a regular computer and you
-were done. Generative AI (chatbots, image generators, voice models) is different. The models are enormous, they need
-GPUs, and doing it *well* is a whole engineering discipline. That discipline is **inference engineering**.
+### Why generative AI made inference hard
 
-## Why anyone cares
+During the machine learning boom of the 2010s, hundreds of thousands of data scientists and ML engineers got used to
+the full lifecycle, training *and* inference, for **classic ML models**. For those models, inference was relatively
+simple. The book recalls that in the early days of Baseten (the author’s company), they ran inference for models built
+with tools like **XGBoost** on lightweight **CPUs** with a simple software stack.
 
-The book makes a simple argument: a few years ago it looked like only a handful of labs (OpenAI, Anthropic, Google)
-would ever run big models, and everyone else would just rent them through an API. That's not what happened.
+<Note kind="beyond">
+  XGBoost is a popular library for *gradient-boosted decision trees*, a classic ML technique for predictions like
+  “will this customer churn?” or “is this transaction fraud?” These models are typically small and answer quickly on an
+  ordinary CPU. A modern LLM can be hundreds of gigabytes and needs GPUs, which is the whole reason a new discipline
+  was needed.
+</Note>
 
-There are now **millions of open models** (models whose weights anyone can download), and the best ones are close to
-the best closed models. That means any company can run its own model, and once you run your own, you can make it better
-in three ways that matter a lot:
+Generative AI (chatbots, image generators, voice models) is a different world. The book is blunt about it: **you can’t
+simply take model weights, get some GPUs, and expect inference to be fast and reliable enough for large-scale
+production use.** The models are enormous, they need specialized hardware and software, and small inefficiencies
+multiply across millions of requests. Doing it *well* is its own engineering discipline: **inference engineering**.
 
-| What you can improve | Why it matters |
+## Why inference matters so much right now
+
+The book opens (in its preface) with a strong claim: **inference is the most valuable category in the AI industry**,
+yet **inference engineering is still in its infancy**. Inference engineers work *across the whole stack*, from
+<Term def="NVIDIA’s platform for writing programs that run on its GPUs. Covered in Chapter 4.">CUDA</Term> (code
+running on the GPU) all the way up to
+<Term def="An open-source system for running and managing containers across a cluster of machines. Covered in Chapter 7.">Kubernetes</Term>
+(managing fleets of machines), chasing one goal: faster, less expensive, more reliable serving of generative AI models
+in production.
+
+### The world in 2022 vs. today
+
+On **November 30, 2022**, the day ChatGPT launched, there were perhaps **a few hundred** inference engineers in the
+world, though nobody called them that. They mostly worked at **frontier labs** (OpenAI, Midjourney, Anthropic) or at
+big tech companies (Google, NVIDIA).
+
+Back then, one future looked plausible: training generative models might be *so* hard and *so* expensive that only a
+handful of companies would ever build them. Everyone else would just be customers, **“renting intelligence a token at
+a time”** through APIs, and only those few labs would ever need inference engineers.
+
+That’s not what happened. Three years later, training turned out to be hard and expensive, **but not so hard or so
+expensive that only a handful of players could do it**. Instead there’s been a “Cambrian explosion” of **open
+models**:
+
+- There are now **more than two million** open models on Hugging Face (the largest repository of open models). The
+  preface’s first figure shows this: about **25 times more models than five years earlier**.
+- Research labs around the world regularly release open models of every modality: **OpenAI** and **NVIDIA Nemotron**
+  in America; **Mistral AI** and **Black Forest Labs** in Europe; **Alibaba Qwen**, **DeepSeek AI**, **Z AI**, and
+  **Moonshot AI** in China.
+
+### Open vs. closed models
+
+Models differ in whether their weights are available to you:
+
+| | Closed model | Open model |
+|---|---|---|
+| **Weights** | Proprietary, not available to the public | Publicly downloadable |
+| **Examples** | GPT-5, Claude Sonnet | Llama, DeepSeek |
+| **How you use it** | Only through the owner’s API | Run it anywhere you like, including on your own GPUs |
+| **License** | Owner’s terms of service | Usually MIT or a similar permissive license, but **some restrict commercial use, so always check** |
+
+### The quality gap closed
+
+Until **December 2024**, there was a meaningful intelligence gap between the best closed and the best open models.
+When **DeepSeek V3** and **R1** were released, that gap disappeared. Today, new closed models are typically matched by
+open models **within months, if not weeks**, and occasionally an open model (the book cites **Kimi K2 Thinking**)
+even beats the closed models for a brief window.
+
+### Why that matters: capability thresholds
+
+The preface’s second figure shows both closed and open models improving rapidly over time, and it frames progress in
+terms of **capability thresholds**: levels of intelligence at which a new kind of product becomes possible. Even though
+open models are usually *chasing* closed ones on benchmarks, crossing a threshold is what changes things for product
+builders.
+
+Here’s the sequence the book describes, step by step:
+
+1. **In 2022**, it was impossible to build the kinds of AI-native products that define the industry today.
+2. **Closed models got smarter first** and crossed thresholds that made new categories possible, like **customer
+   service voice agents** and **AI-powered code editors (IDEs)**. These early models were slow, expensive, and
+   unreliable, but the capability was there, so engineers started building companies around them.
+3. **Open models then crossed the same thresholds**, and product builders began swapping them in to **replace closed
+   models**.
+4. Many teams went further and **fine-tuned open models**, which let them cross thresholds *faster* and even **exceed
+   closed-model quality for their specific product and domain**.
+
+The preface’s third figure sums up the payoff: customizing open models unlocks new capabilities **while keeping
+control over latency, reliability, and economics.**
+
+### Three dimensions you can improve
+
+Once you run open models yourself, inference engineering can make your product better in three ways that closed APIs
+don’t let you control:
+
+| Dimension | The book’s point |
 |---|---|
-| **Speed** (latency) | Voice agents and coding tools feel broken if they're slow. |
-| **Uptime** (availability) | Your own deployment can stay up far more reliably than a shared public API. |
-| **Cost** | Running open models yourself can be dramatically cheaper at scale. |
+| **Latency** | Closed-model APIs are built for *throughput* (serving huge numbers of customers efficiently). Open models can be optimized for *real-time* applications. |
+| **Availability** | APIs for GPT and Claude are “stuck at **two nines** of uptime.” With dedicated deployments of open models, **four nines or better** is achievable. |
+| **Cost** | Open models are often **at least 80% less expensive** at scale. |
 
-Getting those wins takes skill, which is why inference engineering is a young, fast-growing field.
+<Worked title="What “two nines” vs. “four nines” actually means">
+  Uptime is quoted in “nines”: the number of 9s in the percentage of time a service is working.
 
-## The three layers
+  1. A month has about 30.4 days × 24 hours × 60 minutes ≈ **43,800 minutes**.
+  2. **Two nines** = 99% uptime, so 1% downtime: 43,800 × 0.01 ≈ **438 minutes ≈ 7.3 hours of downtime per month**.
+  3. **Four nines** = 99.99% uptime, so 0.01% downtime: 43,800 × 0.0001 ≈ **4.4 minutes of downtime per month**.
 
-The book organizes everything into three layers that stack on top of each other. Click through them:
+  That’s a **100× difference**. For a product in someone’s revenue path (a support agent, a coding tool), seven hours a
+  month of outages versus four minutes is the difference between an annoyance and a dealbreaker.
+</Worked>
+
+<Note kind="beyond">
+  The arithmetic above is standard reliability math, not from the book. Also note what “80% less expensive” means:
+  paying $20 for work that used to cost $100. That’s a 5× reduction in cost, not a 20% saving.
+</Note>
+
+### Who is doing this
+
+The book’s point is that where inference engineering once looked like a niche field, **every company that wants truly
+differentiated, competitive AI products now needs an inference strategy**. It lists examples across the market:
+
+- **AI-native startups** like **Cursor**, **Clay**, **Gamma**, and **Mercor**, growing extremely fast on products that
+  rely on open and in-house models.
+- **Digital-native companies** like **Notion** and **Superhuman**, deeply integrating AI into products hundreds of
+  millions of people already use.
+- **Blended research-and-engineering teams** like **World Labs**, **Writer**, and **Mirage**, training and productizing
+  their own foundation models.
+- **Enterprise and regulated industries**, historically slow adopters: companies like **OpenEvidence**, **Abridge**,
+  and **Ambience** are making generative AI ubiquitous in **healthcare**, and at the world’s largest companies AI
+  projects are moving past the pilot stage into mass adoption.
+
+The author writes from four years at Baseten, an inference provider serving the companies listed above. The book is
+based on interviews with dozens of experts on that engineering team, conference talks (NVIDIA GTC, PyTorch Conference,
+AWS re:Invent, AI Engineer World’s Fair), and many conversations with customers and builders.
+
+<Note kind="tip">
+  The preface’s message to readers is encouraging: **you are early.** Relatively few people work on inference, the
+  space is young, and **newcomers can become experts quickly**. There are novel, deeply technical problems at every
+  level of the stack.
+</Note>
+
+## The three layers of inference
+
+Doing inference well requires **three layers** that must work together to handle mission-critical inference at scale.
+Chapter 0’s first figure shows a complete inference stack combining *runtime* and *infrastructure* optimizations, with
+tooling on top. Click through them:
 
 <ThreeLayers />
 
-A few things worth noticing:
+### Layer 1: Runtime (one machine)
 
-- **Runtime** is about *one* machine. It's the most technical layer, full of GPU tricks. Chapters 2–6 are mostly about this.
-- **Infrastructure** is about *many* machines. No matter how fast one server is, enough traffic will swamp it, so you
-  need more copies of the model and a smart way to spread the work. As you grow, the problem changes: first it's
-  "add servers fast enough", then it's "find enough GPUs at all", and eventually it's "treat GPUs in many clouds as one
-  big pool".
-- **Tooling** is about *people*. The best systems give engineers enough control to fix things without drowning them in
-  details.
+**Definition:** optimizing the performance of **a single model on a single GPU-backed instance**. (An
+<Term def="A rented cloud machine: one or more GPUs plus CPU, RAM, storage, and networking. Covered in Chapter 3.">instance</Term>
+may contain several GPUs; runtime still means getting the most out of that one box.)
 
-## The six big tricks
+The runtime layer depends on a sophisticated **software stack**, from bottom to top:
 
-Inside the runtime layer, six techniques come up again and again. You don't need to understand them yet. Just get
-familiar with the names, because the whole course builds toward them:
+- **CUDA**: NVIDIA’s platform for programming GPUs.
+- **PyTorch**: the standard framework for building and running neural networks.
+- **Inference engines** like **vLLM**, **SGLang**, and **TensorRT-LLM**: specialized servers that run models fast.
+
+Low-level optimization matters a lot here. The book singles out
+<Term def="Small programs that run on the GPU. FlashAttention is a family of highly optimized kernels for computing attention (Chapter 2).">kernels</Term>
+like **FlashAttention**, which deliver significant performance gains on their own.
+
+### The six runtime techniques
+
+The runtime layer relies on a set of **model performance techniques** that adapt new research to the unique
+challenges of inference for generative models. You’ll spend most of Chapters 2–5 on them, so here are the book’s own
+definitions, expanded:
+
+| Technique | What it does | Why it helps |
+|---|---|---|
+| **Batching** | Runs incoming requests in parallel, **weaving them together on a token-by-token basis** | One pass over the model’s weights serves many users, so **throughput** rises |
+| **Caching** | **Reuses the KV cache** (the saved results of the attention calculation) between requests that **share the same prefix** | Work already done for an identical start of a prompt isn’t repeated |
+| **Quantization** | **Lowers the precision** of *select pieces* of the model | Smaller numbers let you **access more compute** and **reduce the memory burden** |
+| **Speculation** | **Generates and then validates draft tokens** | Produces **more than one token per forward pass** during decode, cutting latency |
+| **Parallelism** | **Efficiently uses more than one GPU** for large models | Speeds up big models **without introducing new bottlenecks** |
+| **Disaggregation** | **Separates the two phases** of LLM inference, *prefill* and *decode*, onto **independently scaling workers** | Each phase gets hardware and scaling suited to its very different needs |
+
+Don’t worry if terms like *KV cache*, *forward pass*, *prefill*, and *decode* are new. Chapter 2 builds each of them from
+scratch. For now, get familiar with the names:
 
 <SixTricks />
 
-<Note kind="tip">
-  If a term ever feels fuzzy, check the <a href="/glossary">Glossary</a>. You'll also see <Term def="Like this! Hover or tap on dotted words to see a quick definition.">dotted words</Term> throughout the lessons.
-  Hover or tap them for a quick definition.
+<Note kind="beyond">
+  A useful way to hold all six in your head is by **what each one attacks**:
+  - **Batching** and **speculation** both get more useful work out of each pass through the model’s weights. Batching
+    shares one pass across many users (more throughput); speculation squeezes several tokens out of one pass for a
+    single user (lower latency).
+  - **Caching** avoids repeating work entirely.
+  - **Quantization** shrinks the numbers, so there’s less data to move and more math the GPU can do per second.
+  - **Parallelism** adds more GPUs to one model when one isn’t big or fast enough.
+  - **Disaggregation** recognizes that the two phases of an LLM request stress the GPU in opposite ways (one is limited
+    by math, the other by memory), so it gives each phase its own workers.
+
+  Chapter 2’s bottlenecks lesson explains the “math vs. memory” distinction that makes this grouping click.
 </Note>
+
+These techniques aren’t just for chatbots. They apply to **models of every modality**: vision language models,
+embedding models, automatic speech recognition, speech synthesis, image generation, and video generation. Each of those
+modalities also needs its own specific optimizations, which is what Chapter 6 covers.
+
+### Layer 2: Infrastructure (many machines)
+
+Runtime optimizations **are not enough**. No matter how performant a single instance of a model server is, **it will
+eventually receive more traffic than it can handle.** The book stresses that this isn’t a CUDA problem or a PyTorch
+problem. It’s a **systems problem**, solved at the infrastructure layer.
+
+<Worked title="Why one instance eventually isn’t enough">
+  Imagine one well-optimized model server that can stream answers to **50 users at the same time** without slowing
+  anyone down.
+
+  1. Your app has **2,000 users active at the daily peak**. You need at least 2,000 ÷ 50 = **40 copies** (replicas) of
+     the server at that moment. No amount of kernel tuning turns 50 into 2,000.
+  2. At **3 a.m.**, only 150 users are active: 150 ÷ 50 = **3 replicas** would do. Keeping 40 running all night means
+     paying for 37 idle servers.
+  3. So you need a system that **adds replicas as traffic rises and removes them as it falls**, and does it fast enough
+     that users don’t wait while new servers boot. That’s autoscaling: the first infrastructure problem.
+  4. Now grow tenfold: 400 replicas. Suddenly the question isn’t *when* to add servers but *whether the cloud has any
+     GPUs left to give you*. That’s the capacity problem, the second stage.
+</Worked>
+
+<Note kind="beyond">
+  The numbers in this worked example are illustrative, not from the book. Chapter 7 covers how real autoscalers decide
+  when to add and remove replicas, and why booting a new replica (a “cold start”) can take minutes.
+</Note>
+
+The crucial insight is that **the nature of infrastructure problems changes with each level of scale**:
+
+1. **First, autoscaling.** At small scale, the questions are *when* to add and remove
+   <Term def="One running copy of the model server. More replicas means more capacity.">replicas</Term>, and *how to do
+   it quickly*.
+2. **Then, capacity.** Past a certain scale, **generally a few hundred GPUs**, the problem becomes simply *getting
+   access to enough GPUs*. Inference engineers start spreading workloads across **multiple regions** and **multiple
+   cloud providers**.
+3. **Which creates silos.** Spreading out quickly leads to fragmentation: models in one cluster can be **starved for
+   resources** while other clusters sit on **unused capacity**.
+4. **Finally, a unified global system.** The last level of scale is infrastructure that treats **all available
+   resources as a single unified pool of compute**, placing work wherever capacity exists.
+
+Chapter 0’s other figures illustrate both halves: one shows a runtime optimization (speculation) improving latency, and
+another shows serving at scale by **unifying capacity across multiple cloud service providers**.
+
+Thoughtful multi-cloud infrastructure brings two more benefits beyond raw capacity:
+
+- **Reliability**: spreading across regions and providers protects you against downtime in any single region or cloud.
+- **Lower end-to-end latency**: for global applications, running inference **near your users** cuts the time requests
+  spend traveling over the network.
+
+<Analogy title="Think of it like a restaurant chain">
+  Autoscaling is adding more cooks during the dinner rush. Capacity is discovering you can’t hire enough cooks in one
+  city and opening kitchens in other cities. Silos are when one kitchen has a two-hour wait while another across town
+  is empty. The unified system is a central dispatcher that sends every order to whichever kitchen can cook it fastest.
+</Analogy>
+
+### Layer 3: Tooling (the people using it)
+
+Once runtime and infrastructure capabilities exist, they have to be presented to engineers at the **right level of
+abstraction**. This applies both to **inference providers** (like Baseten) and to **internal teams** building
+inference inside a company: both must decide what tooling and **developer experience** to offer.
+
+The book admits developer experience is subjective, and frames it as a spectrum:
+
+- **One extreme: the black box.** Give the platform model weights, get back an API. Easy, but you can’t fix or tune
+  anything when it matters.
+- **The other extreme: raw building blocks.** Provide only basic constructs for compute, network, disk, and so on. Full
+  control, but engineers drown in details and get little done.
+- **The right answer is in the middle**: enough **control** to run mission-critical inference confidently, with enough
+  **abstraction** to work productively.
 
 ## The map of this course
 
-Here's how the chapters fit together, in plain words:
+The book presents itself as a *map* of the technologies and techniques across all three layers. Here’s how the
+chapters (and this course) fit together:
 
-- **Ch 1 · Before you optimize**: figure out what your app actually needs (speed? cost? quality?) and pick a model.
-- **Ch 2 · How models work**: what's happening inside the model, and *where it gets slow*. (The most important chapter.)
-- **Ch 3 · Hardware**: what's inside a GPU and how to choose one.
-- **Ch 4 · Software**: the layers of software that run the model, from CUDA up to inference engines like vLLM.
-- **Ch 5 · Techniques**: the big speed-up tricks, in depth.
-- **Ch 6 · Beyond text**: how images, speech, and video models differ.
-- **Ch 7 · Production**: running all of this for real users, reliably.
+| Chapter | What it covers |
+|---|---|
+| **1 · Before you optimize** | The product thinking and AI engineering that come *before* inference engineering: defining the use case, budgeting latency and cost, and selecting and evaluating models. |
+| **2 · How models work** | The technical architecture of LLMs and image/video models, **where the bottlenecks are**, and a special focus on optimizing attention. |
+| **3 · Hardware** | GPU spec sheets from the ground up: compute and memory, NVIDIA’s datacenter architectures and product lines, and other accelerators. |
+| **4 · Software** | The abstraction layers from CUDA through PyTorch, Transformers, and Diffusers to inference engines (vLLM, SGLang, TensorRT-LLM), plus NVIDIA Dynamo for large-scale distributed serving. |
+| **5 · Techniques** | The key optimization techniques in depth: quantization, speculative decoding, KV cache reuse, model parallelism, and disaggregation. |
+| **6 · Beyond text** | Voice and visuals. Vision-language, embedding, speech recognition, and speech synthesis models adapt LLM architectures (so the same tools apply); image and video generation have their own architectures and tricks. |
+| **7 · Production** | Operating infrastructure and building performant applications on top of optimized inference services. |
+
+The book ends with a **glossary** and a **recommended reading** list; this site has both (see
+the <a href="/glossary">Glossary</a> and <a href="/reading">Further reading</a> pages).
+
+<Note kind="warn">
+  Like LLMs, books have a **knowledge cutoff**: this one was finished in **January 2026**. Specific products, GPUs, and
+  model names will change. The **principles, concepts, and foundational technologies** are what this course focuses on,
+  because those stay useful for years.
+</Note>
+
+<Note kind="tip">
+  If a term ever feels fuzzy, check the <a href="/glossary">Glossary</a>. You’ll also see <Term def="Like this! Hover or tap on dotted words to see a quick definition.">dotted words</Term> throughout the lessons.
+  Hover or tap them for a quick definition.
+</Note>
 
 <KeyPoints>
-- **Training** = learning (once, expensive). **Inference** = using the model to answer (constantly, forever).
-- Inference engineering makes models **faster, cheaper, and more reliable** without making them dumber.
-- Three layers: **runtime** (one machine), **infrastructure** (many machines), **tooling** (the people using it).
-- Six recurring tricks: batching, caching, quantization, speculation, parallelism, disaggregation.
+- **Training** learns the weights (once, expensive). **Inference** serves the model in production (constantly).
+- Classic ML inference was simple (small models, CPUs). Generative AI inference needs specialized hardware, software,
+  and systems work.
+- Open models (2M+ on Hugging Face) caught up with closed ones after DeepSeek V3/R1 (Dec 2024). Running them yourself
+  lets you control **latency**, **availability** (four nines vs. two), and **cost** (often 80%+ cheaper).
+- Three layers: **runtime** (one model, one instance), **infrastructure** (autoscaling → capacity → silos → one global
+  pool), **tooling** (the right level of abstraction, between black box and raw building blocks).
+- Six runtime techniques: **batching, caching, quantization, speculation, parallelism, disaggregation**. They apply to
+  every modality.
 </KeyPoints>
 
 <Quiz questions={[
@@ -92,18 +338,46 @@ Here's how the chapters fit together, in plain words:
     q: "You ask a chatbot a question and get an answer. Which stage of the model’s life is that?",
     options: ["Training", "Inference", "Fine-tuning"],
     answer: 1,
-    why: "Using an already-trained model to produce an answer is inference. Training happened long before you showed up."
+    why: "Using an already-trained model to produce an answer is inference: serving the model in production. Training happened long before you showed up."
   },
   {
     q: "Your single GPU server is perfectly optimized, but traffic doubles and requests start timing out. Which layer’s problem is this?",
     options: ["Runtime", "Infrastructure", "Tooling"],
     answer: 1,
-    why: "Once one machine can’t keep up, it’s a systems problem: you need more copies and a way to spread the load. That’s infrastructure."
+    why: "The book is explicit: any single instance eventually gets more traffic than it can handle, and that’s a systems problem, not a CUDA or PyTorch problem. You need more replicas and a way to spread load: infrastructure."
   },
   {
-    q: "Which of these is NOT one of the three main reasons companies switch to running their own open models?",
-    options: ["Lower latency", "Higher uptime", "Lower cost", "Models that never make mistakes"],
+    q: "A company runs 400 GPUs and suddenly can’t get more in its usual cloud region. According to the book’s progression, what stage of infrastructure problem is this?",
+    options: ["Autoscaling", "Capacity", "Tooling"],
+    answer: 1,
+    why: "Past roughly a few hundred GPUs, the defining problem becomes capacity: getting enough GPUs at all. The typical response is to spread across regions and clouds, which then risks creating silos."
+  },
+  {
+    q: "A service promises 99.99% uptime. Roughly how much downtime per month is that?",
+    options: ["About 7 hours", "About 44 minutes", "About 4 minutes"],
+    answer: 2,
+    why: "A month is about 43,800 minutes. 0.01% of that is about 4.4 minutes. Two nines (99%) would allow about 438 minutes, or 7.3 hours."
+  },
+  {
+    q: "Which runtime technique produces more than one token per forward pass during decode?",
+    options: ["Batching", "Speculation", "Caching", "Disaggregation"],
+    answer: 1,
+    why: "Speculation generates draft tokens and validates them together, so one pass of the big model can yield several tokens. Batching serves more users per pass, but each still gets one token per pass."
+  },
+  {
+    q: "Your team is building internal inference tooling. Engineers complain they can’t debug anything because the platform just takes weights and returns an API. What does the book suggest?",
+    options: [
+      "Keep the black box; simplicity always wins",
+      "Expose only raw compute, network, and disk so engineers have full control",
+      "Move toward the middle: enough control for mission-critical work, enough abstraction to stay productive"
+    ],
+    answer: 2,
+    why: "The book frames developer experience as a spectrum between a black box and raw constructs, and argues the right answer is in between."
+  },
+  {
+    q: "Which of these is NOT one of the three dimensions the preface says open models let you improve?",
+    options: ["Latency", "Availability", "Cost", "Guaranteed higher intelligence than closed models"],
     answer: 3,
-    why: "The book’s three reasons are latency, availability, and cost. Running a model yourself doesn’t make it smarter by itself."
+    why: "The three are latency, availability, and cost. Open models are usually close to (and occasionally ahead of) closed ones, but running them yourself doesn’t by itself make them smarter. Fine-tuning can raise quality for a specific domain."
   }
 ]} />

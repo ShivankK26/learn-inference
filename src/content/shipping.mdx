@@ -3,186 +3,368 @@ import ApiVsDedicated from "@/components/widgets/ApiVsDedicated";
 import RequestTimeline from "@/components/widgets/RequestTimeline";
 
 <TLDR>
-  The last mile: **test** the whole system before users see it, **roll out** new versions gradually so a bug can't hit
-  everyone, **count the real cost** of running your own GPUs, **watch** the right metrics, and don't forget the
+  The last mile: **test** the whole system before users see it, **roll out** new versions gradually so a bug can’t hit
+  everyone, **count the real cost** of running your own GPUs, **watch** the right metrics together, and don’t forget the
   **client**, because connection setup, timeouts, and streaming decide how fast your app *feels*.
 </TLDR>
 
 ## Testing before you deploy
 
-Chapter 4 covered benchmarking a single replica. Before you deploy, you also need to test the **whole system, end to
-end**. There are three main ways:
+Chapter 4 covered [benchmarking](/learn/benchmarking) a single replica while configuring the engine. Before deploying,
+the book says you also need to test the **whole system, end to end**. There are three strategies:
 
-- **Manual testing**: writing scripts (or clicking buttons) to send made-up traffic to the service.
-- **Load testing**: automatically blasting the system with lots of traffic to see if it scales and stays fast.
-- **Shadow traffic**: **copying real, live traffic** to the new deployment in the background, so you see how it performs
-  on real-world requests without users ever getting its answers.
+- **Manual testing**: writing scripts (or clicking buttons) to send synthetic traffic to an inference service.
+- **Load testing**: automatically sending a large volume of traffic to test the system’s ability to **scale** and
+  **maintain performance** under pressure.
+- **Shadow traffic**: **copying live traffic** to a test deployment to measure performance under real-world conditions.
 
-Testing inference is **expensive**. Setting up tests and reading the results takes engineering time, and the test
-traffic needs real GPUs. Some of that is just the cost of doing business, but be thoughtful. For example, you could
-start by shadowing a **random sample** of production traffic, then follow with a **shorter** load test.
+Each catches different problems:
+
+| Strategy | What it’s good at catching |
+|---|---|
+| **Manual testing** | Broken outputs, wrong formats, misconfigured endpoints: does it work at all? |
+| **Load testing** | Throughput limits, queue buildup, autoscaling behavior, and latency under heavy load |
+| **Shadow traffic** | Surprises from **real** sequence shapes and topics that synthetic tests don’t produce |
+
+<Note kind="beyond">
+  **How shadowing works.** A copy of each real request is sent to the new deployment in the background; users still get
+  their answers from the current deployment, and the shadow’s responses are thrown away after you record their latency
+  and, where useful, compare their outputs. Because shadowing duplicates real user data, it falls under the same privacy
+  and retention rules as production traffic.
+</Note>
+
+**Testing inference is expensive.** It takes engineering time to configure tests and measure results, and it takes
+GPUs to run inference on the test traffic. To a degree that’s the cost of doing business, but the book says to think
+carefully about minimizing it. Its example: start by shadowing a **random sample** of production traffic, followed by a
+**shorter-duration** load test.
+
+<Worked title="What sampling saves on a shadow test">
+
+1. Production serves **2 million requests a day** on **40 GPUs**.
+2. Shadowing **100%** of traffic for a **week** needs roughly another 40 GPUs for 7 days: **6,720 GPU-hours**.
+3. Shadowing a **10%** random sample for **2 days** needs about 4 GPUs for 48 hours: **192 GPU-hours**, about 3% of
+   the cost, and 400,000 real requests is still a large, realistic sample.
+4. A short load test afterwards then checks the one thing a small sample can’t: behavior at full volume.
+
+</Worked>
 
 <Note kind="tip">
-  AI usage rises and falls on **daily and weekly cycles**. A test run on a quiet Sunday night can look very different
-  from Monday at noon, so keep the calendar in mind when you plan and read your tests.
+  AI product usage generally fluctuates on **daily and weekly cycles**. A test run on a quiet Sunday night can look very
+  different from Monday at noon, so keep the calendar in mind when you plan tests and read their results.
 </Note>
 
 ## Deploying without downtime
 
-Once you're confident the new version works, you need to swap it in without an outage.
+Once you’re confident in the updated system’s performance and stability, it’s time to deploy to production, using
+**high-availability** strategies to avoid downtime.
 
-**Blue-green deployment** is the traditional approach. You run two identical environments: the current one (**blue**)
-and one with the new version (**green**). When green is ready, *all* traffic switches over at once, and blue stays
-around so you can roll back if something goes wrong.
+**Blue-green deployment** is the traditional design. There are two identical environments: the original **blue**
+deployment and a new **green** deployment running the updated service. Once green is ready, **the full traffic load cuts
+over** from blue to green, with blue staying ready for rollback in case of issues.
 
-The problem at inference scale is GPUs. If blue runs on 100 GPUs, green needs **another 100 GPUs** before you can switch.
-That's exactly the capacity and cost problem that makes large-scale testing hard in the first place.
+The book explains why blue-green is **not well suited to large-scale inference**: the same GPU capacity and cost issues
+that make large-scale testing difficult. If blue uses **100 GPUs**, green needs **another 100 GPUs** before traffic can
+cut over. At inference scale, you may not even be able to get the second 100 GPUs.
 
-**Canary deployment** gets similar safety with far fewer extra GPUs. The name comes from the canaries coal miners
-carried to detect dangerous gas: a canary deploy **catches problems before they reach most users**. It works in four
-steps:
+**Canary deployments** get similar benefits with far lower GPU overhead. The name comes from the canaries once used to
+detect gas in coal mines: a canary deployment **catches errors before they affect large numbers of users**. It’s a
+four-step process:
 
-1. **Build** the new deployment and get it ready to take requests.
-2. **Send a small slice** of live traffic to it.
-3. **Watch it closely.** If anything looks wrong, revert.
-4. **Gradually increase** its share while you keep watching, until it handles 100% of traffic.
+1. **Build** a new deployment of the inference service and get it ready to handle incoming requests.
+2. **Direct a small percentage** of incoming live traffic to the new service.
+3. **Monitor** the new service and make sure it handles traffic correctly. **Revert** if there are any issues.
+4. **Gradually increase** traffic, while monitoring for issues, until the new deployment handles **100%** of traffic.
 
-The book's diagram shows traffic shifting over in steps like this, so an issue shows up while only a few users are on
+The book’s Figure 7.13 shows traffic shifting over iteratively, so an issue surfaces while only a slice of users is on
 the new version.
 
 <CanaryDeploy />
 
-Canary rollouts can be quick (a few minutes of ramp) or slow and careful. And with autoscaling, they **barely cost
-extra**: as traffic moves off the old deployment, it scales itself down.
+Canary deployments can be rolled out **quickly**, with just a few minutes of traffic ramp, or **slowly** to ensure
+stability at each stage. And with autoscaling, they **don’t increase cost much at scale**, because reducing traffic to the
+old production system causes it to scale down some replicas.
+
+<Worked title="GPU overhead and blast radius: blue-green vs. canary">
+
+The current deployment runs on **100 GPUs**.
+
+1. **Blue-green:** green must be fully built before cutover, so you briefly run **200 GPUs**. If green has a bug that
+   testing missed, it hits **100%** of users the moment traffic cuts over (until you roll back).
+2. **Canary at 5%:** the new deployment needs only about **5 GPUs**' worth of capacity. As 5% of traffic leaves the old
+   deployment, autoscaling trims it toward **95 GPUs**, so the total stays near **100**.
+3. **Ramping 5% → 25% → 50% → 100%:** at every step the new side grows and the old side shrinks by about the same
+   amount. A bug found at the 5% step affected only **5%** of users, for only as long as that step lasted.
+
+</Worked>
 
 <Note kind="warn">
-  With autoscaling, a new deployment with no traffic sits at its **minimum** replica count. Before you shift traffic
-  onto it, make sure it has **enough warm replicas** to handle that traffic. Otherwise users see a latency spike while
-  their requests queue and autoscaling catches up.
+  With autoscaling, a new deployment with no traffic defaults to its **minimum** number of replicas. The book’s warning:
+  throughout the canary process, make sure the new deployment has **enough active replicas** to handle the traffic you’re
+  sending it. Otherwise users see a **latency spike** as their requests queue while autoscaling catches up. Pre-scale the
+  new side before each traffic step.
+</Note>
+
+<Note kind="beyond">
+  **What to watch at each canary step.** Compare the new deployment against the old one on the same metrics: error rates
+  (especially 5XX responses), latency percentiles (P99 time to first token and inter-token latency, not just averages),
+  and output quality, whether through automated checks or eval spot checks. Many teams automate the rollback: if the
+  canary’s error rate or P99 latency crosses a threshold, traffic shifts back without waiting for a human. And make at
+  least one step span a busy period, since daily cycles mean a canary that only saw quiet traffic hasn’t really been
+  tested.
 </Note>
 
 ## Estimating cost
 
-Moving from a public API to your own GPUs changes how you have to think about money.
+Switching from consuming tokens through a public API to running your own inference on dedicated GPUs requires changing
+how you think about cost.
 
-**API cost is simple**: a price per million tokens times the tokens you use. There are a few wrinkles (cached input
-tokens are cheaper than uncached ones, and big customers get discounts), but cost still grows **in a straight line**
-with usage.
+**Cost on public APIs is simple**: a price per million tokens times the number of tokens you use. There are a couple of
+variables, such as **cache hits vs. cache misses** for input tokens and **discounts** for high-volume users, but cost
+remains a **linear function of usage**. Double the tokens, double the bill.
 
-One big reason to invest in inference engineering is to **take control of your unit economics**: to escape per-token
-pricing. But it's a hard mental switch, because with dedicated GPUs, cost depends on many things at once:
+One motivation for investing in inference engineering is to **take control of your unit economics** and escape
+per-token pricing. But the book calls it a difficult mental transition, because the blessing and curse of dedicated
+inference is that **cost is now a function of many variables**. That’s good because it gives you control, and hard
+because it makes estimation difficult. The factors include:
 
-- **Batch sizing**: is the deployment tuned for latency (small batches) or throughput (big batches)?
-- **Traffic patterns**: are your GPUs busy all the time, or often sitting partly idle?
-- **Sequence lengths**: how many input and output tokens do requests have, on average *and* in the extreme cases?
+- **Batch sizing**: is the deployment optimized for **latency** with low batch sizes, or for **throughput** with high
+  batch sizes?
+- **Traffic patterns**: is traffic consistently **saturating** active GPUs, or is capacity going spare?
+- **Sequence lengths**: how many input and output tokens do requests have, both **on average** and in **outlier** cases?
 
-Because of all that, and because input and output tokens are priced differently, the book advises **not** trying to
-reverse-engineer a per-token price for your GPUs. Instead, **turn your token bill into a total cost, and compare it with
-the total cost of running dedicated GPUs.** The book gives an equation for each side. In plain terms:
+Given this complexity, and the difference in price between input and output tokens, the book advises that it’s
+generally more productive to **convert your token price into a total cost and compare that to dedicated**, instead of
+trying to reverse-engineer a per-token price from what you pay for GPUs. The book gives one equation for each side
+(Figures 7.14 and 7.15, not reproduced in this course). *Reconstructed in plain terms:*
 
 ```text
-API total        ≈ (input tokens × input price)
-                 + (output tokens × output price)      ← per million tokens, summed over the period
+API total cost  ≈ uncached input tokens × input price
+                + cached input tokens   × cached input price
+                + output tokens         × output price        (prices per million tokens)
 
-Dedicated total  ≈ number of GPUs × price per GPU-hour × hours in the period
+Dedicated total ≈ Σ over instance types: number of GPUs × price per GPU-hour × hours in the period
 ```
+
+<Worked title="Comparing a week of API spend with dedicated GPUs">
+
+All prices and throughput figures are illustrative.
+
+1. **Usage per week:** 3 billion input tokens (a third of them cache hits) and 600 million output tokens.
+2. **API total:** 2,000M uncached × $0.60 + 1,000M cached × $0.15 + 600M output × $2.40 per million
+   = $1,200 + $150 + $1,440 = **$2,790 per week**.
+3. **Dedicated sizing:** 600M output tokens over a week (604,800 s) is about **1,000 output tokens per second** on
+   average. Traffic isn’t flat; say the busiest hours run at **3×** average, so you need about **3,000 tokens per
+   second** at peak, plus the prefill work for all that input.
+4. If one 8-GPU node sustains that at your latency SLA, you need **one node, plus a second for redundancy**: 16 GPUs.
+5. **Dedicated total:** 16 GPUs × $3.00 per GPU-hour × 168 hours = **$8,064 per week**, before engineering time.
+6. **Verdict at this scale:** the API wins by far. Dedicated only pulls ahead when usage grows enough to keep those GPUs
+   busy. At 5× this usage the API bill would be about $13,950, while the same two nodes (if they can absorb it) still
+   cost about $8,064.
+
+</Worked>
 
 <ApiVsDedicated />
 
-Two more rules of thumb:
+<Note kind="beyond">
+  **Why a “dedicated price per million tokens” is slippery.** You *can* compute one: price per hour ÷ (tokens per
+  second × 3,600) × 1,000,000. A node costing $24 an hour that produces 10,000 tokens per second makes 36 million tokens
+  an hour, about **$0.67 per million**, but only if it’s saturated every hour. At 30% average utilization the effective
+  price is about **$2.22 per million**. It also changes with batch size and the mix of input and output tokens. That
+  sensitivity is exactly why the book says to compare **totals** over a long window instead.
+</Note>
 
-- **Use a long time window**, ideally **at least a week**, to smooth out the ups and downs of usage.
-- **Include engineering time.** Building and running your own inference takes people. That investment buys
-  reliability, security, and control, but it belongs in the bill. GPUs plus engineering gives you the **total cost of
-  ownership** (<Term def="Total cost of ownership: everything it really costs to run something, including hardware and the people who build and maintain it.">TCO</Term>).
+Two more rules from the book:
+
+- **Use a long time horizon**, ideally **at least a week**, to smooth out variations in usage (weekends, launches, daily
+  cycles).
+- **Include engineering time.** The time spent building and maintaining inference systems is justified by increased
+  reliability, security, and control, but it should be added to GPU costs to form a complete picture of the **total cost
+  of ownership** (<Term def="Total cost of ownership: everything it really costs to run something, including hardware and the people who build and maintain it.">TCO</Term>)
+  for inference.
 
 ## Observability: watching it run
 
-Inference is mission-critical, so it deserves the same **alerts, logs, and dashboards** as any other critical part of
-your app. Here's what to measure:
+Inference is mission-critical, so it must be monitored like any other mission-critical component, with **alerting,
+logs, and observability** built at the right level of abstraction. The first question is what to monitor. The book’s
+list:
 
 | Metric | What it tells you |
 |---|---|
-| **Total volume** | How many requests the deployment is receiving |
-| **Request and response sizes** | Input and output sequence lengths |
-| **Response codes** | Counts of 2XX (success), 4XX (bad request), and 5XX (server error) responses |
+| **Total volume** | The number of requests the deployment is receiving |
+| **Request and response sizes** | The input and output sequence lengths being processed |
+| **Response codes** | Counts of 2XX (success), 4XX (client error), and 5XX (server error) responses |
 | **Latency** | Time to first token, tokens per second, and end-to-end latency at P50, P90, and P99 |
-| **Replica count** | How many replicas are serving, and how many are still starting up |
-| **Utilization** | How busy the CPU, host memory, GPU, and GPU memory are |
-| **Queue depth** | For async traffic, how many requests are waiting |
+| **Replica count** | Instances actively serving traffic, and instances still starting up |
+| **Utilization** | Usage across CPU, host memory, GPU, and GPU memory |
+| **Queue depth** | For asynchronous traffic, the number of requests enqueued and waiting |
 
-These metrics **depend on each other**, which is why you want them side by side. A latency spike might come from a flood
-of requests, or it might come from a few very long inputs. Seeing volume, sequence sizes, and latency together tells
-you not just *what* happened but *why*.
+These metrics are **interdependent**. The book’s example: a spike in latency could come from **request volume**, but it
+could also come from **long input sequences**. Seeing the metrics together lets inference engineers understand not only
+*what* is happening but *why*.
 
-When something breaks, you need details fast. **Logs** deliver them in real time: **server logs** (what the service is
-doing) and **audit logs** (who changed what, and when).
+<Worked title="Diagnosing a latency spike with metrics side by side">
 
-And don't build it as an island. Plug inference monitoring into the tools the rest of your app already uses, like
-**Grafana, Datadog, PagerDuty, or Sentry**, so inference problems show up in context.
+1. **Alert:** at 2 p.m., P99 time to first token doubles from 400 ms to 800 ms.
+2. **Volume:** flat. So it isn’t simply more users.
+3. **Request sizes:** P99 input length jumped from 4,000 to 40,000 tokens. Someone is sending very long prompts.
+4. **Utilization:** GPU compute is pinned on a few replicas while others are fairly idle. The long prompts are clustering
+   on some replicas and creating heavy <Compute>prefill</Compute> work there.
+5. **Replica count:** unchanged, because traffic-based autoscaling counts *requests*, and the number of requests didn’t
+   change.
+6. **Diagnosis and fixes:** prefill-heavy requests are hurting their neighbors. Options from earlier lessons: route by
+   sequence length, use chunked prefill so long prompts don’t block others, and let utilization signals trigger
+   scaling. No single metric would have told you all of that.
+
+</Worked>
+
+When things go wrong, inference engineers need information to fix issues. **Logs** deliver that information in real
+time: both **server logs** (what the service is doing) and **audit logs** (showing changes made to an inference service:
+who changed what, and when).
+
+And observability **cannot be siloed**. The book says to build it with deep integration into existing observability and
+alerting tools, such as **Grafana, Datadog, PagerDuty, and Sentry**, to put inference information in context with the
+rest of the application.
+
+<Note kind="beyond">
+  **SLA, SLO, SLI.** An *SLA* (service level agreement) is the external promise, like “P95 time to first token under 500
+  ms, 99.9% uptime,” often with financial penalties. An *SLO* (service level objective) is your stricter internal target,
+  say 400 ms, so you get warned well before breaking the promise. An *SLI* (service level indicator) is the actual
+  measurement you compare against both. Alerts work best on user-facing symptoms like P99 latency and 5XX rates, with
+  the other metrics in the table used to find the cause.
+</Note>
 
 ## The client side
 
-There's one area of inference engineering that often gets forgotten: the **client code**. Every call has two sides:
+Inference engineering draws on many technologies, from CUDA to Kubernetes. But the book singles out one critical area
+that’s often overlooked when optimizing for latency and building for scale: **client code**. There are two sides to
+every call:
 
-- The **client**: the browser, agent, or app making the request.
-- The **server**: the inference service that answers it.
+- The **client**: the browser, agent, or application making a request to the inference service.
+- The **server**: the inference service that handles the request and returns the model’s results.
 
-The industry-standard client is the **OpenAI SDK**, which works with many compatible providers, not just OpenAI. Popular
-frameworks like **LangChain, Vercel AI SDK, LiteLLM, and LlamaIndex** can act as clients too. Whether you use one of
-those or write your own, the client can add latency or become a throughput bottleneck. And real-time apps may need
-something other than plain HTTP, like **WebSockets**, to keep a connection open.
+The industry standard for client code is the **OpenAI SDK**, which supports a wide range of compatible providers in
+addition to OpenAI’s own models. Popular AI engineering frameworks and libraries like **LangChain, Vercel AI SDK,
+LiteLLM, and LlamaIndex**, and dozens more, can also act as clients. Whether you use an existing library or your own
+code, there’s potential for **latency overhead** or **throughput bottlenecks** on the client side. And real-time apps may
+need a protocol other than plain HTTP, like **WebSockets**, to keep a continuous connection open.
 
-The book's diagram makes the key point: **the time the model spends on the server is only part of the total latency a
-user experiences.**
+The book’s Figure 7.16 makes the key point: **on-server inference time is just a fraction of the end-to-end latency for a
+given request.** Network travel, connection setup, and client processing surround it.
 
 <RequestTimeline />
 
 ### Re-use your connections
 
-Setting up a secure connection between client and server (the <Term def="The back-and-forth a client and server do to set up an encrypted connection before any real data flows.">TLS handshake</Term>)
-takes **a few dozen milliseconds**, depending on the user's connection and the protocol.
+Depending on the client’s internet connection and the protocol used, **establishing a session** between client and server
+takes **a few dozen milliseconds**.
 
-In a fast system with a **300 ms** latency target (at P95), a handshake alone eats **at least 10%** of the budget
-before inference even starts. So later requests from the same client should **re-use the existing session**. The
-OpenAI SDK already does this quietly under the hood, but if you build your own client (common for unusual modalities
-like audio), follow the same practice.
+In a high-performance system with a **300 ms P95** end-to-end latency SLA, the book notes that a
+<Term def="The back-and-forth a client and server do to set up an encrypted connection before any real data flows.">TLS handshake</Term>
+costs **at least 10%** of that latency budget before inference even starts. Later requests from the same client should
+save that time by **re-using the existing session**. Session re-use is not a new idea, and tools like the OpenAI SDK do it
+silently under the hood. But when you build your own client, for example for non-standard modalities, follow the same
+best practice.
+
+<Worked title="What a fresh connection costs">
+
+1. The user is **30 ms** round trip from your server.
+2. A new connection needs a transport handshake (about **one round trip**) and then a TLS handshake (about **one more**
+   with modern TLS): roughly **60 ms** before the request is even sent.
+3. Against a **300 ms** P95 budget, that’s **20%** gone. Even a very close user pays the book’s “at least 10%.”
+4. A re-used session skips both handshakes: the request goes out immediately on the already-open connection.
+
+</Worked>
+
+<Note kind="beyond">
+  **How clients re-use sessions.** HTTP clients keep connections open between requests (*keep-alive*) and hold a
+  *pool* of open connections to reuse. Newer versions of HTTP can also carry many requests over one connection at the
+  same time. The common mistake in hand-written clients is creating a new client object, and therefore a new
+  connection, for every request.
+</Note>
 
 ### Asynchronous inference
 
-Some systems care about **throughput, not latency**. Processing a huge pile of documents or embedding an entire corpus
-doesn't need an instant answer. For these, switch to **asynchronous** jobs: "fire and forget."
+Some systems are built for **throughput, not latency**. Use cases like **bulk document processing** and **embedding an
+entire corpus** aren’t latency-sensitive, so it makes sense to switch to **asynchronous jobs**, a “fire and forget”
+approach:
 
-- A normal, **synchronous** request has a **timeout**, usually a few minutes, after which it fails.
-- An **asynchronous** request is acknowledged immediately. When the result is ready, it's delivered to a
+- Ordinary **synchronous** requests have a **timeout**, generally a few minutes, after which the request fails.
+- **Asynchronous** jobs are **acknowledged immediately**. Later, the result is returned to a
   <Term def="A URL you give the service ahead of time; it calls that URL to hand you the result when the job is done.">webhook</Term>
-  you provided in the original request.
+  supplied in the original request.
 
-Async jobs still have time limits, but they're measured in **hours**, not minutes. Combined with good server-side
-queueing, this makes big, latency-insensitive workloads sturdier and more efficient.
+Asynchronous jobs still have time limits, but they’re usually measured in **hours, not minutes**. Combined with strong
+**server-side queueing**, asynchronous requests make high-throughput, latency-insensitive systems more robust and
+efficient: the server can work through the queue at full batch sizes, at its own pace, instead of juggling timeouts.
+
+<Worked title="The life of an asynchronous job">
+
+1. Your system submits “summarize these 50,000 documents” along with a webhook URL.
+2. The service **immediately replies** “accepted, job 123”. Nothing is held open, so no timeout can fire.
+3. The job waits in the server-side **queue** and runs as capacity allows, in large, efficient batches.
+4. Hours later, when it finishes, the service **calls your webhook** with the results (or with where to fetch them).
+5. If it runs past its limit, which is usually hours, it fails cleanly instead of your client hanging for minutes and
+   timing out.
+
+</Worked>
+
+<Note kind="beyond">
+  **Two habits for async systems.** Make submissions *idempotent*, for example with a unique job key, so a client that
+  retries after a network hiccup doesn’t start the same expensive job twice. And verify incoming webhook calls (commonly
+  with a signature) so nobody else can post fake results to your endpoint.
+</Note>
 
 ### Streaming, WebSockets, and gRPC
 
-**Streaming** makes an app feel instant. Tick the streaming box above: the user starts reading after prefill instead of
-waiting for the last token. For **text** from a language model, streaming over ordinary **HTTP** is enough.
+**Streaming makes applications feel instant.** Tick the streaming box in the timeline above: the user starts reading after
+prefill instead of waiting for the last token. For **language models**, streaming text output over **HTTP** is
+sufficient.
 
-But live **voice and video** need a lot more data flowing in **both directions** at once. A one-off HTTP request and
-response suits text chat, but not a continuous stream. The two most common protocols for two-way streaming are:
+<Note kind="beyond">
+  **How text streaming over HTTP works.** OpenAI-compatible APIs stream by keeping the HTTP response open and sending
+  each new chunk of tokens as a small event the moment it’s generated (a format called *server-sent events*). It’s
+  one-directional, server to client, which is all a chat reply needs.
+</Note>
 
-| Protocol | Best for | Notes |
+But for other modalities, especially **live voice and video**, both the **input and output** streams need to carry much
+more data, continuously. The book’s Figure 7.17 contrasts one-time HTTP requests and responses, a good fit for text chat,
+with the continuous streaming that live media needs. The two most common **bi-directional** streaming protocols are:
+
+- **WebSockets**: for streaming use cases where strong schema enforcement is **not** required.
+- **gRPC**: for well-defined **service-to-service** communication.
+
+**WebSockets** (Figure 7.18) establish a continuous connection that’s useful for transmitting **unstructured, real-time
+data like audio**, where the server receiving it parses and processes it downstream. With WebSockets, a server supports up
+to a **fixed, developer-configurable number of clients**; once that concurrency is reached, new connections **can’t be
+established** and must wait until a slot frees up or another replica scales up. (That’s the same concurrency-target logic
+from the [autoscaling lesson](/learn/autoscaling), applied to open connections.)
+
+**gRPC** (Figure 7.19) also supports bi-directional streaming, but for **structured** data. Requests sent via gRPC must
+follow a **predefined schema**, which takes away the work of parsing free-form input. The book notes that this extra
+validation layer makes gRPC **slightly slower than WebSockets**.
+
+| Protocol | Best for | Key property |
 |---|---|---|
-| **WebSockets** | Streaming unstructured, real-time data, like audio | Keeps a continuous connection open. Each server accepts a fixed, configurable number of clients; when it's full, new connections wait for a free slot or a new replica. |
-| **gRPC** | Well-defined service-to-service communication | Also streams both ways, but for **structured** data. Messages must follow a predefined schema, so the server doesn't have to parse free-form input. That extra validation makes it slightly slower than WebSockets. |
+| **HTTP (streamed response)** | Text chat from an LLM | Simple; the server streams, the client listens |
+| **WebSockets** | Unstructured real-time data, like live audio | Continuous two-way connection; fixed number of clients per server |
+| **gRPC** | Structured service-to-service calls | Two-way streaming with an enforced schema; slightly slower than WebSockets |
+
+<Note kind="beyond">
+  **Under the hood of gRPC.** gRPC runs over HTTP/2 and encodes messages with *Protocol Buffers*, a compact binary
+  format defined by a schema that both sides share. That shared schema is what enforces structure, and it’s why gRPC is
+  popular between internal services, such as one model in a pipeline calling the next.
+</Note>
 
 ## Where the book ends
 
-The book closes with a short note about **Baseten**, the inference company where the author has worked for four
-years and where the book's lessons were learned. It describes their focus in four areas (performance, infrastructure,
-tooling, and hands-on expertise), which echo the layers you've studied throughout this course.
+The book closes with a short note about **Baseten**, the inference company where the author has worked for four years
+and where these lessons were learned. It describes their focus on four pillars (performance, infrastructure, tooling, and
+hands-on applied expertise), which mirror the layers this course has covered: the runtime, the infrastructure around
+it, and the tooling people use to operate it.
 
 ## You made it
 
-That's the whole journey, from a single neuron to a global, multi-cloud inference platform. Look how far it goes:
+That’s the whole journey, from a single neuron to a global, multi-cloud inference platform:
 
 - **Chapters 0–1**: what inference is, and how to decide what your app needs.
 - **Chapter 2**: how models work, and why <Compute>prefill</Compute> hits compute limits while <Memory>decode</Memory>
@@ -190,19 +372,23 @@ That's the whole journey, from a single neuron to a global, multi-cloud inferenc
 - **Chapters 3–4**: the hardware and software stack that runs it all.
 - **Chapter 5**: the big speed-ups: quantization, speculation, caching, parallelism, and disaggregation.
 - **Chapter 6**: images, speech, video, and embeddings.
-- **Chapter 7**: running it for real: containers, autoscaling, multi-cloud, deployment, cost, and the client.
+- **Chapter 7**: running it for real: containers, autoscaling, multi-cloud, deployment, cost, observability, and the
+  client.
 
 Keep the [Glossary](/glossary) handy, and revisit the lessons whenever you need them.
 
 <KeyPoints>
-- Test end to end with **manual tests, load tests, and shadow traffic**, and keep the cost of testing in check.
-- **Blue-green** doubles your GPUs during a switch. **Canary** rollouts shift traffic gradually and catch bugs early,
-  at little extra cost, as long as the new side has enough warm replicas.
-- Compare **total cost** (API bill vs. GPUs × hours), over at least a week, **plus engineering time** (TCO).
-- Monitor volume, sizes, response codes, latency percentiles, replicas, utilization, and queue depth **together**,
-  alongside logs, in your existing tools.
-- Client matters: **re-use sessions**, use **async jobs** for bulk work, and **stream** results. Use **WebSockets** for
-  unstructured real-time data and **gRPC** for structured service-to-service traffic.
+- Test end to end with **manual tests, load tests, and shadow traffic**; control test cost by sampling traffic and
+  shortening load tests, and mind daily and weekly cycles.
+- **Blue-green** needs a full second copy of your GPUs. **Canary** rollouts shift traffic in steps, catch bugs while few
+  users are exposed, and barely add cost with autoscaling, provided the new side has enough warm replicas at each step.
+- API cost is linear in tokens. Dedicated cost depends on batch size, traffic patterns, and sequence lengths, so compare
+  **totals** over **at least a week**, and add **engineering time** for true **TCO**.
+- Monitor volume, sequence sizes, response codes, latency percentiles, replicas, utilization, and queue depth
+  **together** to learn *why*, alongside server and audit logs, in your existing tools.
+- On the client: **re-use sessions** (a handshake can eat 10%+ of a 300 ms budget), use **async jobs with webhooks** for
+  bulk work, and **stream** results. HTTP for text, **WebSockets** for unstructured real-time media, **gRPC** for
+  structured service-to-service traffic.
 </KeyPoints>
 
 <Quiz questions={[
@@ -214,7 +400,27 @@ Keep the [Glossary](/glossary) handy, and revisit the lessons whenever you need 
       "Blue-green can’t roll back"
     ],
     answer: 1,
-    why: "Blue-green requires two complete environments at once. Canary shifts traffic in steps, and autoscaling shrinks the old deployment as it goes, so extra GPU cost stays small."
+    why: "Blue-green requires two complete environments at once. Canary shifts traffic in steps, and autoscaling shrinks the old deployment as it goes, so extra GPU cost stays small, and a bug reaches only a slice of users."
+  },
+  {
+    q: "You shift 10% of traffic to a new canary deployment and latency spikes for those users, though the new version has no bugs. What’s the likely cause?",
+    options: [
+      "The canary percentage was too low",
+      "The new deployment was still at its minimum replica count, so its requests queued while autoscaling caught up",
+      "Canary deployments always add latency"
+    ],
+    answer: 1,
+    why: "A new deployment with no traffic sits at min replicas. The book warns to make sure it has enough active replicas before sending it traffic."
+  },
+  {
+    q: "You want realistic test coverage without doubling your GPU bill for a week. What does the book suggest?",
+    options: [
+      "Skip testing and rely on canary rollouts",
+      "Shadow a random sample of production traffic, then run a shorter load test",
+      "Run only manual tests"
+    ],
+    answer: 1,
+    why: "Sampling keeps shadow testing cheap while still exercising real sequence shapes, and a short load test checks behavior at full volume."
   },
   {
     q: "What’s the book’s recommended way to compare API costs with dedicated GPUs?",
@@ -224,18 +430,40 @@ Keep the [Glossary](/glossary) handy, and revisit the lessons whenever you need 
       "Compare the price of one GPU-hour with the price of one million tokens"
     ],
     answer: 1,
-    why: "Dedicated cost depends on batch sizes, traffic, and sequence lengths, so a per-token price is hard to pin down. Comparing totals over a long window is more reliable."
+    why: "Dedicated cost depends on batch sizes, traffic patterns, and sequence lengths, so a per-token price is unstable. Comparing totals over a long window is more reliable."
+  },
+  {
+    q: "A node costs $24 per hour and produces 10,000 tokens per second when fully busy. What is its effective price per million tokens at 100% utilization, and roughly at 30%?",
+    options: ["About $0.67, and about $2.22", "About $2.40, and the same at 30%", "About $0.07, and about $0.20"],
+    answer: 0,
+    why: "10,000 tokens per second × 3,600 = 36 million tokens per hour; $24 ÷ 36 ≈ $0.67 per million. At 30% utilization you pay the same $24 for 30% of the tokens: about $2.22 per million."
+  },
+  {
+    q: "P99 time to first token doubles, but request volume is flat. Which metric is most likely to explain it?",
+    options: ["Replica count", "Request sizes (input sequence length)", "Response codes"],
+    answer: 1,
+    why: "The book’s example: latency spikes can come from volume or from long input sequences. With volume flat, much longer inputs (heavy prefill) are the prime suspect, which is why you watch the metrics together."
   },
   {
     q: "Your system has a 300 ms P95 latency target, and every request opens a brand-new secure connection. What’s the quick win?",
     options: ["Re-use existing sessions", "Switch to spot GPUs", "Use a longer autoscaling window"],
     answer: 0,
-    why: "A TLS handshake can cost a few dozen milliseconds, which is at least 10% of a 300 ms budget. Re-using sessions removes it from later requests."
+    why: "Establishing a session costs a few dozen milliseconds, at least 10% of a 300 ms budget. Re-using sessions removes it from later requests."
+  },
+  {
+    q: "You’re embedding a 20-million-document corpus overnight. Which approach fits best?",
+    options: [
+      "Many synchronous requests with a long client timeout",
+      "Asynchronous jobs acknowledged immediately, with results delivered to a webhook",
+      "A WebSocket per document"
+    ],
+    answer: 1,
+    why: "Bulk, latency-insensitive work suits fire-and-forget async jobs: no minute-scale timeouts, time limits in hours, and server-side queueing that keeps GPUs working at full batch sizes."
   },
   {
     q: "You’re building a live voice assistant that streams raw audio both ways. Which protocol fits best?",
-    options: ["A single HTTP request and response", "WebSockets", "Asynchronous jobs with a webhook"],
+    options: ["A single HTTP request and response", "WebSockets", "gRPC with a strict schema for every audio chunk"],
     answer: 1,
-    why: "WebSockets keep a continuous two-way connection for unstructured real-time data like audio. gRPC suits structured service-to-service calls, and async jobs are for work that isn’t latency-sensitive."
+    why: "WebSockets keep a continuous two-way connection for unstructured real-time data like audio. gRPC suits structured service-to-service calls and is slightly slower due to schema validation; plain HTTP responses suit text chat."
   }
 ]} />

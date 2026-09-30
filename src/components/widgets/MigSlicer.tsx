@@ -12,8 +12,6 @@ const profiles = [
   { name: "Full GPU", c: 7, m: 8, label: "all compute · 80 GB" },
 ];
 const colors = ["bg-accent", "bg-memory", "bg-compute", "bg-good", "bg-ink-soft"];
-const SMS = 132;
-const PER_SLICE = Math.floor(SMS / 7);
 
 export default function MigSlicer() {
   const [parts, setParts] = useState<number[]>([2, 2]);
@@ -37,7 +35,7 @@ export default function MigSlicer() {
     <Widget title="Slice one H100 into smaller GPUs (MIG)" hint="Add instances until you run out">
       <div className="space-y-3">
         <div>
-          <div className="mb-1 text-sm text-ink-soft">Compute slices (7 × about {PER_SLICE} SMs; {SMS - 7 * PER_SLICE} SMs sit idle)</div>
+          <div className="mb-1 text-sm text-ink-soft">Compute slices (132 SMs don’t divide by 7 evenly, so a few are left idle)</div>
           <div className="grid grid-cols-7 gap-1.5">
             {Array.from({ length: 7 }, (_, i) => (
               <div key={i} className={`h-10 rounded-md transition ${i < cCells.length ? colors[cCells[i] % colors.length] : "border border-dashed border-line bg-bg-soft"}`} />

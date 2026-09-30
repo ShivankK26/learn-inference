@@ -1,111 +1,383 @@
+import AttentionIntensity from "@/components/widgets/AttentionIntensity";
+
 <TLDR>
   A GPU can be held back by two things: <Compute>compute</Compute>, how fast it can **do math**, or <Memory>memory bandwidth</Memory>,
-  how fast it can **move data**. LLM **prefill hits the math limit**; LLM **decode hits the memory limit**. Almost every optimization in this book is a way to push on whichever limit you're stuck against.
+  how fast it can **move data**. Divide one by the other and you get the GPU’s **ops:byte ratio** (about 295 for an H100).
+  Divide the math a calculation does by the bytes it moves and you get its **arithmetic intensity**. Compare the two
+  and you know which limit you’re stuck against: LLM **prefill hits the math limit**, LLM **decode hits the memory limit**,
+  and image and video generation hit the math limit. Almost every optimization in this book is a way to push on
+  whichever limit you’re stuck against.
 </TLDR>
 
 <Note kind="tip">
-  If you only fully understand one lesson in this course, make it this one. Everything in Chapters 3–5 will click much
-  faster afterwards.
+  If you only fully understand one lesson in this course, make it this one. Quantization, speculative decoding,
+  batching, disaggregation, and most of the hardware chapter are all answers to the question this lesson teaches you
+  to ask: *which resource is the bottleneck?*
 </Note>
 
-## A GPU's two resources
+## A GPU has two resources, and one is always waiting
 
-- <Compute>Compute</Compute>: how many math operations per second the GPU can do, measured in **FLOPS**. An H100 does
-  roughly **989 trillion** 16-bit operations per second.
-- <Memory>Memory bandwidth</Memory>: how many bytes per second it can move from its memory to its math units. An H100
-  moves about **3.35 terabytes per second**.
+The book starts from an ideal. In a perfectly optimized system, **every resource is fully utilized at all times**. A
+GPU has two resources that matter for inference:
 
-In a perfect world both would be busy 100% of the time. In reality, one is always waiting on the other. Whichever one
-is maxed out is the **bottleneck**, and here's the crucial part: **speeding up the other one does nothing.** If you're
-stuck waiting for data, faster math is useless, and vice versa.
+- <Compute>Compute</Compute>: the number of floating-point operations per second (**FLOPS**) the GPU can achieve. An
+  H100 can do about **989 trillion** 16-bit operations per second on dense math.
+- <Memory>Memory bandwidth</Memory>: the number of bytes per second the GPU can move between its main memory and its
+  math units. An H100 moves about **3.35 terabytes per second**.
+
+In the ideal system, compute is **never sitting idle waiting for data** to arrive from memory, and memory bandwidth is
+**never going unused waiting for compute to finish**. Real systems never look like that. They have **bottlenecks**:
+imbalances where one resource is saturated while the other sits partly idle.
+
+Finding the bottleneck is always **the first step** to improving performance, for a simple and slightly brutal reason:
+
+> If an operation is bottlenecked on memory bandwidth, **no amount of compute optimization will make it faster**, and
+> vice versa.
 
 <Analogy title="Think of it like a kitchen">
   The **chef** is compute. The **waiter** carrying ingredients from the storeroom is memory bandwidth. If the chef is
-  a genius but the waiter is slow, the chef stands around waiting. Hiring a faster chef won't help. You need a faster
-  waiter, or you need to get more cooking out of every trip the waiter makes.
+  a genius but the waiter is slow, the chef stands around waiting. Hiring a faster chef won’t help at all. You need a
+  faster waiter, or you need to get more cooking out of every trip the waiter makes. That last option, *more work per
+  trip*, is exactly what batching does.
 </Analogy>
 
-## The magic ratio: ops per byte
+### The three bottlenecks you’ll meet most
 
-Divide a GPU's compute by its bandwidth and you get its **ops:byte ratio**:
+The book gives the rule of thumb up front. In most cases:
 
-```
-H100:  989 TFLOPS ÷ 3.35 TB/s ≈ 295 operations per byte
-```
+| Workload | What it’s doing | Bottleneck |
+|---|---|---|
+| LLM **prefill** | Building the KV cache from the whole prompt at once | <Compute>Compute</Compute> |
+| LLM **decode** | Generating output tokens one at a time | <Memory>Memory bandwidth</Memory> |
+| **Image & video** generation | Denoising the whole latent at once, many times | <Compute>Compute</Compute> |
 
-This means that to keep an H100 perfectly balanced, your work needs to do **~295 math operations for every byte it
-loads from memory**.
+The rest of this lesson proves *why* those are the bottlenecks. When you optimize any of these phases, the goal is to
+make its bottleneck **less limiting** for the system as a whole. The book’s example is batching: processing a batch of
+requests together uses **more compute for the same amount of memory traffic**, which makes decode *less* memory-bound.
 
-Every piece of work has its own version of that ratio, called **arithmetic intensity**: *how much math you do per byte
-you move*.
+## Background: counting FLOPs and bytes
 
-- Arithmetic intensity **below** the GPU's ratio (not much math per byte) means you're **memory-bound**. The chef is
-  waiting on the waiter.
-- Arithmetic intensity **above** the GPU's ratio (lots of math per byte) means you're **compute-bound**. The chef is
-  the busy one.
+To compare math against data movement, you need to be able to count both. The book assumes you can; here’s how.
 
-## Why prefill and decode are opposites
+<Note kind="beyond">
 
-<Compute>Prefill</Compute> loads the model's weights once and uses them on *every* prompt token at once. That's
-thousands of tokens' worth of math for a single trip through memory: **very high arithmetic intensity → compute-bound.**
-
-<Memory>Decode</Memory> produces **one token per step**, but to produce that one token it has to read **every single
-weight in the model**. That's a mountain of data moved for a tiny bit of math: **low arithmetic intensity →
-memory-bound.**
-
-The book works through the exact numbers for one attention calculation during decode and gets an arithmetic intensity
-of about **62**, far below the H100's 295. The GPU spends most of its time waiting for data.
-
-| Workload | Bottleneck |
-|---|---|
-| LLM **prefill** | <Compute>Compute</Compute> |
-| LLM **decode** | <Memory>Memory bandwidth</Memory> |
-| **Image & video** generation | <Compute>Compute</Compute> (like prefill, it works on everything at once) |
-
-## Feel it: the decode speed limit
-
-Because decode must read all the weights for every token, there's a simple back-of-the-envelope ceiling for how fast
-**one user** can ever get tokens:
+**Counting FLOPs for a matrix multiplication.** Multiplying an *m×k* matrix by a *k×n* matrix produces *m×n* outputs.
+Each output is a dot product of length *k*: *k* multiplications and (about) *k* additions. So the total is
 
 ```
-max tokens/sec ≈ memory bandwidth ÷ model size in bytes
+FLOPs ≈ 2 · m · k · n
 ```
 
-<SpeedLimit />
+The factor of 2 is because one *multiply-add* counts as two floating-point operations. GPU spec sheets count FLOPS
+the same way.
 
-Notice what moves the number: a **smaller model**, **smaller numbers** (FP8 instead of FP16, called *quantization*), or
-a **GPU with more bandwidth**. Faster compute doesn't appear anywhere in that formula, because decode isn't
-limited by compute.
+**Counting bytes.** Each number takes a fixed number of bytes depending on its format: FP32 is 4 bytes, FP16 and BF16
+are 2, FP8 is 1, FP4 is half a byte. A model’s size in bytes is its parameter count times bytes per parameter, so a
+70B-parameter model in FP16 is about 140 GB of weights. That’s why “a 70B model” and “140 GB” are often used
+interchangeably, and why quantizing to FP8 halves both the memory needed *and* the bytes that must be moved.
 
-## The roofline: seeing the bottleneck
+</Note>
 
-Engineers draw this as a **roofline chart**. The horizontal axis is arithmetic intensity. The "roof" has a slanted part
-(limited by memory bandwidth) and a flat part (limited by compute). Wherever your workload sits tells you what's holding
-it back.
+## The ops:byte ratio: a GPU’s balance point
+
+Every GPU has a compute speed (operations per second) and a memory bandwidth (bytes per second). Divide the first by
+the second and you get its **ops:byte ratio**: how many operations it can do in the time it takes to move one byte.
+
+<Worked title="The H100’s ops:byte ratio">
+
+1. Dense FP16 compute: **989 TFLOPS** = 989 × 10¹² operations per second.
+2. Memory bandwidth: **3.35 TB/s** = 3.35 × 10¹² bytes per second.
+3. Ratio: 989 × 10¹² ÷ 3.35 × 10¹² ≈ **295 operations per byte**.
+
+So for FP16 inference on an H100 to be perfectly balanced (in the book’s words, “as all things should be”), the work
+must perform about **295 floating-point operations for every byte** it reads or writes. Do less math per byte and the
+math units wait on memory. Do more and memory waits on the math units.
+
+</Worked>
+
+<Note kind="beyond">
+
+The ratio depends on **both the GPU and the number format** (the book’s glossary defines it “at a given precision”).
+Two examples using the book’s own spec tables:
+
+- An **H200** has the same compute as an H100 (989 dense FP16 TFLOPS) but more bandwidth (4.8 TB/s), so its ratio is
+  989 ÷ 4.8 ≈ **206**. Memory-bound work, like decode, gets faster on an H200; compute-bound work doesn’t.
+- In **FP8**, an H100 does about 1,979 TFLOPS, so its FP8 ratio is 1,979 ÷ 3.35 ≈ **591**. Lower precision doubles the
+  math *and* halves the bytes per value.
+
+</Note>
+
+## Arithmetic intensity: your work’s own ratio
+
+To find out which side of that balance point a calculation falls on, compute its **arithmetic intensity** (also called
+**operational intensity**): the ratio between the work it does and the memory traffic it causes.
+
+```
+arithmetic intensity = total floating-point operations ÷ total bytes moved to and from memory
+```
+
+This is the book’s Figure 2.12. Note the subtle difference from the ops:byte ratio: the ops:byte ratio is a property
+of the *hardware*, measured per second. Arithmetic intensity is a property of an *algorithm*, measured across one
+complete execution of a function.
+
+Then compare:
+
+- Arithmetic intensity **above** the GPU’s ops:byte ratio → **compute-bound**. There’s so much math per byte that the
+  math units are the limit.
+- Arithmetic intensity **below** the GPU’s ops:byte ratio → **memory-bound**. The math units finish early and wait for
+  data.
+
+## The roofline model: a picture of the bottleneck
+
+Arithmetic intensity is usually visualized with a **roofline model** (the book’s Figure 2.13). The horizontal axis is
+arithmetic intensity. The vertical axis is achieved performance. The “roof” has two parts:
+
+- A **diagonal bandwidth ceiling** on the left. Here, performance is limited to *bandwidth × arithmetic intensity*: every
+  byte you move lets you do that many FLOPs, and you can only move so many bytes per second.
+- A **flat performance ceiling** on the right: the GPU’s peak compute. No algorithm can go above it.
+
+The two lines meet at the **ridge point**, which sits exactly at the GPU’s ops:byte ratio. An algorithm that lands on the
+diagonal is memory-bound; one that lands on the flat roof is compute-bound. In one formula:
+
+```
+achievable FLOPS = min( peak compute ,  memory bandwidth × arithmetic intensity )
+```
 
 <Roofline />
 
 Play with it and notice three things:
 
-1. **At batch size 1, decode sits deep in memory-bound territory.** The GPU's math units are mostly idle.
+1. **At batch size 1, decode sits deep in memory-bound territory.** The GPU’s math units are mostly idle.
 2. **Increasing the batch pushes the dot to the right.** The weights are loaded once and shared by the whole batch, so
    you get more math per byte. **Total throughput shoots up**, and per-user speed barely changes at first. This is
-   why batching is the #1 trick in inference.
-3. **Now raise the conversation length.** Every user's KV cache has to be read too, so memory traffic grows again,
-   per-user speed drops, and eventually you **run out of GPU memory**. That tension (batch size vs. KV cache) is
-   something you'll run into again and again.
+   exactly the book’s point about batching making decode less memory-bound.
+3. **Now raise the conversation length.** Every user’s KV cache has to be read too, and KV cache reads come with very
+   little math attached, so memory traffic grows again, per-user speed drops, and eventually you **run out of GPU
+   memory**. That tension (batch size vs. KV cache) comes back again and again in Chapters 5 and 7.
 
-<Note kind="deeper">
-  The chart is a simplified model (an 8B model in FP16, ignoring overheads). Calculating arithmetic intensity by hand
-  isn't something inference engineers do every day, but doing it once builds the intuition you'll use constantly.
+<Note kind="beyond">
+  The roofline widget is a simplified model of an 8B-parameter model in FP16 that ignores overheads, so real numbers
+  are lower. The shape of the trade-off is what matters.
 </Note>
 
+To find a bottleneck in practice, the book’s advice is to look at the arithmetic intensity of **the most expensive
+calculations** in the system. In LLM inference, one of those is attention.
+
+## Why prefill and decode are opposites
+
+LLM inference has two phases, and they sit on opposite sides of the ridge point:
+
+- <Compute>Prefill</Compute> determines **time to first token (TTFT)** and is **compute-bound**.
+- <Memory>Decode</Memory> determines **tokens per second (TPS)** and is **memory-bound**.
+
+You can *prove* each bottleneck by comparing the arithmetic intensity of the phase’s most important operation to the
+hardware’s ops:byte ratio. The exact intensity depends on the model architecture (dimensions, number of heads), the
+input sequence length, and the attention implementation, but the essential difference is always the same:
+
+- **Prefill processes the entire input sequence in parallel.** The model weights are loaded **once**, then used in a
+  series of large *matrix-matrix* multiplications against the matrix of all input tokens. Lots of calculation for a
+  single read from memory: **high arithmetic intensity**.
+- **Decode generates tokens one at a time.** The weights are loaded for **every token**, and each token is produced
+  with much cheaper *vector-matrix* multiplications. Very few FLOPs relative to loading the entire model: **low
+  arithmetic intensity**.
+
+The weight matmuls make this concrete. Here’s the calculation for one linear layer.
+
+<Worked title="Arithmetic intensity of one linear layer, prefill vs. decode">
+
+Take a linear layer with a 4,096 × 4,096 weight matrix (a typical size for an 8B-parameter model) in FP16, applied to
+*T* token vectors at once. During prefill, *T* is the number of prompt tokens. During decode, *T* is the batch size,
+because each request contributes one token per step.
+
+1. **FLOPs**: a (*T* × 4,096) by (4,096 × 4,096) matmul is 2 · *T* · 4,096 · 4,096 ≈ 33.6 million × *T*.
+2. **Bytes moved**: the weights are 4,096 × 4,096 × 2 bytes ≈ 33.6 MB, read once no matter what *T* is. The inputs and
+   outputs add 2 · *T* · 4,096 × 2 bytes ≈ 16 KB per token.
+3. **Arithmetic intensity** ≈ (33.6 M × *T*) ÷ (33.6 MB + 16 KB × *T*):
+
+| *T* (tokens per weight read) | Arithmetic intensity | On an H100 (ratio ≈ 295) |
+|---|---|---|
+| 1 (decode, one user) | ≈ 1 | Deeply memory-bound |
+| 8 | ≈ 8 | Memory-bound |
+| 64 | ≈ 62 | Memory-bound |
+| 256 | ≈ 228 | Still memory-bound |
+| ≈ 345 | ≈ 295 | The ridge point |
+| 2,000 (a prefill) | ≈ 1,012 | Compute-bound |
+
+The pattern: for weight matmuls, **arithmetic intensity is roughly equal to the number of tokens that share each read
+of the weights**. A single decode token does about one FLOP per byte of weights, nearly 300× below what an H100 needs.
+A 2,000-token prompt reuses every weight 2,000 times. That’s the whole prefill/decode split in one table, and it’s
+why batching decode requests together works: it raises *T*.
+
+</Worked>
+
+<Note kind="beyond">
+  The table’s numbers were calculated for this lesson; they aren’t in the book. The book makes the same argument
+  in words, and its own worked numbers are for attention, below.
+</Note>
+
+## The book’s worked example: attention during decode
+
+The book proves the decode bottleneck on the most expensive operation, **attention**, using the standard algorithm with
+no optimizations. The setup:
+
+- **N = 4,096**: the sequence length.
+- **d = 128**: the dimensionality of one attention head.
+- **FP16**: every value takes 2 bytes.
+
+### The standard attention algorithm
+
+The book’s Figure 2.14 (adapted from the FlashAttention paper) is the textbook three-line implementation. Each line
+follows the same pattern: **load data from GPU memory, do a calculation, store the result back to memory**.
+
+```
+1. Load Q and K from memory.   Compute S = Q·Kᵀ.       Write S to memory.
+2. Load S from memory.         Compute P = softmax(S). Write P to memory.
+3. Load P and V from memory.   Compute O = P·V.        Write O to memory.
+```
+
+- **S** holds the raw *scores*: how well each query matches each key.
+- **P** holds those scores turned into *probabilities* by softmax (each row sums to 1).
+- **O** is the *output*: each token’s blend of values, weighted by P.
+
+<Note kind="beyond">
+
+**What softmax does.** Softmax turns a row of scores into probabilities: take *e* to the power of each score, then
+divide each by the row’s total. Implementations first subtract the row’s maximum so the exponents don’t overflow. So
+each score costs a handful of operations: a max, a subtraction, an exponent, a sum, and a division.
+
+</Note>
+
+### The sizes of the matrices
+
+| Matrix | Shape | Values | Size in FP16 |
+|---|---|---|---|
+| Q, K, V | N × d = 4,096 × 128 | 524,288 each | **1 MiB** each |
+| S, P | N × N = 4,096 × 4,096 | 16,777,216 each | **32 MiB** each |
+| O | N × d = 4,096 × 128 | 524,288 | **1 MiB** |
+
+A 4,096 × 4,096 matrix in FP16 is about 32 MiB, which the book compares to a high-resolution RAW photo from a DSLR.
+The intermediate matrices S and P are **32 times bigger** than the inputs and output. Keep that in mind.
+
+<Worked title="Reproducing the book’s arithmetic intensity of 62">
+
+**Step by step** (the book’s Figure 2.15), in MiB of memory traffic and FLOPs:
+
+| Step | Reads | Compute | Writes |
+|---|---|---|---|
+| 1. S = Q·Kᵀ | Q + K = 2 MiB | 2 · N · N · d ≈ 4.29 GFLOPs | S = 32 MiB |
+| 2. P = softmax(S) | S = 32 MiB | a few ops per score (≈ 0.08 GFLOPs) | P = 32 MiB |
+| 3. O = P·V | P + V = 33 MiB | 2 · N · N · d ≈ 4.29 GFLOPs | O = 1 MiB |
+
+**Total memory movement** (Figure 2.16), summing every read and write:
+
+2 + 32 + 32 + 32 + 33 + 1 = **132 MiB** = 138,412,032 bytes.
+
+**Total compute** (Figure 2.17), counting the two matrix multiplications:
+
+2 × (2 · 4,096 · 4,096 · 128) = 2 × 4,294,967,296 = **8,589,934,592 FLOPs** ≈ 8.59 GFLOPs.
+
+**Arithmetic intensity** (Figure 2.18):
+
+8,589,934,592 FLOPs ÷ 138,412,032 bytes ≈ **62 FLOPs per byte**.
+
+Counting softmax too (about 5 operations per score) nudges it to about 62.7; either way the answer is about **62**.
+
+**Compare with the hardware:** 62 is far below the H100’s ops:byte ratio of about 295. On the roofline, the best this
+operation can do is 3.35 TB/s × 62 ≈ 208 TFLOPS, about **21% of the H100’s peak**. In time terms, moving 132 MiB takes
+about 41 microseconds, while the math alone would take under 9. The GPU spends most of the operation waiting for data.
+
+</Worked>
+
+The exact numbers change with the model, the sequence length, and the hardware, but the example shows the general
+principle: **decode is memory-bound**. The book is candid that calculating arithmetic intensity by hand like this is
+**an academic exercise, not a routine task** for inference engineers. But seeing it done once builds the intuition you’ll
+use constantly: when a calculation moves lots of data for comparatively little math, no amount of extra FLOPS will
+save it.
+
+Try the calculation yourself, then change the inputs:
+
+<AttentionIntensity />
+
+<Note kind="beyond">
+
+**Two things the book’s example doesn’t spell out.**
+
+1. **A real decode step is even more memory-bound.** The three-line algorithm above computes attention for a full
+   4,096 × 4,096 score matrix. During decode with a KV cache, only *one* new token needs attention, so Q is a single
+   row (1 × 128). The step then reads the cached K and V (1 MiB each) to do only about 2 million FLOPs, an arithmetic
+   intensity of about **1**. Switch the widget to “One new decode token” to see it. The book’s conclusion gets
+   stronger, not weaker.
+2. **Most of the 132 MiB is avoidable.** Of the 132 MiB moved, **128 MiB** is S and P being written out and read straight
+   back. If all three steps ran without ever leaving the chip, only Q, K, V (3 MiB) would be read and O (1 MiB) written:
+   about **2,048 FLOPs per byte**, comfortably compute-bound. That is exactly what FlashAttention does, and it’s the
+   subject of the [next lesson](/learn/faster-attention).
+
+</Note>
+
+## Feel it: the decode speed limit
+
+The prefill/decode argument implies a simple back-of-the-envelope ceiling for how fast **one user** can ever get
+tokens. If generating each token requires reading every weight once, then:
+
+```
+max tokens per second (one user) ≈ memory bandwidth ÷ model size in bytes
+```
+
+<Worked title="The speed limit for a 70B model">
+
+1. A 70B-parameter model in FP16 is 70 × 10⁹ × 2 bytes = **140 GB** of weights.
+2. On an H100 (3.35 TB/s): reading 140 GB takes 140 ÷ 3,350 ≈ 0.042 seconds, so at most **≈ 24 tokens per second**.
+   (It also doesn’t fit in one H100’s 80 GB, so in reality it would be split across GPUs.)
+3. On an H200 (4.8 TB/s): 4,800 ÷ 140 ≈ **34 tokens per second**, with the same compute. Only bandwidth changed.
+4. Quantized to FP8 (70 GB) on the same H200: 4,800 ÷ 70 ≈ **69 tokens per second**.
+
+</Worked>
+
+<SpeedLimit />
+
+Notice what moves the number: a **smaller model**, **smaller numbers** (FP8 instead of FP16, which is *quantization*),
+or a **GPU with more bandwidth**. Faster compute appears nowhere in that formula, because decode isn’t limited by
+compute.
+
+<Note kind="beyond">
+  This ceiling is a derivation from the book’s argument rather than a formula the book states. Real systems land
+  below it because they also read the KV cache, and because no kernel reaches 100% of peak bandwidth. It’s still the
+  single most useful sanity check in inference: if a vendor claims a single-user speed above this ceiling, something
+  else (like speculative decoding or batching) is going on.
+</Note>
+
+## Image and video generation are compute-bound
+
+Image and video models are relatively small. The book notes they have **about a tenth as many parameters as frontier
+language models**, but their attention mechanism is **just as computationally demanding**.
+
+They use iterative denoising, not autoregressive generation. Like LLM prefill, their attention has to consider the
+**entire object at once**: the whole image or video, as represented in latent space. Every forward pass multiplies large
+matrices against a big latent that’s already in place, so there’s a lot of math for each byte moved, and image and video
+inference is **bottlenecked on compute**, just like prefill.
+
+This is also why optimizations have to match the bottleneck. Techniques that reduce memory traffic help decode a lot,
+while techniques that reduce or speed up the *math* (faster attention kernels, lower-precision compute, fewer denoising
+steps) help image and video generation. The specific techniques for these modalities are covered in
+[Serving image & video models](/learn/serving-images-video).
+
+## Putting it together
+
+| Workload | Arithmetic intensity | Bottleneck | What helps |
+|---|---|---|---|
+| LLM prefill | High (weights reused across all prompt tokens) | <Compute>Compute</Compute> | Faster math: better kernels, FP8/FP4 compute, more FLOPS |
+| LLM decode | Low (≈ 1 per user for weights; ~62 or lower for attention) | <Memory>Memory bandwidth</Memory> | Moving fewer bytes or reusing each byte more: batching, quantization, higher-bandwidth GPUs, speculation |
+| Image & video generation | High (whole latent at once) | <Compute>Compute</Compute> | Faster attention, lower-precision compute, fewer steps |
+
 <KeyPoints>
-- GPUs have two limits: <Compute>compute</Compute> (math/sec) and <Memory>memory bandwidth</Memory> (bytes/sec).
-- **Ops:byte ratio** = compute ÷ bandwidth (~295 for an H100). **Arithmetic intensity** = math ÷ bytes for your work.
-- Below the ratio → memory-bound. Above → compute-bound. Only fixing the actual bottleneck helps.
-- **Prefill** and **image/video** are compute-bound. **Decode** is memory-bound.
-- **Batching** raises decode's arithmetic intensity, massively improving throughput. The KV cache pushes back.
+- GPUs have two limits: <Compute>compute</Compute> (FLOPS) and <Memory>memory bandwidth</Memory> (bytes per second). Only fixing the actual bottleneck helps.
+- **Ops:byte ratio** = compute ÷ bandwidth: ≈ 295 for an H100 in FP16. It’s a property of the hardware at a given precision.
+- **Arithmetic intensity** = FLOPs ÷ bytes moved for one execution of an algorithm. Below the ratio → memory-bound; above → compute-bound.
+- The **roofline**: achievable FLOPS = min(peak, bandwidth × intensity). The ridge point sits at the ops:byte ratio.
+- **Prefill** reuses weights across the whole prompt (high intensity, compute-bound, sets TTFT). **Decode** reloads weights for every token (low intensity, memory-bound, sets TPS).
+- The book’s attention example (N = 4,096, d = 128, FP16) moves **132 MiB** for **8.59 GFLOPs**: an intensity of **≈ 62**, far below 295.
+- **Batching** raises decode’s intensity by sharing each weight read across requests. The KV cache pushes back.
+- **Image and video** models are ~10× smaller than frontier LLMs but compute-bound, like prefill.
 </KeyPoints>
 
 <Quiz questions={[
@@ -117,28 +389,56 @@ Play with it and notice three things:
       "A longer prompt"
     ],
     answer: 1,
-    why: "Tokens per second is decided by decode, and decode is memory-bound. More bandwidth moves the weights faster."
+    why: "Tokens per second is set by decode, and decode is memory-bound. More bandwidth moves the weights faster; more compute would sit idle."
   },
   {
-    q: "A 70B model in FP16 is about 140 GB. On a GPU with 4.8 TB/s bandwidth, roughly what’s the max decode speed for one user?",
+    q: "A GPU does 2,000 TFLOPS and has 8 TB/s of memory bandwidth. What is its ops:byte ratio?",
+    options: ["16", "250", "4,000"],
+    answer: 1,
+    why: "Ops:byte = compute ÷ bandwidth = 2,000 × 10¹² ÷ 8 × 10¹² = 250 operations per byte."
+  },
+  {
+    q: "An algorithm has an arithmetic intensity of 100 FLOPs per byte. On an H100 (ratio ≈ 295), what is it?",
+    options: ["Compute-bound", "Memory-bound", "Perfectly balanced"],
+    answer: 1,
+    why: "100 is below 295, so it lands on the diagonal part of the roofline: the math units finish early and wait for data."
+  },
+  {
+    q: "In the book’s attention example (N = 4,096, d = 128, FP16), how much of the 132 MiB of memory traffic is the S and P matrices?",
+    options: ["4 MiB", "64 MiB", "128 MiB"],
+    answer: 2,
+    why: "S is written (32) and read (32), then P is written (32) and read (32): 128 MiB. Only 4 MiB is Q, K, V and O. That waste is what FlashAttention removes."
+  },
+  {
+    q: "Using the roofline, what’s the best an operation with arithmetic intensity 62 can achieve on an H100 (3.35 TB/s, 989 TFLOPS)?",
+    options: ["About 208 TFLOPS", "989 TFLOPS", "About 62 TFLOPS"],
+    answer: 0,
+    why: "Achievable = min(989, 3.35 × 62) = min(989, ≈208) ≈ 208 TFLOPS, about 21% of peak. The bandwidth ceiling is the limit."
+  },
+  {
+    q: "A 70B model in FP16 (≈140 GB) runs on a GPU with 4.8 TB/s bandwidth. Roughly what’s the max decode speed for one user?",
     options: ["~3 tok/s", "~34 tok/s", "~340 tok/s"],
     answer: 1,
-    why: "4,800 GB/s ÷ 140 GB ≈ 34 tokens per second, at the very best, because every token requires reading all the weights once."
+    why: "4,800 GB/s ÷ 140 GB ≈ 34 tokens per second at the very best, because every token requires reading all the weights once."
   },
   {
-    q: "Why does batching make decode more efficient?",
+    q: "Why does batching decode requests make them less memory-bound?",
     options: [
-      "It makes each user’s answer shorter",
-      "The weights are read once and reused for every request in the batch, so there’s more math per byte",
+      "It makes each answer shorter",
+      "Each weight read from memory is reused for every request in the batch, so there’s more math per byte",
       "It skips the prefill phase"
     ],
     answer: 1,
-    why: "One trip through the weights now serves many users, raising arithmetic intensity and total throughput."
+    why: "For weight matmuls, arithmetic intensity is roughly the number of tokens sharing each weight read. A batch of 64 gives roughly 64 FLOPs per byte instead of 1."
   },
   {
-    q: "Image generation is usually bottlenecked on…",
-    options: ["Memory bandwidth", "Compute", "The tokenizer"],
+    q: "Image and video models have about a tenth the parameters of frontier LLMs. Why are they still compute-bound?",
+    options: [
+      "Because they generate one pixel at a time",
+      "Because their attention works over the entire latent at once, like prefill, which is a lot of math per byte",
+      "Because they run on slower GPUs"
+    ],
     answer: 1,
-    why: "Like prefill, image and video models process the whole latent at once, which is a lot of math per byte, so they’re compute-bound."
+    why: "Iterative denoising processes the whole image or video latent on every pass, so attention is huge and each byte loaded feeds a lot of math."
   }
 ]} />

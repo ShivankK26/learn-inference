@@ -1,103 +1,300 @@
 <TLDR>
   An LLM never writes a whole answer at once. It first **reads your entire prompt in one go** (*prefill*), then
-  **writes the reply one token at a time** (*decode*), each time predicting the most likely next token. Those two
-  phases behave completely differently, and that difference shapes the whole field.
+  **writes the reply one token at a time** (*decode*). Each decode step produces a score for every token in its
+  vocabulary, turns those scores into probabilities, and picks one. Those two phases behave completely differently, and
+  that difference shapes the whole field.
 </TLDR>
+
+## LLMs are autoregressive
+
+The book’s one-sentence definition: an LLM is an **autoregressive token generation model**. It generates new tokens
+**one at a time**, and each new token is based on **every token before it**. Everything in this lesson follows from
+that: the model can’t write token 50 until it has written token 49, because token 49 is part of the input for token 50.
 
 ## Step 0: text becomes tokens
 
-Models don't see letters or words. They see **tokens**: chunks of text, each mapped to a number. Common words are
-usually one token, while rarer or longer words get split into pieces. This is called *subword tokenization*.
+Models don’t see letters or words. They see **tokens**, the atomic units of language models. A token is a **number**
+that stands for a chunk of text. Modern LLMs use **subword tokenization**: each token is a whole word or a fraction of
+one. The book’s Figure 2.5 shows the pattern: a common word or a punctuation mark gets a single token, while a less
+common word gets split into several.
 
 <Tokenizer />
 
-A few facts about tokens:
+Some important facts about tokenization:
 
-- The translation between text and tokens is done by a **tokenizer**. It's a simple lookup table, not a neural network.
-- The full list of tokens a model knows is its **vocabulary**, usually **100,000+** entries.
-- **Fewer tokens = faster.** A more efficient tokenizer needs fewer tokens for the same text, so there's less work to do.
+- **It doesn’t involve a neural network.** A **tokenizer** is a simple, deterministic mapping between strings and
+  their token numbers, in both directions.
+- The complete mapping is the model’s **vocabulary**. Most models have **over 100,000 tokens** in theirs.
+- Vocabularies and tokenizers **differ from model to model**. You can’t feed one model’s tokens to another.
+- Newer models tend to use **more efficient** tokenizers. **The fewer tokens it takes to represent a request and its
+  answer, the faster the end-to-end inference**, because every output token costs a full decode step.
+- In other modalities the idea stretches: a speech-synthesis model’s vocabulary is expanded so that some tokens
+  represent pieces of **audio** instead of text.
 
-## The three sequences in a request
+<Worked title="Estimating tokens from words">
+  The book’s glossary gives a rule of thumb for English: roughly **4 tokens for every 3 words**.
 
-Every request involves up to three strings of tokens:
+  1. A 750-word blog post ≈ 750 × 4 ÷ 3 = **1,000 tokens**.
+  2. If a model decodes at 50 tokens per second, writing that post takes about 1,000 ÷ 50 = **20 seconds**.
+  3. A tokenizer that needed 10% fewer tokens for the same text would cut that to about 18 seconds, with no change to
+     the model at all.
+</Worked>
 
-1. **Input**: your prompt, plus chat history, instructions, tool definitions, and so on.
-2. **Reasoning** (optional): for "thinking" models, the private scratchpad they write before answering.
-3. **Output**: the reply you see.
+<Note kind="beyond">
+  **Where vocabularies come from.** Most modern tokenizers are built with a method called byte-pair encoding (BPE):
+  start with single characters (or bytes), then repeatedly merge the most frequent adjacent pair in a large body of text
+  into a new token, until the vocabulary reaches the target size. Frequent words end up as single tokens; rare words are
+  spelled out from smaller pieces. That’s why the split in the demo above depends on how common a word is.
+</Note>
 
-All three together have to fit in the model's **context window**, the maximum number of tokens it can handle in one
-request. You can also cap the output length with a `max_tokens` setting.
+## The sequences in a request, and the context window
 
-<Note kind="deeper">
-  Chats have roles (system, user, assistant) and sometimes tool definitions or images. Before anything else, all of it
-  is flattened into one single sequence using a **chat template**. Each model has its own template, and getting it
-  slightly wrong quietly makes the model worse, which is one of those details inference engineers have to get right.
+Inference involves two or three sequences of tokens:
+
+1. **Input sequence**: the prompt, the chat history, any retrieved context, function definitions, and anything else
+   passed in.
+2. **Reasoning sequence** (optional): for reasoning models, an intermediate output the model writes to “think” before
+   answering.
+3. **Output sequence**: the response.
+
+All of these combined must fit inside the model’s **context window**: the total number of tokens it can process *and*
+generate for one request. A request can also cap the output with a **`max_tokens`** argument.
+
+<Worked title="A context window budget">
+  A model has a context window of 32,000 tokens. You send a 30,000-token prompt, and the model spends 1,500 tokens
+  reasoning.
+
+  1. Tokens already used: 30,000 + 1,500 = **31,500**.
+  2. Room left for the visible answer: 32,000 − 31,500 = **500 tokens**, and less if `max_tokens` is set lower.
+  3. The reasoning tokens are generated by decode just like the answer, so they cost the same time per token even if
+     the user never sees them.
+</Worked>
+
+### Chat templates
+
+The input sequence is technically a single string, but LLMs are trained to accept structured input: **multi-turn chats
+with roles** (system, user, assistant), **function signatures** for tool calls, and sometimes **images or other
+media**. All of that has to be flattened into one sequence. That job belongs to the **chat template**.
+
+Chat templates **differ subtly from model to model**, and the book stresses that they must be **implemented correctly
+in the inference engine**. A template that’s slightly off (a missing separator, the wrong special token) won’t crash
+anything; the model will just quietly perform worse, which is the most dangerous kind of bug.
+
+<Note kind="beyond">
+  Here’s what Llama 3’s template produces for a system prompt plus one user message. The special tokens mark where each
+  role starts and ends, and the final header tells the model it’s the assistant’s turn to speak:
+
+  ```text
+  <|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+  You are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+  What is inference?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+  ```
+
+  Another model family uses entirely different markers for the same conversation, which is why the template has to
+  match the model exactly.
 </Note>
 
 ## The two phases: prefill and decode
 
-Once the input is tokenized, inference happens in two phases:
+Tokenizing the input with the chat template applied is **step zero**. Then inference has two primary phases:
 
-- <Compute>Prefill</Compute>: the model processes **every input token at the same time**, in parallel. Along the way it
-  saves its notes about each token into something called the **KV cache** (next lesson).
-- <Memory>Decode</Memory>: the model generates the answer **one token per step**. Each step is a full pass through the
-  model (a *forward pass*) that produces exactly one new token. Then that token is added and it goes again.
+- <Compute>Prefill</Compute>: the model processes the **entire input sequence at once**, calculating attention for every
+  input token and storing the results in a **KV cache** (next lesson).
+- <Memory>Decode</Memory>: the model performs **forward passes** to generate tokens **autoregressively**, one per pass.
 
-Run a request and watch both happen:
+<Note kind="beyond">
+  **What a forward pass is.** One forward pass means running data through every layer of the network, from the
+  embedding layer at the bottom to the output layer at the top. During prefill, that pass carries all the prompt tokens
+  together. During decode, each pass carries just the newest token (the KV cache supplies everything the model needs to
+  know about the earlier ones). Either way, the pass touches every layer, which means reading every weight in the model.
+</Note>
+
+Run a request and watch both phases:
 
 <PrefillDecode />
 
-This gives us the two most important speed numbers in inference:
+The two phases map onto the two speed numbers users actually feel:
 
 | Metric | What it measures | Mainly set by |
 |---|---|---|
 | **TTFT** (time to first token) | How long you stare at a blank screen | <Compute>Prefill</Compute> |
-| **TPS** (tokens per second) | How fast the text streams once it starts | <Memory>Decode</Memory> |
+| **TPS** (tokens per second) | How fast text streams once it starts | <Memory>Decode</Memory> |
+
+The first output token arrives at the end of prefill, because the same pass that processes the prompt also produces
+the scores for the first new token. Every token after that costs one decode pass.
 
 <Analogy>
-  Think of a **simultaneous interpreter** reading a speech handed to them on paper. First they read the whole page
-  quickly and take notes (prefill: fast, all at once). Then they speak the translation word by word, and each word
-  depends on what they've already said (decode: slow, one at a time). A longer page means a longer pause before they
-  start. A longer translation means more time speaking.
+  Think of a **simultaneous interpreter** handed a speech on paper. First they read the whole page and take notes
+  (prefill: all at once). Then they speak the translation word by word, each word depending on everything they’ve said
+  so far (decode: one at a time). A longer page means a longer pause before they start; a longer translation means more
+  time speaking.
 </Analogy>
 
-## How each next token is chosen
+The book points out that these two pieces, **building the KV cache during prefill** and **generating logits during
+decode**, take the overwhelming majority of the time and resources in inference, because they’re the only steps that
+run the large neural network. Tokenizing, applying the template, and picking a token from probabilities are cheap by
+comparison.
 
-At the end of each decode step, the model doesn't output a word. It outputs a **score for every token in its
-vocabulary** (these scores are called <Term def="The raw scores a model gives to every possible next token, before they’re turned into probabilities.">logits</Term>).
-Those scores get turned into probabilities, and then a token is **picked at random, weighted by probability**.
+## From vector to token: logits and sampling
 
-You can nudge that picking with a few settings. Try them:
+Every decode pass must produce a token, but a neural network outputs **vectors**, not tokens. So a few extra steps
+happen at the end of each pass.
+
+The **output layer** produces a vector of **logits**: raw, unnormalized scores, with **one number per token in the
+vocabulary**. For a 128,000-token vocabulary, that’s 128,000 scores. After normalization, those scores become the
+**probability** of each token being the right next one. This is the book’s Figure 2.6: a bar per vocabulary token for
+the raw logits, then the same bars converted to percentages that add up to 100%.
+
+The normalization step is called **softmax**:
+
+```
+probability of token i  =  e^(logit_i)  ÷  sum over all tokens of e^(logit_j)
+```
+
+Raising *e* to each score makes everything positive and exaggerates the gaps between scores; dividing by the total
+makes the results add up to 1.
+
+<Worked title="Softmax on three logits">
+  Suppose the vocabulary had only three tokens, with logits **mat = 3.2**, **floor = 2.6**, **couch = 2.3**.
+
+  1. Exponentiate: e^3.2 ≈ 24.53, e^2.6 ≈ 13.46, e^2.3 ≈ 9.97.
+  2. Add them: 24.53 + 13.46 + 9.97 ≈ 47.97.
+  3. Divide each by the total: mat ≈ **51.1%**, floor ≈ **28.1%**, couch ≈ **20.8%**.
+
+  A gap of just 0.9 in logits (3.2 vs 2.3) became a gap of more than 2× in probability.
+</Worked>
+
+The output token is then chosen by **weighted random selection** from that probability vector: *mat* is picked about
+half the time, *couch* about a fifth of the time. That randomness is why the same prompt can give different answers.
+
+### Steering the choice: temperature, top-k, top-p
+
+You can nudge the selection with **inference arguments**:
+
+- **Temperature** adjusts the **logits themselves, before normalization**: each logit is divided by the temperature.
+  Below 1 sharpens the distribution; above 1 flattens it.
+- **Top-k** keeps only the **k most likely tokens** after normalization, then **re-normalizes** among them.
+- **Top-p** keeps the **smallest set of tokens** (after normalization) whose probabilities **add up to p**, then
+  re-normalizes among them.
+
+<Worked title="Temperature, top-k and top-p on the same three tokens">
+  Start from the logits above (3.2, 2.6, 2.3).
+
+  1. **Temperature 0.5**: divide by 0.5 → 6.4, 5.2, 4.6. Softmax gives mat ≈ **68.2%**, floor ≈ 20.5%, couch ≈ 11.3%.
+     The favorite got more likely.
+  2. **Temperature 2**: divide by 2 → 1.6, 1.3, 1.15. Softmax gives mat ≈ **42.0%**, floor ≈ 31.1%, couch ≈ 26.8%.
+     The choice got more random.
+  3. **Top-k = 1**: only *mat* survives, at 100%. Always the same answer.
+  4. **Top-p = 0.7** (at temperature 1): mat alone is 51.1%, short of 70%; adding floor brings it to 79.2%, which
+     reaches 70%. So *mat* and *floor* survive and are re-normalized to about **64.5%** and **35.5%**. *Couch* can no longer
+     be picked.
+</Worked>
+
+Now try the real thing with a longer list of candidates:
 
 <NextToken />
 
-- **Temperature** reshapes the probabilities before picking. Low means the likely words dominate. High means the
-  distribution flattens and surprises become more likely. **Temperature 0 = always pick the top token.**
-- **Top-k** says to only consider the *k* most likely tokens.
-- **Top-p** says to only consider the smallest group of tokens whose probabilities add up to *p*.
+Lower temperature, top-k, or top-p all make output **more predictable**, because the model is limited to highly likely
+tokens. Setting **temperature to 0** or **top-k to 1** makes selection **deterministic**: the highest-probability
+token is always chosen (this is called *greedy* decoding).
 
-For things like JSON output or tool calls, engines can also push the scores directly (e.g. **logit biasing**) to force
-valid output. This loop keeps going until the model produces a special **stop token** (or hits the length limit).
+<Note kind="beyond">
+  Mathematically, dividing by a temperature of exactly 0 is undefined, so engines special-case it and simply take the
+  top token. Also note that “deterministic token choice” doesn’t always mean bit-identical outputs across runs on real
+  servers: tiny numerical differences from batching and hardware can occasionally flip a near-tie.
+</Note>
 
-## Reading a model's name
+### Structured output and logit biasing
 
-Every open model on Hugging Face ships with a `config.json` describing its architecture. The architecture name alone
-tells you a lot. For example, `Qwen3MoeForCausalLM`:
+Sometimes the output must follow a strict format, such as JSON that matches a schema. Here, prompting alone isn’t
+reliable enough, so engines use additional tools like **logit biasing** to steer generation. These adjustments are
+applied **after each forward pass**, before a token is picked. The book notes that they underpin important abilities
+like **tool use**, and that implementing them correctly is **essential** for high-quality inference.
 
-- **Qwen**: the model family
-- **3**: the version
-- **Moe**: it's a *Mixture of Experts* model (next lesson)
-- **CausalLM**: it predicts the *next* token from the previous ones (every modern chatbot does)
+<Note kind="beyond">
+  The simplest form of constraint works like this: at each step, the engine works out which tokens would still produce
+  valid output, and sets the logits of every other token to negative infinity. After softmax those tokens have
+  probability exactly zero. For example, if the output so far is `{"name": ` and the schema says the value must be a
+  string, only tokens that begin with a quote mark remain possible.
+</Note>
 
-One architecture can come in several **sizes** (e.g. 8B and 70B), **variants** ("base" vs. "instruct"), and endless
-**fine-tunes**. That's handy for inference engineers: if you've optimized one architecture, the same optimizations
-carry over to every model that shares it.
+### When does it stop?
+
+This loop (produce logits, pick a token, append it, run the next pass) continues until the model generates the **stop
+token**, a special vocabulary entry that means “end of output.” Generation also ends early if the **context window**
+fills up or the **`max_tokens`** limit is reached.
+
+### The whole loop, start to finish
+
+1. Apply the **chat template** and **tokenize** the input.
+2. **Prefill**: process all input tokens at once, build the KV cache, and produce logits for the first output token.
+3. **Sample** a token from those logits (temperature, top-k, top-p, any logit biasing).
+4. **Decode**: run a forward pass on the new token, using the KV cache for everything before it, to get the next logits.
+5. Repeat steps 3–4 until a stop token, `max_tokens`, or the context window ends it.
+6. **Detokenize**: turn the token numbers back into text (streamed to the user as it goes).
+
+## Reading a model’s architecture
+
+Every LLM on **Hugging Face**, the largest repository of open models, ships with a **`config.json`**: a few dozen lines
+describing the model’s architecture.
+
+A model’s **architecture** is the set of decisions made during training about the nature and shape of each component.
+Within a single architecture there can be:
+
+- **Multiple sizes**: the same design at different parameter counts, like Llama 8B and 70B.
+- **Multiple variants**: the “base” and “instruct” versions of a model share an architecture.
+- **Unlimited fine-tunes**: methods like **LoRA** (low-rank adaptation) change a model’s *behavior*, not its
+  architecture.
+
+Why this matters for inference: architectures determine **runtime and engine support**. If you have a highly optimized
+deployment of one architecture, you can deploy **any other variant of that architecture** and get the same performance
+improvements for free.
+
+The architecture name is one of the first lines in the config. Take `Qwen3MoeForCausalLM`:
+
+- **Qwen**: the model family, i.e. the brand name.
+- **3**: the major version of the architecture within that family.
+- **Moe**: a **Mixture of Experts** model (next lesson).
+- **CausalLM**: a **causal language model**.
+
+A causal language model predicts the **next** token from the **previous** ones. The contrast is a **masked language
+model**, which fills in a blank using the tokens on **both** sides. Every generative LLM today is a causal language
+model.
+
+Beyond the name, `config.json` describes the nature and **dimensions** of the layers inside the model and of the
+vectors that flow through them during inference.
+
+<Note kind="beyond">
+  Here are some of the fields in Qwen3-235B-A22B’s config (the real file has more). You’ll meet most of them in the next
+  lesson:
+
+  ```json
+  {
+    "architectures": ["Qwen3MoeForCausalLM"],
+    "hidden_size": 4096,
+    "num_hidden_layers": 94,
+    "num_attention_heads": 64,
+    "num_key_value_heads": 4,
+    "num_experts": 128,
+    "num_experts_per_tok": 8,
+    "vocab_size": 151936
+  }
+  ```
+
+  Read it as: every token is a 4,096-number vector; there are 94 transformer blocks; attention uses 64 query heads that
+  share 4 key/value heads; each block has 128 experts, of which 8 are used per token; and the output layer produces
+  151,936 logits, one per vocabulary entry.
+</Note>
 
 <KeyPoints>
-- Text → **tokens** via a tokenizer. Fewer tokens = less work.
-- <Compute>Prefill</Compute> reads the whole prompt at once and decides **time to first token**.
-- <Memory>Decode</Memory> writes one token per forward pass and decides **tokens per second**.
-- Each token is picked from a probability list, shaped by **temperature, top-k, and top-p**.
+- LLMs are **autoregressive**: one token at a time, each based on every token before it.
+- A **tokenizer** (not a neural network) maps text to tokens via a **vocabulary** of 100,000+ entries. Fewer tokens = faster. English ≈ 4 tokens per 3 words.
+- Input + reasoning + output must fit the **context window**; `max_tokens` caps the output. **Chat templates** flatten structured chats and must match the model exactly.
+- <Compute>Prefill</Compute> processes the whole prompt and builds the KV cache (sets **TTFT**); <Memory>decode</Memory> produces one token per forward pass (sets **TPS**).
+- Each pass ends in **logits** (one per vocabulary token) → **softmax** → weighted random pick, shaped by **temperature, top-k, top-p**, and **logit biasing** for structured output.
+- `config.json` defines the **architecture**; optimizations carry over to every size, variant, and fine-tune that shares it.
 </KeyPoints>
 
 <Quiz questions={[
@@ -105,18 +302,62 @@ carry over to every model that shares it.
     q: "You paste a 50-page document into a chatbot. Which number gets noticeably worse?",
     options: ["Time to first token (TTFT)", "Tokens per second once it starts", "Neither"],
     answer: 0,
-    why: "A huge input means a lot more prefill work before the first token can appear, so TTFT goes up."
+    why: "A huge input means much more prefill work before the first token can appear, so TTFT rises. (Decode also slows somewhat as the context grows, but the big hit is the wait before anything appears.)"
   },
   {
     q: "During decode, how many new tokens does one forward pass produce (without any special tricks)?",
     options: ["One", "One per word in the prompt", "The whole answer"],
     answer: 0,
-    why: "Plain decode produces exactly one token per forward pass. (Speculative decoding, in Chapter 5, is a trick to beat that.)"
+    why: "Plain decode produces exactly one token per forward pass. Speculative decoding (Chapter 5) is a family of tricks for beating that."
   },
   {
-    q: "You want the model to give the same answer every time. What should you set?",
-    options: ["Temperature = 2", "Temperature = 0", "Top-p = 1"],
+    q: "Two tokens have logits 2 and 0. After softmax (temperature 1), roughly what are their probabilities?",
+    options: ["100% and 0%", "88% and 12%", "67% and 33%", "50% and 50%"],
     answer: 1,
-    why: "Temperature 0 (or top-k = 1) always picks the single most likely token, so the choice becomes deterministic."
+    why: "e² ≈ 7.39 and e⁰ = 1. The total is 8.39, so the probabilities are 7.39 ÷ 8.39 ≈ 88% and 1 ÷ 8.39 ≈ 12%."
+  },
+  {
+    q: "The four most likely tokens have probabilities 60%, 25%, 10%, and 5%. With top-p = 0.9, how many tokens remain candidates?",
+    options: ["1", "2", "3", "4"],
+    answer: 2,
+    why: "60% alone is short of 90%; adding 25% gives 85%, still short; adding 10% gives 95%, which reaches 90%. So the smallest qualifying set is the top 3 tokens."
+  },
+  {
+    q: "What happens to the probability distribution if you lower the temperature from 1 to 0.5?",
+    options: [
+      "It gets sharper: likely tokens get even more likely",
+      "It gets flatter: all tokens become equally likely",
+      "Nothing, temperature only affects speed"
+    ],
+    answer: 0,
+    why: "Dividing logits by 0.5 doubles the gaps between them, and softmax turns bigger gaps into more lopsided probabilities."
+  },
+  {
+    q: "A model has a 32,000-token context window. The prompt is 30,000 tokens and the model uses 1,500 reasoning tokens. What’s the most the visible answer can be?",
+    options: ["500 tokens", "2,000 tokens", "32,000 tokens", "Unlimited, only the prompt counts"],
+    answer: 0,
+    why: "Input, reasoning, and output all share the context window: 32,000 − 30,000 − 1,500 = 500."
+  },
+  {
+    q: "A config.json says “LlamaForCausalLM”. What can you conclude?",
+    options: [
+      "A dense (not Mixture-of-Experts) next-token-prediction model from the Llama family",
+      "A masked language model that fills in blanks",
+      "An image generation model",
+      "A Mixture-of-Experts model"
+    ],
+    answer: 0,
+    why: "“CausalLM” means it predicts the next token from previous ones, and there’s no “Moe” in the name, so it’s a standard dense architecture."
+  },
+  {
+    q: "Why does a slightly wrong chat template matter so much?",
+    options: [
+      "It crashes the engine immediately",
+      "It silently degrades output quality, because the model sees input formatted differently from how it was trained",
+      "It only affects speed",
+      "It changes the model’s weights"
+    ],
+    answer: 1,
+    why: "The model was trained on one exact format. A mismatch doesn’t throw an error; it just makes the model worse, which is easy to miss."
   }
 ]} />

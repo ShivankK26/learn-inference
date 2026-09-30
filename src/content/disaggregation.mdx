@@ -1,27 +1,39 @@
 import DisaggFlow from "@/components/widgets/DisaggFlow";
 import XPyD from "@/components/widgets/XPyD";
 import ShouldDisagg from "@/components/widgets/ShouldDisagg";
+import KVHandoff from "@/components/widgets/KVHandoff";
 
 <TLDR>
-  Prefill and decode want different things from a GPU, and under heavy load they get in each other's way.
+  Prefill and decode want different things from a GPU, and under heavy load they get in each other’s way.
   **Disaggregation** runs them on separate engines: prefill engines read prompts and build KV caches, decode engines
-  write the answers. It's powerful, but only worth it for large models, lots of traffic, and long inputs.
+  write the answers. It’s powerful, but only worth it for large models, lots of traffic, and long inputs.
 </TLDR>
 
 ## Three ideas, combined
 
-Disaggregation brings together three ideas from earlier lessons:
+Disaggregation brings together three important ideas from earlier lessons:
 
-1. <Compute>Prefill</Compute> is compute-bound and sets your **TTFT**; <Memory>decode</Memory> is memory-bound and sets
-   your **TPS** (see [Finding the bottleneck](/learn/bottlenecks)).
-2. **Specialization improves performance**, from choosing kernels to tuning engine settings. A machine doing one job
-   can be tuned for that job.
-3. You can spread serving across many GPUs, or even many machines, **if you avoid bottlenecks** on the slower links
-   between them.
+1. <Compute>Prefill</Compute> is a compute-bound process that determines your **TTFT**, while
+   <Memory>decode</Memory> is a memory-bound process that determines your **TPS** (see
+   [Finding the bottleneck](/learn/bottlenecks)).
+2. **Specialization improves performance** in everything from kernel selection to inference engine parameter tuning.
+   An engine that does one kind of work can be tuned for exactly that work.
+3. You can effectively parallelize model serving over **multiple GPUs, or even multiple nodes**, if you avoid
+   bottlenecks from lower-bandwidth interconnects ([Using many GPUs](/learn/parallelism)).
 
-When prefill and decode share the same GPUs under heavy traffic, they tend to **interfere**. In theory they're a good
-pairing: prefill mostly uses compute, decode mostly uses memory. But with large batches and compute-hungry
-optimizations, they start competing for the same resources, and a big prefill can stall everyone's token stream.
+## The problem: prefill and decode interfere
+
+When prefill and decode run on the same GPUs under heavy traffic, they have a higher chance of interfering with one
+another. In an ideal world they’d coexist nicely: prefill uses mostly compute, decode uses mostly memory bandwidth,
+so they should be able to share a GPU without stepping on each other. But with larger batches and more
+compute-intensive optimizations, prefill and decode start **competing for the same resources**.
+
+Here’s what that competition looks like inside an engine. With continuous batching, the engine runs in steps, and
+each step produces one token for every request that’s decoding. When a new long prompt arrives, its prefill has to
+happen in some of those steps too. A step that includes a big chunk of prefill takes much longer, so every decoding
+user’s next token arrives late, and their inter-token latency spikes. Going the other way, a GPU busy with many
+memory-bound decode requests can’t give prefill the full compute it wants, so TTFT rises. Chunked prefill
+([Caching](/learn/caching)) softens the first problem, but it can’t make one GPU be two kinds of machine at once.
 
 <Analogy>
   Picture a restaurant where the same cooks both **prep** (chopping for big new orders) and **cook to order**. When a
@@ -31,89 +43,197 @@ optimizations, they start competing for the same resources, and a big prefill ca
 
 ## How disaggregation works
 
-**Disaggregated serving** puts prefill and decode on **separate engines, on separate GPUs or machines**. A request
-becomes a three-step relay:
+**Disaggregation**, or **disaggregated serving**, separates prefill and decode into **separate engines running on
+separate GPUs or nodes**. It turns LLM inference into a three-step process:
 
-1. The **prefill engine** reads the input, builds the KV cache, and computes the **first token**.
-2. The prefill engine **sends the KV cache** over the hardware connection to a decode engine.
-3. The **decode engine** generates every token after that.
+1. The **prefill engine** takes the input sequence and generates the KV cache while computing the **first token**.
+2. The prefill engine **sends the KV cache** over the hardware interconnect to the decode engine.
+3. The **decode engine** computes all subsequent tokens.
+
+The book’s figure shows exactly this split: prefill workers produce the first token, decode workers produce every
+token after it.
+
+### What does shipping the KV cache cost?
+
+Step 2 is the new cost disaggregation adds. The KV cache for a long prompt is gigabytes, and it has to cross a link
+before decode can begin. The question is how that compares to the prefill it replaces.
+
+<Worked title="The handoff vs. the work it saves">
+
+A 70B model with a 16-bit KV cache (320 KiB per token, from [Caching](/learn/caching)), prefilled on a node of 8 H100s
+in FP8, assuming they sustain about half their peak compute.
+
+1. **A 20,000-token prompt** produces 20,000 × 327,680 bytes ≈ **6.6 GB** of KV cache.
+2. **Prefill work:** about 2 × 70 × 10⁹ × 20,000 = 2.8 × 10¹⁵ FLOPs for the weights, plus ~0.5 × 10¹⁵ for attention.
+   At ~7.9 PFLOPS that’s roughly **420 ms**.
+3. **Transfer:** over InfiniBand with each of the 8 GPUs sending its own shard on its own 50 GB/s card (400 GB/s
+   together), 6.6 GB takes about **16 ms**. Over NVLink within a node it’s faster still.
+4. So the handoff costs about **4% of the work** it moves off the decode engine. Clearly worth it.
+5. **A 200-token prompt:** only ~66 MB of cache (~0.2 ms to send), but its prefill is only ~3.5 ms of work. The fixed
+   overhead of handing a request between engines (scheduling, an extra network hop) is now a big fraction of the job,
+   and it would have been simpler for the decode engine to prefill it itself.
+
+</Worked>
+
+<KVHandoff />
+
+That last case is exactly what the next idea solves.
 
 ### Conditional disaggregation
 
-Shipping a KV cache has a cost, and it isn't worth paying for a tiny prompt. With **conditional disaggregation**, the
-request goes to the **decode engine first**, which checks whether the input is already in its prefix cache or short
-enough to handle itself:
+In **conditional disaggregation**, the request goes to the **decode engine first**. The decode engine checks whether
+the input sequence is **already cached**, or **short enough** to handle locally:
 
-- **If yes**, the decode engine runs prefill locally and skips disaggregation.
-- **If no**, it hands the request to a prefill engine and the disaggregated relay happens.
+1. **If it is,** the decode engine runs prefill locally, skipping disaggregation entirely.
+2. **If it is not,** the decode engine transfers the request to a prefill engine for disaggregated serving.
 
-The book notes that conditional disaggregation works **better for real-world traffic**, which is a messy mix of long
-and short requests.
+Conditional disaggregation is **better for real-world traffic**, which is a messy mix of long and short prompts, some
+heavily cached and some brand new.
 
 <DisaggFlow />
 
-Separating the engines has another big benefit: **you can tune each one independently.** For example, the
-compute-bound prefill engine needs **less tensor parallelism** than the memory-bound decode engine (see
-[Using many GPUs](/learn/parallelism)).
+<Worked title="Deciding on the tokens that are actually new">
+
+A decode engine is configured to prefill locally when a request has at most **1,000 uncached tokens**.
+
+1. **Request A:** a 12,000-token prompt in a long chat, with an 11,500-token prefix already in the cache. Only **500**
+   tokens need prefill → handled **locally**.
+2. **Request B:** a 9,000-token prompt with a fresh codebase pasted in and nothing cached → **9,000** uncached tokens →
+   sent to a **prefill engine**.
+3. Request A is longer than request B, but it’s the cheaper one to serve. The decision uses the input length **after
+   prefix caching**, not the raw prompt length. That’s the threshold NVIDIA Dynamo exposes (below).
+
+</Worked>
+
+### Tune each engine for its job
+
+Another benefit of separate engines: you can **optimize each one individually, and the system as a whole.** The book’s
+example: the compute-bound prefill engine requires a **lower tensor-parallelism degree** than the memory-bound decode
+engine.
+
+The reasoning follows from the bottlenecks:
+
+- **Decode** is memory-bound. Higher TP splits the weight reads across more GPUs, which speeds up every token, and it
+  also gives more aggregate memory for the KV caches of many concurrent users.
+- **Prefill** is compute-bound. It’s already doing lots of math per byte, so splitting it across more GPUs mostly
+  adds all-reduce communication. It’s better to run more, smaller prefill engines side by side, each processing
+  different prompts.
+
+<Note kind="beyond">
+  Specialization can go all the way down to the hardware. The book’s glossary notes that NVIDIA’s Rubin generation
+  introduces **CPX** chips for compute-bound workloads, and prefill is the textbook compute-bound workload. Separate
+  engines also let you choose different batch sizes, kernels, or quantization settings for prefill and decode.
+</Note>
 
 ## When should you use it?
 
-Disaggregation needs multiple GPUs and real engineering effort. The book says to reach for it only when **all three**
-of these are true:
+Disaggregation is very powerful, but it requires multiple GPUs and extra engineering work. You should reach for it
+**only when all three** of these are true:
 
-1. **High volume**: you serve a lot of traffic, starting around **100 million to 1 billion tokens per day**, depending
-   on model size.
-2. **A big model**: at least around **100 billion parameters**.
-3. **Prefill-heavy traffic**: many long input sequences.
+1. **High volume:** you’re serving a large volume of traffic, starting at **one hundred million to one billion tokens
+   per day**, depending on model size.
+2. **A larger model:** at least **a hundred billion parameters**.
+3. **Prefill-heavy traffic:** many **long input sequences**.
 
-If (1) or (2) is false, you're probably paying for extra hardware for little gain. If (3) is false, you may do better
-using those GPUs for **more replicas**, since decode engines handle short prompts and prefix-cache hits efficiently on
-their own.
+If either (1) or (2) is not true, you’re likely wasting money on extra hardware for minimal performance gains. If (3)
+is not true, you may be better off using the extra GPUs to **scale replicas horizontally**, because decode engines are
+efficient on their own for short sequences and prefix-cache hits.
+
+<Worked title="What those traffic thresholds mean per second">
+
+1. 100 million tokens per day ÷ 86,400 seconds ≈ **1,160 tokens per second**, on average.
+2. 1 billion tokens per day ≈ **11,600 tokens per second**, on average.
+3. Real traffic has peaks several times higher than the average. The point is that you need enough steady work to
+   keep **separate** prefill and decode pools busy. With too little traffic, one pool sits idle while the other
+   works, and you’ve paid for two sets of GPUs to do one set’s job.
+
+</Worked>
+
+Why these particular criteria?
+
+- **Model size:** for a big model, prefill is expensive (2 × parameters FLOPs per token) and every GPU-hour is costly,
+  so the efficiency gained from specializing is worth a lot. A small model’s prefill is cheap, and the transfer and
+  coordination overhead eats the gain.
+- **Prefill-heavy traffic:** if prompts are short or mostly cached, there’s little prefill to move, and the decode
+  engines would handle it locally anyway under conditional disaggregation.
 
 <ShouldDisagg />
 
-The textbook workload: a **frontier LLM inside a code editor**, where many developers at once send big, varied
-chunks of code as context. That's tons of tokens, mostly prefill, on a trillion-parameter model.
+The book’s go-to example: **serving a frontier LLM inside a code editor**, where many developers at once pass in
+large and varied chunks of code as context. That’s tons of tokens, mostly prefill, on a trillion-parameter LLM. It’s
+the textbook workload for disaggregation.
 
 ## Dynamic disaggregation with NVIDIA Dynamo
 
-**NVIDIA Dynamo** provides production-ready disaggregation that can cope with messy real traffic. Its main building
-blocks:
+**NVIDIA Dynamo** provides production-ready support for disaggregation, with the flexibility to handle mixed,
+real-world traffic. It provides developer tools and prebuilt optimizations:
 
-- A **prefill queue** that holds requests when every prefill engine is busy.
-- Solid support for **conditional disaggregation**, with configurable thresholds for when to send a request to prefill
-  engines, based on the
-  <Term def="Input sequence length: how many tokens are in the prompt.">input length (ISL)</Term>
-  left after prefix caching, and on how long the prefill queue is.
-- Fast KV cache transfer from prefill to decode engines, built on
-  <Term def="NVIDIA’s Inference Transfer Library, used by Dynamo to move KV cache data quickly between engines.">NIXL</Term>,
-  including a kernel that **rearranges KV blocks** when the prefill and decode engines use different tensor-parallel
-  layouts.
+- **A prefill queue** that holds requests when all prefill engines are saturated, so bursts wait in line instead of
+  failing or landing on decode engines.
+- **Robust support for conditional disaggregation**, with prefill routing based on configurable thresholds for **ISL
+  after prefix caching** (the input length left once cached tokens are subtracted, as in the worked example above) and
+  for **prefill queue size**.
+- **Efficient KV transfer** from prefill to decode engines, built on
+  <Term def="NVIDIA’s Inference Transfer Library, used by Dynamo to move KV cache data quickly between engines.">NIXL</Term>.
+  This includes a kernel that **transposes KV blocks between layouts** when the prefill and decode engines use
+  different TP configurations.
 
-Together these enable **dynamic disaggregation**: the number of prefill and decode engines can be **changed at
-runtime** and adjusted over time as traffic shifts.
+That last point follows from the parallelism lesson. With tensor parallelism, each GPU holds the KV cache for its own
+attention heads. If the prefill engine runs at TP2 and the decode engine at TP8, the prefill GPUs hold the cache in two
+shards while the decode GPUs expect eight. The blocks have to be rearranged in flight, and that’s what the transpose
+kernel does.
+
+Together, these features enable **dynamic disaggregation**: the number of prefill and decode engines is configurable
+**at runtime**, and can be adjusted over time to match the changing nature of incoming traffic.
 
 ### xPyD: not one-to-one
 
-It's easiest to explain disaggregation with one prefill engine and one decode engine, but real systems run several
-of each, in whatever ratio the traffic needs. The shorthand is **xPyD**: **5P3D** means five prefill engines and three
-decode engines serving one model together.
+Disaggregation doesn’t need to be a one-to-one ratio between prefill and decode engines. It’s simplest to explain with
+one prefill engine and one decode engine, but real systems have several of each. The shorthand is **xPyD**. For
+example, **5P3D** means five prefill engines and three decode engines working together to serve a single model
+deployment.
 
 <XPyD />
 
-More moving parts means more places to get stuck. Disaggregation adds two new bottlenecks to watch:
+<Worked title="Sizing an xPyD deployment">
 
-- **Prefill queue size.** Don't let the queue grow too long. Set a sensible threshold so decode engines prefill
-  smaller requests themselves, and reconfigure xPyD at runtime to shift engines to prefill when needed.
-- **Running out of KV cache on decode engines** under heavy load. Make more room with
-  [quantization](/learn/quantization) (including of the KV cache) and [KV cache offloading](/learn/caching).
+Traffic: **20 requests per second**, each with **8,000** uncached input tokens and **400** output tokens, streamed to
+the user at **50 tokens per second**. Assume one prefill engine sustains ~40,000 prefill tokens/s and one decode engine
+can hold ~64 concurrent streams at that speed (illustrative capacities; they depend on model, hardware, and engine).
+
+1. **Prefill demand:** 20 × 8,000 = **160,000 tokens/s** → 160,000 ÷ 40,000 = **4 prefill engines**.
+2. **Decode time per request:** 400 tokens ÷ 50 tokens/s = **8 seconds**.
+3. **Concurrent decode streams:** 20 requests/s × 8 s = **160** in flight at any moment.
+4. **Decode engines:** 160 ÷ 64 = 2.5 → **3 decode engines**.
+5. Result: **4P3D**. If prompts get longer, the prefill side grows. If answers get longer, the decode side grows. That’s
+   why being able to change the ratio at runtime matters.
+
+</Worked>
+
+<Note kind="beyond">
+  Step 3 is **Little’s law**: the average number of items in a system equals their arrival rate times how long each
+  one stays. It’s the standard back-of-the-envelope tool for sizing anything with a queue, including autoscaling in
+  [Chapter 7](/learn/autoscaling).
+</Note>
+
+### The new bottlenecks
+
+As systems grow more complicated, more potential bottlenecks appear. Disaggregation adds two to watch:
+
+- **Prefill queue size.** Don’t let the queue grow too large. Set a reasonable threshold for **local prefill** on the
+  decode engines, so small jobs never join the queue, and **reconfigure xPyD at runtime** to give prefill more
+  engines if needed.
+- **Running out of KV cache on the decode engines** under high load. Every in-flight request’s cache lives on a decode
+  engine. Increase KV cache availability with [quantization](/learn/quantization) (including of the KV cache itself)
+  and [KV cache offloading](/learn/caching).
 
 <KeyPoints>
-- Disaggregation splits <Compute>prefill</Compute> and <Memory>decode</Memory> onto **separate engines** so they stop interfering and can each be tuned.
-- The flow: prefill engine builds the KV cache and first token → ships the cache → decode engine writes the rest.
-- **Conditional disaggregation** lets decode engines handle short or cached prompts themselves, which fits real traffic best.
-- Worth it only with **high volume** (~100M–1B+ tokens/day), a **big model** (100B+), and **prefill-heavy** traffic.
-- **Dynamo** adds a prefill queue, routing thresholds, fast KV transfer (NIXL), and runtime-adjustable **xPyD** ratios. Watch the prefill queue and decode KV memory.
+- Under heavy load, big prefills stall everyone’s decode steps and decode crowds out prefill. **Disaggregation** puts <Compute>prefill</Compute> and <Memory>decode</Memory> on **separate engines**.
+- The flow: prefill engine builds the KV cache and first token → ships the cache over the interconnect → decode engine writes the rest. For long prompts the transfer is a few percent of the prefill it saves.
+- **Conditional disaggregation**: decode engines prefill short or cached requests themselves, judged by **ISL after prefix caching**. It fits real traffic best.
+- Tune engines separately: prefill (compute-bound) wants **lower TP**, decode (memory-bound) wants **higher TP**.
+- Only worth it with **high volume** (~100M–1B+ tokens/day, i.e. roughly 1,000–12,000 tokens/s on average), a **100B+ model**, and **prefill-heavy** traffic. Otherwise add replicas.
+- **Dynamo** adds a prefill queue, routing thresholds, NIXL transfers with a layout-transposing kernel, and runtime **xPyD**. Watch the prefill queue and decode KV memory.
 </KeyPoints>
 
 <Quiz questions={[
@@ -121,17 +241,43 @@ More moving parts means more places to get stuck. Disaggregation adds two new bo
     q: "In disaggregated serving, which engine produces the first token?",
     options: ["The decode engine", "The prefill engine", "The router"],
     answer: 1,
-    why: "The prefill engine processes the input, builds the KV cache, and computes the first token. Then it hands the cache to decode."
+    why: "The prefill engine processes the input, builds the KV cache, and computes the first token. Then it hands the cache to decode, which produces every later token."
   },
   {
-    q: "With conditional disaggregation, what happens to a short prompt that’s mostly in the prefix cache?",
+    q: "Why do prefill and decode interfere when they share GPUs under heavy load?",
     options: [
-      "It’s always sent to a prefill engine",
-      "The decode engine handles its prefill locally, skipping the transfer",
+      "They use different model weights",
+      "A big prefill makes engine steps long, delaying every decoding user’s next token, and decode load takes compute prefill wants",
+      "Decode deletes the KV cache that prefill builds"
+    ],
+    answer: 1,
+    why: "Each engine step produces one token per decoding request. Packing heavy prefill into those steps stretches them out, so inter-token latency spikes, while a crowd of decode requests limits the compute available to prefill."
+  },
+  {
+    q: "A 70B model’s KV cache is 320 KiB per token. Roughly how much data must move after prefilling a 10,000-token prompt?",
+    options: ["About 33 MB", "About 3.3 GB", "About 33 GB"],
+    answer: 1,
+    why: "10,000 × 327,680 bytes ≈ 3.3 GB. Over ~400 GB/s of parallel InfiniBand that’s about 8 ms, small next to the prefill it saves."
+  },
+  {
+    q: "A decode engine prefills locally when a request has 2,000 or fewer uncached tokens. A 30,000-token prompt arrives with 29,000 tokens already in the prefix cache. What happens?",
+    options: [
+      "It’s sent to a prefill engine because the prompt is long",
+      "It’s handled locally, because only 1,000 tokens are uncached",
       "It’s rejected"
     ],
     answer: 1,
-    why: "Shipping a KV cache isn’t worth it for small jobs, so the decode engine does the prefill itself."
+    why: "Conditional disaggregation looks at the input length after prefix caching. Only 1,000 tokens need prefill, which is under the threshold."
+  },
+  {
+    q: "Why does the prefill engine typically use lower tensor parallelism than the decode engine?",
+    options: [
+      "Prefill is compute-bound, so splitting it further mostly adds communication; decode is memory-bound, so more TP splits the weight reads and speeds up each token",
+      "Prefill needs more memory than decode",
+      "TP only works for prefill"
+    ],
+    answer: 0,
+    why: "Match the split to the bottleneck. Decode benefits from sharing weight reads across GPUs. Prefill already has plenty of math per byte, so it’s better served by more, smaller engines working on different prompts."
   },
   {
     q: "You serve an 8B model at 20 million tokens a day. Should you disaggregate?",
@@ -141,16 +287,22 @@ More moving parts means more places to get stuck. Disaggregation adds two new bo
       "Only if the prompts are short"
     ],
     answer: 1,
-    why: "The book’s checks need high volume and a model of roughly 100B+ parameters. Here, replicas are a better use of GPUs."
+    why: "The book’s checks need high volume (100M–1B+ tokens/day) and a model of roughly 100B+ parameters. Here, replicas are a better use of GPUs."
   },
   {
-    q: "What does 5P3D mean?",
-    options: [
-      "5 GPUs for prefill, 3 for data",
-      "Five prefill engines and three decode engines serving one model",
-      "A 5-to-3 compression ratio"
-    ],
+    q: "Traffic is 10 requests/s. Each answer is 600 tokens streamed at 60 tokens/s, and one decode engine holds 40 concurrent streams. How many decode engines do you need?",
+    options: ["2", "3", "10"],
     answer: 1,
-    why: "xPyD describes how many prefill (P) and decode (D) engines work together. Dynamo can change this ratio at runtime."
+    why: "Each request decodes for 600 ÷ 60 = 10 s, so 10 requests/s × 10 s = 100 concurrent streams. 100 ÷ 40 = 2.5, which rounds up to 3 decode engines."
+  },
+  {
+    q: "The prefill queue keeps growing during the afternoon peak. Which two fixes does the book point to?",
+    options: [
+      "Raise the local-prefill threshold on decode engines and shift engines to prefill by reconfiguring xPyD",
+      "Lower the temperature and shorten answers",
+      "Disable prefix caching and add a router"
+    ],
+    answer: 0,
+    why: "Letting decode engines handle more small prefills keeps them out of the queue, and Dynamo can change the prefill/decode ratio at runtime to add prefill capacity."
   }
 ]} />

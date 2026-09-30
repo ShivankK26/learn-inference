@@ -32,11 +32,12 @@ export function KeyPoints({ children }: { children: ReactNode }) {
   );
 }
 
-export function Note({ kind = "tip", children }: { kind?: "tip" | "warn" | "deeper"; children: ReactNode }) {
+export function Note({ kind = "tip", children }: { kind?: "tip" | "warn" | "deeper" | "beyond"; children: ReactNode }) {
   const style = {
     tip: { label: "Tip", cls: "border-good/40 bg-good-soft", lcls: "text-good" },
     warn: { label: "Watch out", cls: "border-bad/40 bg-bad-soft", lcls: "text-bad" },
     deeper: { label: "Going deeper (optional)", cls: "border-line bg-bg-soft", lcls: "text-ink-soft" },
+    beyond: { label: "Beyond the book", cls: "border-memory/40 bg-memory-soft", lcls: "text-memory" },
   }[kind];
   return (
     <div className={`rounded-xl border px-5 py-4 text-[0.98rem] ${style.cls}`}>
@@ -79,5 +80,16 @@ export function Widget({ title, children, hint }: { title: string; hint?: string
       </figcaption>
       <div className="p-5 text-[0.95rem] leading-normal">{children}</div>
     </figure>
+  );
+}
+
+/** A step-by-step calculation or walkthrough. Numbered steps read best as an ordered list inside. */
+export function Worked({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <div className="rounded-2xl border border-compute/35 bg-card px-6 py-5">
+      <div className="mb-1 font-sans text-sm font-semibold text-compute">Worked example</div>
+      <div className="mb-3 font-serif text-[1.25rem] font-semibold leading-snug">{title}</div>
+      <div className="space-y-3">{children}</div>
+    </div>
   );
 }

@@ -1,219 +1,428 @@
 import AutoscalerSim from "@/components/widgets/AutoscalerSim";
 import BatchingModes from "@/components/widgets/BatchingModes";
 import ColdStartBreakdown from "@/components/widgets/ColdStartBreakdown";
+import ReplicaSizer from "@/components/widgets/ReplicaSizer";
 
 <TLDR>
   Traffic goes up and down all day, so the number of model copies (**replicas**) should too. **Autoscaling** adds
-  replicas when demand rises and removes them when it falls. It only works well if you know how much each replica can
-  handle, can start new ones quickly (**cold starts**), and can route and queue requests sensibly while it catches up.
+  replicas when demand rises and removes them when it falls. It only works well if you know exactly how much each
+  replica can handle (its **concurrency**), can start new ones quickly (**cold starts**), and can route and queue
+  requests sensibly while capacity catches up.
 </TLDR>
 
 ## The goal
 
-The goal of autoscaling fits in one sentence: **always have enough capacity to serve every request within your latency
-targets, without paying for idle GPUs.**
+The book states the goal of autoscaling in one sentence: **always have enough resources to serve all incoming requests
+while maintaining your latency SLAs, without wasting money on idle GPUs.** Both halves matter. Missing the first half
+means slow or failed requests; missing the second means burning money.
 
-Without autoscaling you're stuck with a fixed fleet, and it's wrong most of the day. The book shows this with two
-pictures: a fixed fleet **wastes GPUs during quiet periods** and **misses its latency targets during spikes**, while a
-good autoscaler keeps capacity hugging the demand curve. You can recreate both below.
+Without autoscaling you’re stuck with a fixed fleet, and it’s wrong most of the day. The book shows this with two
+figures. In Figure 7.3, a fixed number of replicas **wastes resources during traffic lulls** (the gap between capacity
+and demand at night) and **misses SLAs during spikes** (demand poking above capacity). In Figure 7.4, a strong
+autoscaling system keeps capacity **hugging the demand curve**. You can recreate both below: start with a fixed fleet,
+then switch on autoscaling.
 
 <AutoscalerSim />
 
 ## How it works: Kubernetes, replicas, and clusters
 
-Autoscaling systems are usually built on **Kubernetes** (an open-source system for running and managing containers),
-together with a cluster-level system that adds and removes machines.
+Autoscaling systems are built on **Kubernetes**, an open-source container orchestration system, together with a
+cluster-level system for provisioning and deallocating compute (actually adding and removing machines).
 
-- Kubernetes runs one or more **replicas** of a model's container, each on its own **instance**: the GPUs and other
-  hardware the container needs.
-- A group of machines managed together is a **cluster**, and it has two kinds of parts:
-  - The **control plane** makes the decisions: where requests go and how many replicas to run.
-  - The **worker plane** runs the actual containers.
+- Kubernetes can run one or more **replicas** of a model’s container, each on its own **instance**. The instance
+  includes the GPUs and other hardware resources the container requires.
+- Kubernetes composes a group of hardware resources into a **cluster**, which has two types of components:
+  - The **control plane** makes routing and scaling decisions.
+  - The **worker plane** runs the actual containerized applications.
 
-One control plane orchestrates many workers, and one cluster can run many replicas of many different models.
+The book’s Figure 7.5 shows a single control plane orchestrating many workers. A single cluster can run many replicas of
+many different models.
 
-So how many replicas should each model get? Unless your traffic is unusually steady, **there's no single right
-number**. Autoscaling means adjusting that number continuously.
+<Note kind="beyond">
+  **Kubernetes vocabulary you’ll meet in practice.** A *node* is one machine in the cluster (for inference, typically a
+  GPU instance). A *pod* is the smallest thing Kubernetes schedules: one or more containers that run together, so each
+  model replica is usually one pod. A *deployment* declares “I want N copies of this pod,” and Kubernetes keeps reality
+  matching that number, restarting pods that crash and moving them off unhealthy nodes. A pod asks for GPUs explicitly
+  (for example, 8 GPUs), and the scheduler only places it on a node that has them free. Kubernetes ships with a generic
+  autoscaler that scales on metrics like CPU usage, but CPU usage says little about a GPU inference server, which is why
+  inference platforms scale on **traffic** and **GPU** signals, as this lesson describes.
+</Note>
+
+So how many replicas should each model get? Unless your traffic is unusually consistent, **there isn’t one number of
+replicas that perfectly matches your needs**. Autoscaling is the practice of dynamically adjusting the number of replicas
+allocated to a given model within a cluster.
 
 ## What to scale on: utilization or traffic?
 
-There are two kinds of signals:
+There are two ways to make autoscaling decisions:
 
-- **Utilization**: how busy the GPUs are, such as memory use or compute use.
-- **Traffic**: how many requests are currently in the system.
+- **Utilization**: scale up and down on GPU signals like **memory usage** or **compute usage**.
+- **Traffic**: scale up and down on the **number of requests being processed** in the system.
 
-They don't always agree. During LLM <Compute>prefill</Compute>, a *few* requests with hundreds of thousands of uncached
-input tokens can make GPUs far busier than *many* short requests that mostly hit the cache.
+They don’t always match. The book’s example is LLM <Compute>prefill</Compute>: a *few* requests with hundreds of
+thousands of **uncached** input tokens can cause far higher utilization than *many* small requests with high cache hit
+rates. Ten requests could be light work or crushing work depending on their shapes.
 
-The other difference is timing. **Traffic is a leading signal**: you can react as requests arrive. **Utilization is a
-lagging signal**: it only rises after the work has started. The best systems use **both together**.
+The other difference is timing. **Traffic-based decisions can be proactive**: you see requests arriving before they
+turn into GPU work. **Utilization is a lagging indicator**: it only rises after the work has started, so by the time it
+spikes, users are already waiting. The book’s recommendation is to **use both in combination** to keep resources
+matched with demand: traffic to react early, utilization to catch cases where a few requests are much heavier than they
+look.
 
 ## The five knobs of traffic-based autoscaling
 
+When designing a traffic-based autoscaler, you configure five factors:
+
 | Setting | The question it answers |
 |---|---|
-| **Min replicas** | How many replicas stay running no matter what? |
-| **Max replicas** | What's the most you'll ever run when traffic is high? |
-| **Autoscaling window** | Over how long a sliding window do you measure traffic before deciding? |
-| **Scale-down delay** | After a scale-down looks possible, how long do you wait in case another spike hits? |
+| **Min replicas** | What is the minimum number of replicas that stay running, regardless of traffic? |
+| **Max replicas** | What is the maximum number of replicas you can allocate when traffic is high? |
+| **Autoscaling window** | How long is the sliding timeframe used to measure traffic and make decisions? |
+| **Scale-down delay** | After a scale-down is suggested, how long do you wait in case of another spike? |
 | **Concurrency target** | How many requests can each replica handle at once? |
 
-These settings trade off against each other. For example, a **longer scale-down delay** protects you from removing
-replicas too early when traffic is spiky, but it also means paying for extra replicas after traffic has genuinely cooled
-off. Go back to the simulator and try it.
+What each one really controls:
+
+- **Min replicas** is your floor, and your insurance. It sets the capacity you have *instantly*, with no cold start, when
+  a burst arrives. Higher means safer and more expensive; zero is the special case of *scale to zero*, covered below.
+- **Max replicas** is your ceiling: a cost guardrail, and often a reflection of how many GPUs you can actually get. If
+  traffic exceeds max replicas × concurrency target, the excess waits in the queue no matter what.
+- **The autoscaling window** trades stability against speed. A **longer** window averages out noise, so replica counts
+  stay steady; a **shorter** one reacts faster to spikes, but can thrash (adding and removing replicas over momentary
+  blips).
+- **The scale-down delay** is asymmetric protection. Scaling *up* should be quick; scaling *down* should be patient,
+  because removing a replica you’ll need again in five minutes costs a full cold start. The book’s example: a longer
+  scale-down delay prevents premature scale-downs for spiky traffic, but can mean unnecessary spend after traffic
+  truly cools off.
+- **The concurrency target** is the conversion factor between “requests in the system” and “replicas needed.” Get it
+  wrong and every other setting is working from a bad number (next section).
+
+The exact configuration determines how well the autoscaler achieves its two goals: maintaining latency SLAs without
+wasting resources. Go back to the simulator and try each knob.
+
+<Worked title="One autoscaling decision, step by step">
+
+Suppose min replicas = 2, max replicas = 40, a 5-minute window, a 15-minute scale-down delay, and a concurrency target
+of 16. The service currently runs 6 replicas.
+
+1. **Measure.** Over the last 5 minutes, the average number of requests in flight was **150**.
+2. **Convert to replicas.** 150 ÷ 16 = 9.4, rounded up to **10 replicas needed**.
+3. **Clamp.** 10 is between the minimum (2) and maximum (40), so the target is 10.
+4. **Act.** 10 is more than the current 6, so the autoscaler **scales up immediately** by 4 replicas. They start their
+   cold starts; meanwhile any overflow waits in the queue.
+5. **Later, traffic falls.** The window average drops to **70** in flight: 70 ÷ 16 = 4.4, so **5 replicas needed**.
+   Instead of removing 5 replicas right away, the autoscaler starts the **15-minute scale-down delay**.
+6. **If traffic spikes again** within those 15 minutes, the scale-down is cancelled and no cold starts are wasted. If it
+   stays low for the full delay, the extra replicas are removed.
+
+</Worked>
+
+## How much traffic is “in the system”? Little’s law
+
+The traffic signal is the number of **requests in flight**: requests that have arrived but not yet finished. It depends
+on two things, how fast requests *arrive* and how *long* each one takes.
+
+<Note kind="beyond">
+  **Little’s law** is a simple, very general result from queueing theory: in a steady system, the average number of
+  items inside equals the arrival rate times the average time each item spends inside. For inference: **requests in
+  flight = requests per second × seconds per request.** It explains why the same traffic can need very different
+  capacity: if your average response doubles in length (say, users start asking for long reports), the number of
+  requests in flight doubles too, and so do the replicas you need, even though no more users showed up.
+</Note>
+
+<Worked title="Sizing a deployment with Little’s law">
+
+1. Requests arrive at **20 per second**, and each one takes about **6 seconds** from arrival to last token.
+2. Requests in flight: 20 × 6 = **120**.
+3. Each replica’s concurrency target is **16**, so you need 120 ÷ 16 = 7.5, rounded up to **8 replicas** just to keep up.
+4. Now add a margin for cold starts. If traffic can grow **10% per minute** during a morning ramp and a new replica
+   takes **4 minutes** to come online, traffic can be about 40% higher by the time the replica is ready.
+   120 × 1.4 = 168 in flight, and 168 ÷ 16 = 10.5, so about **11 replicas**.
+5. Those three extra replicas are the price of slow cold starts. Halve the cold start and the margin halves too.
+
+</Worked>
+
+<ReplicaSizer />
 
 ## Concurrency and batch sizing
 
-Traffic-based autoscaling needs one number above all: **how many requests can one replica handle at the same time?**
-That depends on batching. There are three styles:
+To operate a traffic-based autoscaler properly, you need a strong understanding of **how much concurrent traffic each
+instance can handle**. Most model inference services can handle more than one request at a time via batching, and there
+are three approaches:
 
-- **Static batching**: wait until the batch is completely full, then run it.
-- **Dynamic batching**: run when the batch is full *or* when a set amount of time has passed, whichever comes first.
-- **Continuous batching**: keep running all the time, swapping new requests in at the token level as soon as a slot
-  frees up.
+- **Static batching**: the server waits until the batch is full before starting inference.
+- **Dynamic batching**: the server waits until the batch is full *or* a configured amount of time has passed, whichever
+  comes first.
+- **Continuous batching**: the server runs inference continuously, swapping in requests as slots become available.
+
+The book’s three diagrams show the difference. In **Figure 7.6** (static), the batch size is fixed and inference waits
+for the batch to fill, so early requests sit idle waiting for latecomers. In **Figure 7.7** (dynamic), a cutoff time is
+added: the batch runs whether or not it’s full once the timer expires, capping the wait. In **Figure 7.8**
+(continuous), the batch operates at the **token level**, switching new requests in as old ones finish, so a free slot
+never sits empty for long.
 
 <BatchingModes />
 
-The book's three diagrams show exactly this. With static batching, early requests sit waiting for the batch to fill.
-Dynamic batching adds a cutoff so nobody waits forever. Continuous batching slots new requests in as soon as others
-finish. Modern engines (vLLM, SGLang, TensorRT-LLM) all do **continuous batching**, which TensorRT-LLM calls
-**in-flight batching**, and it cuts latency a lot compared to static batching.
+<Worked title="Why static batching punishes early arrivals">
 
-Batch size is the classic trade-off from Chapter 2: **bigger batches give more total throughput, but each user waits a
-bit longer.** Test several batch sizes to find the right fit for your model, hardware, latency target, and budget.
+1. A batch holds **8** requests, and requests arrive about **one every 0.5 seconds**.
+2. **Static:** the first request waits for 7 more to arrive, about 7 × 0.5 = **3.5 seconds**, before any work starts.
+   If traffic is light, it could wait much longer.
+3. **Dynamic** with a 1-second cutoff: the first request waits at most **1 second**; the batch runs with the 2 or 3
+   requests that have arrived.
+4. **Continuous:** the first request starts on the next step. And because slots are refilled token by token, a short
+   request that finishes early frees its slot for a waiting request immediately, instead of the whole batch waiting for
+   its longest member to finish.
 
-You set this number in two places, and **they should match**:
+</Worked>
 
-- In the **autoscaler**, as the *concurrency target*.
-- In each **replica**, as the engine's *batch size*.
+Inference engines like **vLLM**, **SGLang**, and **TensorRT-LLM** implement robust continuous batching (TensorRT-LLM
+calls it **in-flight batching**), where requests are batched at the token level. This minimizes latency relative to
+static batching, and it’s why LLM serving has largely left the older approaches behind.
 
-Then the scaling rule is simple. When **every active replica is at its maximum concurrency**, it's time to add replicas.
-When lots of replicas are running **half-empty batches**, it's time to remove some.
+**Batch sizing trades latency for throughput.** Increasing the batch size produces more throughput overall, but each
+user’s latency gets worse (the [bottlenecks lesson](/learn/bottlenecks) showed why: bigger batches squeeze more work out
+of each trip through the weights, but each step takes a little longer). The book’s advice is to **test performance
+across multiple batch sizes** to find the right fit for your model, instance, latency target, and budget. In practice
+that usually means finding the **largest batch size that still meets your latency SLA** at P90 or P99, since every
+extra slot per replica means fewer replicas to pay for.
+
+This number is controlled in two places, and **they should match**:
+
+- At the **autoscaling configuration** level, as the **concurrency target**.
+- At the **replica** level, as the engine’s **batch size**.
+
+<Note kind="beyond">
+  **What goes wrong when they don’t match.** If the concurrency target is *higher* than the batch size, the autoscaler
+  thinks replicas have room when they don’t: extra requests pile up in a queue *inside* each replica, latency climbs,
+  and the autoscaler doesn’t add capacity because by its count nothing is full. If the target is *lower* than the batch
+  size, the autoscaler adds replicas while existing ones still have free batch slots, so you pay for idle capacity.
+</Note>
+
+Once they match, the scaling rule is simple. The book puts it this way: **once every active replica reaches its maximum
+concurrency, the autoscaler knows to spin up more replicas. If enough replicas are kicking off half-full batches, it’s
+time to scale back down.**
 
 ## Cold starts
 
-A **cold start** is the time it takes to bring a brand-new replica online. It quietly decides how good your whole
-autoscaling system can be: **if new replicas take a long time to start, you can't confidently scale down**, because you
-won't be able to scale back up in time. So you over-provision and pay for idle GPUs.
+A **cold start** is the time it takes to spin up a new replica of a model. It quietly decides how good your whole
+autoscaling system can be. The book’s key insight: **if you can’t spin up replicas fast, it’s hard to confidently scale
+down**, because you won’t be able to scale back up in time when traffic returns. The result is **over-provisioning**:
+paying for idle GPUs as insurance. (The replica calculator above shows this: cold start time directly sets how much
+headroom you need.)
 
-A cold start has four stages, and each one adds to the total:
+Several factors affect cold start time, and each one adds to the total timeline (the book’s Figure 7.9 lays them end to
+end):
 
-1. **GPU procurement**: getting the GPUs added to your cluster and assigned to the model.
-2. **Image loading**: getting the container image onto the new machine.
-3. **Model loading**: getting the model weights into the container.
-4. **Engine startup**: starting the inference engine, including any compilation.
+1. **GPU procurement**: how quickly can you add the necessary GPUs to your cluster and allocate them to the model?
+2. **Image loading**: how quickly can you load the container image onto the newly procured instance?
+3. **Model loading**: how quickly can you load the model weights into the container?
+4. **Engine startup**: how quickly can you start the inference engine, including any compilation time?
 
-Each stage needs its own fix.
+**Each of these needs to be optimized separately.**
 
 <ColdStartBreakdown />
 
-**GPU procurement** is mostly up to your cloud provider, unless you keep a pool of **warm nodes** that you shift between
-models. How quickly a provider starts nodes is even something you can negotiate in a contract (more on that in the
-next lesson).
+### 1. GPU procurement
 
-**Image and weight loading** is about moving gigabytes, often *hundreds* of gigabytes, onto the machine. There are only
-two ways to speed that up: **make it smaller**, or **get more bandwidth**.
+Unless you have a **pool of warm nodes** that you flex between models, GPU procurement speed is mostly a function of
+your **cloud provider**. How quickly a provider starts nodes is one of the negotiable factors in a GPU contract (the
+[multi-cloud lesson](/learn/multi-cloud) covers procurement). The warm pool trick works because moving an already-running
+node from one model to another skips the provider entirely.
 
-- *Smaller*: slim images with only the necessary steps and dependencies. **Quantized weights** (Chapter 5) are smaller,
-  so they also load faster during a cold start.
-- *Separate the weights*: for small models, people used to bake the weights right into the image. Now that most models
-  have tens or hundreds of billions of parameters, the weights **dwarf** the image, so it's better to load them
-  separately.
-- *Load from somewhere close*: where the weights come from matters enormously. Pull them from **Hugging Face** and
-  you're limited by their download speed. Keep them in a cloud **S3 bucket** and you pay network latency plus
-  data-transfer fees. For models with hundreds of billions of parameters you need **gigabytes per second**, and the best
-  way to get that is a **cache physically close to the GPUs, inside the same datacenter**.
+### 2 and 3. Loading images and weights
 
-**Engine startup** depends on the engine. vLLM and SGLang start quickly. But TensorRT-LLM, and PyTorch models that have
-been specially optimized, have a **compile step** that builds the engine for your exact hardware, which often takes
-**several minutes**. The fix is **caching the built engine**, and both TensorRT-LLM and PyTorch support this. The catch:
-a cached engine only works on a machine with **exactly the same GPU type, CUDA version, and software dependencies** as
-the one it was built on.
+Engineers can do a lot about the next stages. Loading images and model weights is a function of **how quickly you can
+write gigabytes, often hundreds of gigabytes, of data onto your instance**. There are only two ways to go faster:
+**make the data smaller, or get more bandwidth.**
+
+- **Make it smaller.** Include only the necessary steps and dependencies so images are smaller and faster to build into
+  containers (the [containers lesson](/learn/containers)). **Quantizing** model weights has an extra benefit here: FP8
+  weights are half the size of FP16 weights, so they also load twice as fast during a cold start.
+- **Keep weights out of the image.** For small models, the strategy used to be baking the weights into the image to
+  simplify caching and loading. Now that most models have dozens or hundreds of billions of parameters, the weights
+  **dwarf** the image and are better loaded separately.
+- **Load from somewhere close.** Where you load weights *from* has a massive impact on bandwidth. From a third party like
+  **Hugging Face**, you’re limited by their egress (download) speed. Storing weights in an **S3 bucket** introduces
+  network latency and data transfer costs. For multi-hundred-billion-parameter models you need **gigabytes per second**
+  of bandwidth, and the book says the best way to get it is **loading over the network within a node from a source
+  cached physically near the GPU instance, in the same datacenter.**
+
+<Worked title="How long do the weights take to arrive?">
+
+Take a model with about 670 billion parameters stored in FP8: roughly **670 GB** of weights.
+
+1. At **0.2 GB/s** (a slow external download): 670 ÷ 0.2 = 3,350 s, about **56 minutes**.
+2. At **1 GB/s** (a cloud storage bucket): 670 s, about **11 minutes**.
+3. At **5 GB/s** (a cache in the same datacenter): 134 s, a bit over **2 minutes**.
+4. The same model in **FP16** is about 1,340 GB, so every one of those times doubles.
+
+(The bandwidth figures are illustrative; the point is the ratio. Moving the source closer and quantizing are
+multiplicative wins.)
+
+</Worked>
+
+### 4. Engine startup
+
+Inference engines like **vLLM** and **SGLang** are fast to start up. But engines like **TensorRT-LLM**, and models
+optimized with **PyTorch** compilation, have a **compilation step** that targets the specific hardware to build the
+model inference engine. These compilations **often take several minutes**.
+
+In those cases, **caching built engines** massively improves cold start times. Both TensorRT-LLM and PyTorch have
+caching mechanisms that make this possible. The catch: you always need to load a cached engine onto an instance with
+**exactly the same GPU type, CUDA version, and software dependencies** as the environment it was built in, or it won’t
+run properly. A compiled engine is specialized to one precise setup, which is also why the pinned, reproducible
+containers from the last lesson matter so much.
 
 ## Routing, load balancing, and queueing
 
-With several replicas running, something has to decide where each request goes. Two kinds of components share that job:
+Once multiple replicas are online, the system has to decide which requests go to which replicas. Two kinds of
+components make these decisions:
 
-- A **router** works per request and asks: *where **should** this request go?*
-- A **load balancer** works across the system and asks: *where **could** this request go?*
+- A **router** works at the **request** level to determine the ideal place for a given request. It answers: *where
+  **should** this request go?*
+- A **load balancer** works at the **system** level to even out requests between multiple options. It answers: *where
+  **could** this request go?*
 
-In a big system there isn't just one of each. Routing happens at many layers of the stack, with load balancers placed
-at key points to keep everything stable.
+In complex systems there isn’t just one of each. Routing occurs throughout the stack, with load balancers injected at key
+points to keep system-wide performance stable.
 
-The overall aim is to spread load evenly, but "12 requests, 3 replicas, 4 each" doesn't work. Requests aren't equal:
-if most prompts have 100 input tokens, a single 10,000-token prompt throws a naive split off balance. And some replicas
-are simply *better* for certain requests:
+Overall, you want to split load evenly across replicas. But the book warns it’s not as simple as “I have 3 replicas and
+12 requests, so let’s put 4 on each.” Two things break the naive split:
 
-- **KV cache-aware routing**: send the request to a replica that already has a matching prefix in its KV cache (see
-  [Caching](/learn/caching)).
-- **LoRA-aware routing**: send it to a replica that already has the right <Term def="A small add-on fine-tune that changes a model’s behavior. Replicas can keep several in memory and swap between them.">LoRA</Term> loaded.
+- **Requests aren’t equal.** Each request may have a different number of input tokens. If most requests have 100 input
+  tokens, one request with 10,000 will unbalance a simple system.
+- **Some replicas are better for some requests:**
+  - **KV cache-aware routing** sends a request to a replica that already has a matching prefix in its KV cache (see
+    [Caching](/learn/caching)), skipping prefill work.
+  - **LoRA-aware routing** sends a request to a replica that already has the desired
+    <Term def="A small add-on fine-tune that changes a model’s behavior. Replicas can keep several in memory and swap between them.">LoRA</Term>
+    fine-tuned weights in memory, instead of one that would have to load them.
 
-Smart routers use information from the inference engine and from orchestrators like **NVIDIA Dynamo** to route by
-sequence length, prefix, and LoRA.
+Intelligent request routing uses information from the inference engine and from orchestrators like **NVIDIA Dynamo** to
+route requests based on **sequence length, prefix, and LoRA needs**.
 
-Even perfect routing isn't enough when traffic exceeds capacity. Then you need a **queue**: somewhere to hold requests
-while new replicas start or existing ones free up.
+<Worked title="Why “4 requests each” goes wrong">
 
-- A standard queue is **first-in, first-out**.
-- A **priority queue** can do smarter things, like letting paying users skip ahead of free users when you're overloaded.
+1. Three replicas, twelve requests. Eleven have **100** input tokens; one has **10,000**.
+2. Total prefill work: 11 × 100 + 10,000 = **11,100 tokens**. A fair share is 3,700 tokens per replica.
+3. **Naive split (4 requests each):** the replica that gets the big request has 3 × 100 + 10,000 = **10,300 tokens**;
+   the other two have **400** each. One replica does 25× the work of its neighbors, and the three users stuck behind
+   the big request wait far longer than everyone else.
+4. **Token-aware split:** give the 10,000-token request a replica largely to itself and spread the eleven small ones
+   across the other two. Now no small request waits behind the giant one.
 
-One easy-to-miss detail: when new replicas come online, **make sure the queue actually sees them**, so waiting requests
-don't keep piling onto the old replicas. Each new replica should immediately take queued requests, up to its
-concurrency limit.
+</Worked>
+
+<Note kind="beyond">
+  **Common load-balancing strategies.** *Round robin* hands requests out in turn; it’s simple but blind to request size,
+  which is exactly the failure above. *Least outstanding requests* sends each request to the replica with the fewest in
+  flight, which adapts to slow replicas. *Power of two choices* picks two replicas at random and sends the request to
+  the less loaded one: nearly as good as checking every replica, at a fraction of the cost. *Consistent hashing* maps
+  something like a user or conversation ID to the same replica every time, the classic way to get cache affinity. Real
+  inference routers blend these: prefer a replica with the right prefix or LoRA, as long as it isn’t overloaded.
+</Note>
+
+Load balancing and routing are not enough. When the system receives **more traffic than it can handle**, it needs a way
+to hold onto requests while it scales up or waits for existing capacity to free up. The infrastructure primitive for
+this is a **queue**:
+
+- A standard queue is **first-in, first-out** for excess requests.
+- A more complex implementation, like a **priority queue**, can, for example, **give paid users priority over free
+  users** in high-traffic scenarios.
+
+One detail the book calls out: **as new replicas come online, make sure the queue sees them**, so requests don’t keep
+waiting for the existing replicas. **Each new replica should immediately be assigned up to its concurrency limit in
+queued traffic once it’s active.** Otherwise you’ve paid for a cold start and the new replica sits idle while users
+wait.
+
+<Note kind="beyond">
+  **Queues need limits too.** An unbounded queue during a huge spike just turns fast failures into slow failures:
+  requests wait minutes and then time out anyway. Production systems usually cap how long a request may wait, and when
+  the queue is too deep they reject new requests right away (commonly with an HTTP 429 “too many requests” response) so
+  clients can back off and retry, rather than piling on.
+</Note>
 
 <Analogy title="Think of it like a busy restaurant">
   The **load balancer** is the host looking at which sections have free tables. The **router** is the host remembering
   that *this* customer is a regular whose favorite waiter is in section B (the matching KV cache). The **queue** is the
-  waiting area by the door, and when a new section opens, the host must actually start seating people there.
+  waiting area by the door, maybe with a VIP line. And when a new section opens, the host must actually start seating
+  people there, immediately and up to its capacity.
 </Analogy>
 
 ## Scale to zero
 
-**Scale to zero** means that when there's no traffic at all, the system shuts down *every* replica, and then starts one
-automatically when a request arrives. It depends on two things:
+Advanced autoscaling systems implement **scale to zero**: the system scales down to **zero active replicas** when there
+is no traffic, then scales up automatically when traffic is received. It relies on two prerequisites:
 
-- **Fast cold starts**, because a real user might be waiting on that first request.
-- **Robust queueing**, to hold incoming requests until a replica is up.
+- **Fast cold starts**, because a user may be waiting live on that first request.
+- **Robust queueing**, to hold incoming requests until a replica is live.
 
-It isn't right for every workload. It's great for:
+Even with both, scale to zero isn’t a fit for every workload. It’s great for:
 
-- **Development**, where testing is bursty and nobody minds if the first request is slow.
-- **Production apps with predictable gaps**, like an internal agent only used during business hours in one country,
-  or an offline system that runs one batch job a day.
+- **Development**, when testing is bursty and latency on the first request is unimportant.
+- **Production apps that only get traffic periodically**, like an agent only used during business hours in one country,
+  or an offline system built for daily batch jobs.
+
+<Worked title="What scale to zero saves for a business-hours agent">
+
+1. An internal agent is used **9 hours a day, 5 days a week**: 45 hours out of the 168 hours in a week.
+2. Always on, one replica costs 168 hours of GPU time per week. Scaled to zero outside business hours, it costs about
+   **45 hours**, roughly **27%** of the always-on bill, a saving of about 73%.
+3. The price: the first user each morning waits through a cold start (or you schedule a warm-up just before the
+   workday starts).
+
+</Worked>
 
 <Note kind="warn">
-  If you're counting on scale to zero to keep costs down for a **latency-sensitive** app with **light, unpredictable**
-  traffic, that's a sign you're not ready for dedicated infrastructure yet. Stick with pay-per-token APIs until you have
-  more scale.
+  The book’s warning: if you’re relying on scale to zero to keep costs low for a **latency-sensitive** app that gets
+  **light, unscheduled** traffic, it’s probably a sign your AI application **isn’t ready for dedicated infrastructure
+  yet**, and should use pay-per-token APIs until greater scale is reached. Users of such an app would hit cold starts
+  constantly.
 </Note>
 
-## Scaling each component on its own
+## Scaling each component independently
 
-More and more AI products are **compound AI systems**: several models chained together to answer one request. The steps
-often need very different hardware. In a voice pipeline, for example:
+AI applications are increasingly **multi-model, multi-stage compound AI workloads**, where inference engineers
+coordinate several steps to fulfill a single request. Those steps can have very different hardware needs. The book’s
+voice example:
 
-- A **voice activity detector** (which spots when someone is speaking) needs only a small GPU.
-- The **transcription model** it feeds needs a much bigger one.
-- The **LLM** that reads the transcript may need a full node of several GPUs.
+- A **voice activity detector** needs a far less powerful GPU than the transcription model it chunks audio for.
+- The **transcription model** needs more.
+- The **LLM** that processes the transcript may need a full node with multiple GPUs.
 
-Their traffic patterns and scaling settings differ too. So the book recommends **independent component scaling**:
-split the autoscaling decisions and scale **each step on its own**, so every step gets the right hardware without
-bottlenecks or waste.
+The scaling parameters differ for each step too (concurrency targets, cold start times, traffic patterns). So you need to
+**decompose autoscaling decisions and scale each step individually**, right-sizing resources per step and avoiding both
+bottlenecks and overprovisioning. The book’s Figure 7.10 shows each model in the pipeline with its own hardware and its
+own scaling.
 
-But keep all of those models **in the same cluster**. Suppose a message takes 10 ms inside a cluster but 50 ms between
-clusters. That 40 ms difference, repeated across a 5-step pipeline, adds **200 ms**: 20% of a one-second latency budget,
-gone.
+But **every model in the pipeline should run in the same cluster.**
+
+<Worked title="Why pipelines stay in one cluster">
+
+1. Sending a message within a cluster takes **10 ms**; between clusters it takes **50 ms**. That’s **40 ms** extra per
+   hop.
+2. A **5-step** pipeline crosses clusters 5 times: 5 × 40 ms = **200 ms** added.
+3. Against a **one-second** latency SLA, 200 ms is **20%** of the entire budget, spent on nothing but network hops.
+
+</Worked>
 
 <KeyPoints>
-- Autoscaling keeps capacity matched to demand: enough to meet latency targets, no idle GPUs.
-- Kubernetes runs **replicas** in a **cluster** with a **control plane** (decisions) and **worker plane** (containers).
-- Scale on **traffic** (leading) *and* **utilization** (lagging). Tune min/max replicas, the window, the scale-down
-  delay, and the **concurrency target**.
-- **Continuous batching** swaps requests in token by token. The concurrency target should match the replica's batch size.
-- **Cold starts** = get GPU + load image + load weights + start engine. Shrink things, load weights from a nearby cache,
-  and cache compiled engines.
-- **Routers** pick the best replica, **load balancers** spread load, **queues** absorb overflow.
-- **Scale to zero** needs fast cold starts and good queueing. **Scale each pipeline step independently**, in one cluster.
+- Autoscaling keeps capacity matched to demand: enough to meet latency SLAs, no idle GPUs.
+- Kubernetes runs **replicas** (each on its own instance) in a **cluster** with a **control plane** (routing and scaling
+  decisions) and a **worker plane** (containers).
+- Scale on **traffic** (proactive) *and* **utilization** (lagging); they disagree when a few requests are huge.
+- Five knobs: min and max replicas, the window, the scale-down delay, and the **concurrency target**.
+  Requests in flight = arrival rate × time per request (Little’s law), divided by the target, gives replicas needed.
+- **Continuous batching** swaps requests in token by token. Pick the largest batch size that meets your SLA, and make
+  the concurrency target match it.
+- **Cold starts** = GPU procurement + image loading + weight loading + engine startup. Slow cold starts force
+  over-provisioning. Warm pools, smaller images, quantized weights, a nearby weight cache, and cached compiled engines
+  (on identical hardware and software) each attack one stage.
+- **Routers** pick the best replica (by prefix, LoRA, and sequence length), **load balancers** even out load, and
+  **queues** (FIFO or priority) absorb overflow. New replicas must pull from the queue immediately.
+- **Scale to zero** needs fast cold starts and robust queueing, and suits bursty or scheduled workloads.
+- **Scale each pipeline step independently**, but keep them all in one cluster.
 </KeyPoints>
 
 <Quiz questions={[
@@ -225,32 +434,72 @@ gone.
       "Utilization always overestimates demand"
     ],
     answer: 0,
-    why: "Traffic-based signals let you act as requests arrive; utilization only shows up afterwards. The book recommends combining both."
+    why: "Traffic-based signals let you act as requests arrive; utilization only shows up afterwards. The book recommends combining both, since utilization still catches the case where a few requests are much heavier than they look."
   },
   {
-    q: "Each replica runs with a batch size of 16. What should the autoscaler’s concurrency target be?",
-    options: ["1", "16", "It doesn’t matter"],
+    q: "Requests arrive at 30 per second, each takes 4 seconds, and the concurrency target is 20. How many replicas do you need just to keep up?",
+    options: ["2", "6", "120"],
     answer: 1,
-    why: "The concurrency target in the autoscaler and the batch size in the replica should match, so the autoscaler scales up exactly when replicas are full."
+    why: "Requests in flight = 30 × 4 = 120 (Little’s law). 120 ÷ 20 = 6 replicas, before adding any headroom for cold starts."
   },
   {
-    q: "Cold starts for your 400B-parameter model are slow, mostly spent loading weights from Hugging Face. What’s the best fix?",
+    q: "Each replica runs with a batch size of 16, but the autoscaler’s concurrency target is set to 32. What happens under load?",
+    options: [
+      "Nothing: the two numbers are unrelated",
+      "Requests queue inside replicas and latency rises, but the autoscaler doesn’t scale up because it thinks replicas still have room",
+      "The autoscaler adds too many replicas"
+    ],
+    answer: 1,
+    why: "The concurrency target and batch size should match. With the target too high, replicas are full long before the autoscaler notices, so users wait while capacity stays flat."
+  },
+  {
+    q: "Why do slow cold starts make autoscaling more expensive, not just slower?",
+    options: [
+      "Cold starts are billed at a higher rate",
+      "If you can’t scale up quickly, you can’t confidently scale down, so you keep extra replicas running as insurance",
+      "Slow cold starts use more GPU memory"
+    ],
+    answer: 1,
+    why: "The book’s point: cold start speed decides how aggressively you can remove replicas. Slow starts force over-provisioning to cover traffic that arrives while new replicas boot."
+  },
+  {
+    q: "Cold starts for your roughly 670 GB model are dominated by downloading weights from Hugging Face. What’s the best fix?",
     options: [
       "Bake the weights into the container image",
-      "Load the weights from a cache physically close to the GPUs, in the same datacenter",
+      "Load the weights from a cache physically close to the GPUs, in the same datacenter (and quantize if quality allows)",
       "Increase the scale-down delay"
     ],
     answer: 1,
-    why: "Huge models need gigabytes per second of bandwidth, which a nearby in-datacenter cache provides. Hugging Face is limited by their download speed, and weights now dwarf images."
+    why: "Huge models need gigabytes per second, which a nearby in-datacenter cache provides. Hugging Face is limited by egress speed, weights now dwarf images, and quantized weights are smaller and load faster."
   },
   {
-    q: "Why keep all models in a multi-step pipeline in the same cluster?",
+    q: "You cached a compiled TensorRT-LLM engine built on H100s with CUDA 12.4. Can you load it on B200 replicas to skip compilation?",
+    options: [
+      "Yes, cached engines are portable",
+      "No: a cached engine needs exactly the same GPU type, CUDA version, and software dependencies it was built with",
+      "Only if the model is quantized"
+    ],
+    answer: 1,
+    why: "Compilation targets the specific hardware and software environment. The cache only helps on identical setups, so you need a separate cached engine per GPU type and software stack."
+  },
+  {
+    q: "Three replicas, twelve requests: eleven with 100 input tokens and one with 10,000. Why is ‘four requests each’ a bad split?",
+    options: [
+      "Replicas can only take three requests at a time",
+      "The replica with the big request gets about 25 times the prefill work of the others, and the users sharing it wait much longer",
+      "It’s fine, because all requests are equal"
+    ],
+    answer: 1,
+    why: "Load is about work, not request count. The big request’s replica has 10,300 tokens of prefill versus 400 on each of the others, so a token-aware router should isolate it."
+  },
+  {
+    q: "Why keep all models in a five-step pipeline in the same cluster?",
     options: [
       "Kubernetes can’t scale models in different clusters",
-      "Cross-cluster hops add latency at every step, which quickly eats the latency budget",
+      "Cross-cluster hops add latency at every step: an extra 40 ms per hop across 5 steps is 200 ms, 20% of a one-second SLA",
       "It’s required for independent scaling"
     ],
     answer: 1,
-    why: "An extra 40 ms per hop across 5 steps is 200 ms, which is 20% of a one-second SLA."
+    why: "Scaling each step independently is still possible within one cluster, and it avoids paying the cross-cluster network penalty at every hop."
   }
 ]} />

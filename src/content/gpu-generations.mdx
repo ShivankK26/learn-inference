@@ -1,53 +1,83 @@
 import GpuPicker from "@/components/widgets/GpuPicker";
 
 <TLDR>
-  NVIDIA releases a new GPU **architecture** every year or two, named after a scientist: Hopper, Blackwell, Rubin. The
-  **letter** in a GPU's name (H100, B200) tells you the architecture, and each new one brings more speed plus new
-  inference features like lower-precision number formats. Most inference today runs on **Hopper and Blackwell**.
+  NVIDIA releases a new GPU **architecture** every one to two years, named after a scientist: Hopper, Blackwell, Rubin.
+  The **letter** in a GPU's name (H100, B200) is the architecture and matters a lot; the **number** is the model within
+  it. Each generation brings faster compute and memory **plus new inference features**, above all
+  **lower-precision number formats**: Hopper added FP8, Blackwell added FP4. Most inference today runs on **Lovelace,
+  Hopper, and Blackwell**, with Blackwell as the new gold standard.
 </TLDR>
 
-## Hardware moves slowly
+## Why GPU generations matter
 
-Designing a chip takes years. Between locking in a design
-(<Term def="The point where a chip design is finalized and sent off for manufacturing.">tapeout</Term>), testing it, and
-shipping it, there's a long lead time. So even brand-new GPUs were designed when AI looked very different from today.
-A good GPU architecture has to *predict* how people will use it over its lifetime.
+### Hardware moves slowly; AI moves fast
 
-For years, the main job of GPUs was **training**. Now that **inference** is becoming the dominant use, the latest
-architectures are adding inference-focused features.
+Hardware iteration cycles are slow. There are **years of lead time** between finalizing an architecture's design
+(<Term def="The moment a chip design is finalized and sent to be manufactured. After tapeout, the design can’t easily change.">tapeout</Term>),
+testing it, and shipping GPUs. Given how fast the AI industry moves, that means **even next-generation GPUs were
+designed when AI model capabilities looked nothing like they do today**. Designing an architecture with staying power
+requires foresight into how people will use it over its whole expected lifetime.
 
-## How to read a GPU's name
+For years, **training** was the primary use for GPUs. Now **inference** is becoming the dominant use case, and the
+latest architectures are adding **inference-focused features**. You'll see that shift across the generations below:
+lower precisions, more memory bandwidth, and, with Rubin, a separate chip just for prefill.
 
-Take **B200**:
+### How to read a GPU's name
 
-- The **letter** is the architecture generation (B = Blackwell). This part is very meaningful.
-- The **number** identifies a specific model within that generation. The numbers are a bit arbitrary, but **bigger
-  usually means larger, more powerful, and more expensive**.
+A name like **B200** has two parts:
 
-For example, the **H100** replaced the previous generation's **A100**. The **H200** is a bigger GPU in the same Hopper
-generation, and it was in turn surpassed by the **B200**.
+- The **letter** is the **architecture generation** used in the chip (B = Blackwell). This part is **very meaningful**.
+- The **number** identifies a specific model within the generation. The numbering is somewhat arbitrary (different
+  generations use different sets of numbers), but the general rule is **bigger number = larger, more powerful, more
+  expensive GPU**.
 
-## The family tree
+For example, the **H100** directly replaced the previous generation's **A100**. The **H200** is a larger GPU within the
+same Hopper generation, and it was in turn **supplanted by the B200**.
 
-NVIDIA has named its architectures after famous scientists since 1998. The book's timeline covers 2017 onwards:
+### The family tree
 
-| Year | Architecture | Named after | Example GPUs |
+Every one to two years, NVIDIA releases a new architecture that powers **all** of its products, from datacenter GPUs to
+personal computers. Each one improves **base speeds** (compute and memory) and adds **new features** for more
+efficient inference. Since 1998, NVIDIA has named its architectures after prominent scientists. The book's figure lists
+the names from 2017 through all announced future architectures:
+
+| Architecture | Named after | First released | Example GPUs |
 |---|---|---|---|
-| 2017 | Volta | Alessandro Volta | V100 |
-| 2018 | Turing | Alan Turing | T4 |
-| 2020 | Ampere | André-Marie Ampère | A10, A100 |
-| 2022 | Hopper | Grace Hopper | H100, H200 |
-| 2022 | Ada Lovelace | Ada Lovelace | L4, L40 |
-| 2024 | Blackwell | David Blackwell | B200, B300 |
-| 2026 | Rubin | Vera Rubin | (upcoming) |
-| 2028 | Feynman | Richard Feynman | (announced) |
+| Volta | Alessandro Volta | 2017 | V100 |
+| Turing | Alan Turing | 2018 | T4 |
+| Ampere | André-Marie Ampère | 2020 | A10, A100 |
+| Hopper | Rear Admiral Grace Hopper | March 2022 | H100, H200 |
+| Ada Lovelace | Ada Lovelace, the first computer programmer | ~6 months after Hopper | L4, L40 |
+| Blackwell | David Blackwell, mathematician | November 2024 | B200, B300 |
+| Rubin | Vera Rubin, astronomer | 2026 | (upcoming) |
+| Feynman | (Richard Feynman) | 2028 | (announced) |
 
-Inference engineers usually work with the **three to five most recent generations**. Even for cost-sensitive work, newer
-GPUs are often *cheaper* at scale because they're so much more efficient. You'll still bump into **Turing (T4)** and
-**Ampere (A10, A100)** in older or low-traffic systems, but most deployments today use **Lovelace, Hopper, or
-Blackwell**.
+<Note kind="beyond">
+  The book’s figure gives the architecture names; its text gives the Hopper, Lovelace, Blackwell, Rubin, and Feynman
+  details and the T4, A10, and A100 examples. The first-release years for Volta, Turing, and Ampere, the V100 example,
+  and the namesakes for Volta, Turing, Ampere, and Feynman are added here from NVIDIA’s public history.
+</Note>
 
-Compare the current lineup yourself. These are the numbers from the book's spec tables:
+### Which generations actually matter
+
+GPU architectures go back decades, but inference engineers generally work within the **three to five most recent
+generations**. Two reasons:
+
+1. Newer architectures offer **better performance**, obviously.
+2. Less obviously, even for **cost-sensitive** workloads, modern architectures' efficiency often makes them **more
+   cost-effective** at large scale. An old GPU is cheaper per hour, but if a new one serves several times more
+   requests per hour, it's cheaper per request.
+
+You may still see **Turing (T4)** and **Ampere (A10, A100)** GPUs in low-traffic or legacy systems. But most
+deployments today use:
+
+- **Lovelace (L4, L40)**: low-cost inference on small models.
+- **Hopper (H100, H200)** and **Blackwell (B200, B300)**: low-precision Tensor Cores, high-bandwidth memory, and
+  inference-focused features. The mainstream of serious inference.
+
+The upcoming **Rubin (2026)** and **Feynman (2028)** architectures promise even more.
+
+Compare the current lineup yourself, using the numbers from the book's spec tables:
 
 <GpuPicker />
 
@@ -58,19 +88,67 @@ Compare the current lineup yourself. These are the numbers from the book's spec 
 | H100 | 1,979 teraFLOPS | 80 GB | 3.35 TB/s |
 | H200 | 1,979 teraFLOPS | 141 GB | 4.8 TB/s |
 
-Named after Rear Admiral **Grace Hopper**, Hopper launched in **March 2022** with the H100. What it brought:
+Named for Rear Admiral **Grace Hopper**, Hopper first shipped in **March 2022** with the H100. Notice the two GPUs have
+**identical compute**; the H200's upgrade is entirely **memory**: 76% more capacity and 43% more bandwidth. That makes
+it the better decode GPU, as the <a href="/learn/gpu-anatomy">previous lesson</a> worked out.
 
-- **FP8 support**: an 8-bit number format. FP8 Tensor Cores are **twice as fast** as FP16 ones, and moving FP8 numbers
-  takes **half the memory bandwidth**. This doesn't mean everything runs exactly 2× faster (the quantization lesson in
-  Chapter 5 explains why), but it's a big win for workloads that can use FP8.
-- **Fourth-generation Tensor Cores** inside more, faster Streaming Multiprocessors.
-- New tools for kernel writers: dynamic programming instructions, thread block clusters, and distributed shared memory.
-- **Asynchronous** data movement and execution, meaning the GPU can load the next chunk of data while it's still
-  crunching the current one. **FlashAttention 3** uses this to speed up attention on Hopper.
+### What Hopper introduced
 
-The H100 and H200 are among the **most widely used inference GPUs**, and for good reason: new enough to be fast,
-established enough to have industry-wide support and highly tuned kernels, and right-sized for common workloads of
-every kind.
+**FP8.** Hopper introduced support for **FP8**, a floating-point number format with 8 bits of precision. Two effects:
+
+- **FP8 Tensor Cores are twice as fast as FP16 Tensor Cores.** (That's the precision-halving rule from the last
+  lesson, built into the hardware.) This helps compute-bound work like <Compute>prefill</Compute>.
+- **Moving FP8 values takes half as much memory bandwidth.** This helps memory-bound work like <Memory>decode</Memory>.
+
+But the book is careful: this **does not linearly translate to double the performance**. For workloads that can run in
+FP8 it's a significant gain, just not a clean 2×. The <a href="/learn/quantization">quantization lesson</a> explains
+in full; here's the intuition.
+
+<Worked title="Why FP8 weights don’t make decode 2× faster">
+
+Take an 8B model serving a batch of **32 users**, each with a **4,000-token** conversation, on one GPU. Each decode
+step reads all the weights **plus** every user's KV cache.
+
+1. **Everything in 16-bit:** weights = 16 GB. KV cache ≈ 32 users × 4,000 tokens × 128 KB per token ≈ **16 GB**.
+   Total read per step ≈ **32 GB**.
+2. **Weights in FP8, KV cache still 16-bit:** weights = 8 GB, KV cache still ≈ 16 GB. Total ≈ **24 GB**.
+3. Speedup = 32 ÷ 24 ≈ **1.33×**, not 2×, because only part of the traffic got smaller.
+
+(The 128 KB-per-token KV figure is the Llama 3 8B estimate from the <a href="/learn/gpu-anatomy">GPU anatomy
+lesson</a>.) Some parts of a model are also kept at higher precision on purpose, for quality.
+
+</Worked>
+
+**Faster building blocks.** Hopper has **fourth-generation Tensor Cores** inside **more, faster Streaming
+Multiprocessors** than previous generations.
+
+**New tools for kernel writers.** Hopper added **dynamic programming instructions**, **thread block clusters**, and
+**distributed shared memory**. These give CUDA engineers (Chapter 4) more ways to write high-performance kernels.
+
+**Asynchronous execution.** Hopper can move data and run computation **at the same time**, instead of alternating
+between "load" and "compute." **FlashAttention 3** is built around these asynchronous data transfer and execution
+features, improving the speed and memory efficiency of attention on Hopper GPUs.
+
+<Note kind="beyond">
+  What these features mean in practice:
+
+  - **Thread block clusters** let a group of SMs cooperate on one piece of work, and **distributed shared memory** lets
+    those SMs read each other’s fast on-chip memory directly instead of going through the slower L2 or VRAM.
+  - The asynchronous copies are done by a dedicated hardware unit, the **Tensor Memory Accelerator (TMA)**, which moves
+    tiles of data between VRAM and shared memory while the Tensor Cores keep computing.
+  - **Dynamic programming (DPX) instructions** speed up a class of algorithms used in areas like genomics and route
+    planning. They matter little for model inference.
+  - FlashAttention 3 uses TMA and assigns different groups of threads to “loading” and “computing,” so the matrix math
+    and the softmax overlap instead of waiting on each other. It also adds FP8 attention.
+</Note>
+
+### Why Hopper is the industry workhorse
+
+The H100 and H200 are among the **most widely used inference accelerators**, and the book gives three reasons:
+
+1. **New enough to be performant.**
+2. **Established enough** for industry-wide software support and highly optimized kernels.
+3. **Right-sized** for common workloads across **all modalities**: 80–141 GB fits a very wide range of models.
 
 ## Ada Lovelace (L4, L40)
 
@@ -79,16 +157,44 @@ every kind.
 | L4 | 242 teraFLOPS | 24 GB | 300 GB/s |
 | L40 | 362 teraFLOPS | 48 GB | 864 GB/s |
 
-Named after **Ada Lovelace**, the first computer programmer, this architecture arrived just **six months after
-Hopper**. It's more of a sibling than a successor: it also supports FP8, but it's aimed more at **graphics** than AI.
+Named for **Ada Lovelace**, the first computer programmer, this architecture was first released just **six months
+after Hopper**. The two are similar, and Lovelace is more of a **counterpart than a successor**. It also supports FP8.
+The difference is focus: Hopper is aimed at **AI**, Lovelace at **graphics**.
 
-Its big limitation: **no NVLink**, the high-speed GPU-to-GPU connection. Eight-GPU Hopper and Blackwell machines rely on
-NVLink to split big models across GPUs efficiently. Lovelace GPUs have to work alone, or use slower methods like
-<Term def="Splitting a model’s layers across GPUs in sequence, like an assembly line. Less efficient than other ways of splitting.">pipeline parallelism</Term>.
+### The big limitation: no NVLink
 
-- **L4**: a cheap, convenient way to run **small models**, like text embeddings and computer vision.
-- **L40**: generally **not a great choice** for inference. For the same amount of memory, a *slice* of an H100 (see
-  <a href="/learn/instances">MIG in the next lesson</a>) gives you much more compute and bandwidth.
+**Lovelace GPUs do not support NVLink**, the high-bandwidth GPU-to-GPU interconnect (details in the
+<a href="/learn/instances">instances lesson</a>). The book calls this a **major limitation**. Nodes of eight Hopper or
+Blackwell GPUs use NVLink for efficient parallelism, splitting one model across GPUs that exchange data constantly.
+Lovelace GPUs must either be used **individually**, or combined with **inefficient** methods like
+<Term def="Splitting a model’s layers into stages on different GPUs, like an assembly line. It needs little communication, but some GPUs sit idle waiting for others.">Pipeline Parallelism</Term>.
+
+### When to use them (and when not)
+
+- **L4**: a cheap and convenient way to run **small models** in modalities like **text embeddings** and **computer
+  vision**. Look at its numbers: 24 GB is plenty for a small model, and 300 GB/s of bandwidth is fine when the model
+  is tiny.
+- **L40**: generally **not a great choice** for inference. For the same memory footprint, a **multi-instance GPU**
+  slice of an H100 (<a href="/learn/instances">MIG</a>) offers much higher compute and memory bandwidth.
+
+<Worked title="An L40 vs. a 3-slice H100 MIG instance">
+
+The book's MIG example: a 3-slice H100 instance gets about **3/7 of the compute** and up to **half the VRAM (40 GB)**.
+
+1. **Compute:** 3/7 × 1,979 ≈ **848 teraFLOPS** of FP8, vs. the L40's **362**: about **2.3×** more.
+2. **Memory:** 40 GB vs. the L40's 48 GB: similar.
+3. **Bandwidth:** if the slice gets half the H100's memory system, that's about 3.35 ÷ 2 ≈ **1.7 TB/s**, vs. the L40's
+   **0.864 TB/s**: about **2×** more.
+
+Roughly the same memory, but more than double the compute and bandwidth. That's the book's point.
+
+</Worked>
+
+<Note kind="beyond">
+  The bandwidth estimate assumes MIG splits memory bandwidth along with memory capacity. It does: each MIG instance gets
+  dedicated memory slices that come with their own share of the memory controllers and L2 cache, so its bandwidth is
+  roughly proportional to its memory slices.
+</Note>
 
 ## Blackwell (B200, B300)
 
@@ -97,60 +203,121 @@ NVLink to split big models across GPUs efficiently. Lovelace GPUs have to work a
 | B200 | ~5 petaFLOPS | 192 GB | Up to 8 TB/s |
 | B300 | ~5 petaFLOPS | 288 GB | Up to 8 TB/s |
 
-Named after mathematician **David Blackwell**, Blackwell launched in **November 2024** with the B200, followed by the
-B300. (A B100 exists, but it's rare for inference.)
+Named for mathematician **David Blackwell**, the architecture first shipped in **November 2024** with the **B200**,
+followed by the **B300**. (A **B100** exists, but it's not common for inference.)
 
-- Where Hopper added FP8, Blackwell goes further with **FP4** (4-bit numbers) plus
-  <Term def="Number formats that store small groups of values with a shared scale factor, to keep more accuracy at very low precision.">microscaling formats</Term>
-  (**MXFP8, MXFP4, NVFP4**) that preserve quality better at low precision. Chapter 5 covers these.
-- More asynchronous features for moving data between memory and the Tensor Cores. **FlashAttention 4** leans heavily on
-  them, splitting loads, math, and writes into overlapping pipelines.
+### What Blackwell introduced
 
-The B200 and B300 are the **new gold standard**: the best performance for large language models and heavy workloads
-like video generation. Software support, optimized kernels, and availability have only recently caught up, which marks
-a big transition in the industry.
+**FP4 and microscaling formats.** Where Hopper introduced FP8, Blackwell goes further with **FP4**, a 4-bit
+floating-point format, plus a set of
+<Term def="Low-precision formats where each small block of values (e.g. every 16 or 32 numbers) shares its own scale factor, which keeps much more accuracy than one scale for the whole matrix.">microscaling formats</Term>
+(**MXFP8, MXFP4, NVFP4**) designed to **retain quality** during inference at these very low precisions. By the
+precision-halving rule, FP4 roughly doubles compute again over FP8 and halves the bytes moved. The
+<a href="/learn/quantization">quantization lesson</a> explains how these formats work.
+
+**More asynchronous programming.** Blackwell builds on Hopper's asynchronous paradigm with **more features for loading
+and storing between tensor memory and global memory**. The updated **FlashAttention 4** kernel relies heavily on this,
+**tiling** its loads, computations, and writes into **asynchronous pipelines** so that all three happen at once.
+
+### The new gold standard
+
+The book calls the B200 and B300 **the new gold standard for inference**: the highest performance for large language
+models and demanding workloads like **video generation**. Just as important for adoption, **software support,
+optimized kernels, and general availability** for Blackwell have all come online recently, which the book describes as
+an important transition for the whole inference industry. (Remember why Hopper became the workhorse: hardware only
+pays off once the software catches up.)
+
+<Worked title="One generation’s jump: H100 → B200">
+
+Using the book's tables:
+
+1. **Compute:** 1,979 → ~5,000 teraFLOPS FP8: about **2.5×**. With FP4 (roughly 2× FP8 by the halving rule), the B200
+   reaches roughly **10 petaFLOPS**, about **5×** an H100 running FP8.
+2. **Memory:** 80 → 192 GB: **2.4×**. A 70B model in FP8 (70 GB, wanting 105 GB with headroom) is too tight on an H100
+   but fits comfortably on one B200.
+3. **Bandwidth:** 3.35 → 8 TB/s: **2.4×**. The single-user decode ceiling for that 70B FP8 model rises from
+   3,350 ÷ 70 ≈ **48** to 8,000 ÷ 70 ≈ **114 tokens per second**.
+
+</Worked>
 
 ## Rubin and Feynman: what's next
 
-**Rubin**, named for astronomer **Vera Rubin**, launches in **2026**. A word of caution from the book: **don't judge a
-new architecture until you can benchmark it on real workloads.** It typically takes about a year after launch for the
-software ecosystem to fully catch up.
+**Rubin**, named for astronomer **Vera Rubin**, launches in **2026** as NVIDIA's next-generation architecture.
 
-What's known so far:
+Before the details, the book's most durable piece of advice about new hardware: **reserve judgment until you can run
+real-world performance benchmarks.** New architecture rollouts, followed by industry-wide software support, take **a
+year or so to fully saturate**. Launch-day spec sheets describe what the silicon can do, not what your workload will
+actually get from it in its first months.
 
-- Rubin uses **HBM4** memory, an upgrade from the HBM3 and HBM3e of recent generations. Memory-bound work like
-  <Memory>LLM decode</Memory> will benefit directly.
-- Rubin introduces the **CPX**, a separate chip built for compute-bound work like <Compute>LLM prefill</Compute>. It
-  will be part of NVIDIA's rack-scale systems for high-volume inference. (This matches the idea of splitting prefill and
-  decode onto different hardware, called *disaggregation*, in Chapter 5.)
+What was concrete at the time of the book's publication:
 
-After Rubin comes **Feynman** in **2028**. Little is known yet, but expect bigger, more powerful chips with faster memory.
+- **HBM4 memory.** Rubin upgrades from the HBM3 and HBM3e that powered the last few generations. Tasks bound by memory
+  bandwidth, like <Memory>LLM decode</Memory>, benefit directly from higher-throughput VRAM.
+- **The Rubin CPX.** A **separate chip** built for **compute-bound** tasks like <Compute>LLM prefill</Compute>. It will
+  be part of NVIDIA's **rack-scale systems** for high-volume inference.
+
+Put those two together and you can see the inference focus: one part of the system is tuned for memory-bound decode,
+another for compute-bound prefill. That's the hardware version of **disaggregation**, splitting prefill and decode onto
+different workers, covered in the <a href="/learn/disaggregation">disaggregation lesson</a>.
+
+After Rubin comes **Feynman** in **2028**. Few details are known, but it's likely to support **larger and more
+powerful chips** with a **faster memory architecture**.
 
 ## Grace and Vera: NVIDIA's CPUs
 
-NVIDIA also makes its own ARM-based CPUs and pairs them with GPUs on **superchips** like the **GH200** and **GB200**.
-The "G" stands for **Grace** (as in Grace Hopper).
+NVIDIA also makes its own **ARM-based CPUs**, integrated with its GPUs on **superchips** like the **GH200** and
+**GB200**. The "G" stands for **Grace**, as in Grace Hopper, to match the Hopper GPUs.
 
-Grace CPUs are strong overall, but what matters for inference is their **much faster connection to the GPU**: NVLink
-Chip-to-Chip gives up to **900 GB/s** (both directions combined) between CPU memory and GPU memory. That's several times
-faster than
-<Term def="The standard connection between a CPU and add-in cards like GPUs in ordinary servers.">PCIe</Term>, the usual
-CPU-to-GPU link. The book's diagram shows this: an ordinary CPU talks to the GPU through a narrow pipe, while Grace gets
-a much wider one.
+Grace CPUs have strong overall compute, but that's not why they matter for inference. What matters is their **much
+higher-bandwidth connection between the CPU and the GPU**. Grace uses **NVIDIA NVLink Chip-to-Chip (C2C)** for up to
+**900 GB/s bidirectional** bandwidth between CPU memory and GPU memory. The book's Figure 3.3 contrasts the two: a
+standard CPU talks to the GPU through a narrow pipe, a Grace CPU through a far wider one. This CPU-to-GPU link is
+**several times faster than PCIe** or other standard connections.
 
-Why care? Some setups **offload** data to CPU memory, which is far larger than GPU memory: things like
-<Term def="Small fine-tune add-ons that change a model’s behavior.">LoRA</Term> weights or KV caches from earlier
-requests. With Grace, fetching them back is much faster.
+### Why the CPU-to-GPU link matters
 
-For Rubin systems, the **Vera** CPU (also named for Vera Rubin) replaces Grace.
+CPU memory is **far larger** than GPU memory. Some inference setups **offload** important data there:
+
+- **LoRA fine-tune weights**, so one GPU can switch between many fine-tuned variants of a model.
+- **KV caches from previous inference calls**, so a returning conversation doesn't have to redo its prefill (the
+  <a href="/learn/caching">caching lesson</a> covers this in depth).
+
+Offloading only helps if fetching the data back is fast. With Grace, it is.
+
+<Worked title="Fetching a 2 GB KV cache back to the GPU">
+
+A long conversation's saved KV cache might be around 2 GB. Moving it from CPU memory to GPU memory:
+
+1. **Over PCIe Gen5** (about 64 GB/s each way): 2 ÷ 64 ≈ **31 milliseconds**.
+2. **Over NVLink-C2C** (900 GB/s total, about 450 GB/s each way): 2 ÷ 450 ≈ **4.4 milliseconds**.
+
+About **7× faster**, which is the difference between offloading being a clear win and being a noticeable delay on
+time to first token.
+
+</Worked>
+
+<Note kind="beyond">
+  The PCIe Gen5 figure (a standard x16 slot moves about 64 GB/s in each direction) isn’t in the book, which only says
+  C2C is “several times faster.” Also, a GB200 superchip pairs **one** Grace CPU with **two** Blackwell GPUs, which is
+  why the NVL72 rack in the next lesson has 72 GPUs but only 36 CPUs.
+</Note>
+
+For the Rubin architecture, the **Vera CPU**, also named for Vera Rubin, **replaces Grace**.
 
 <KeyPoints>
-- GPU name = **architecture letter** + **model number** (bigger number, bigger GPU).
-- Most inference today: **Lovelace (L4, L40)**, **Hopper (H100, H200)**, **Blackwell (B200, B300)**.
-- **Hopper** added **FP8** and async features (FlashAttention 3). It's the workhorse of the industry.
-- **Lovelace** has **no NVLink**. The L4 is good for small models, and the L40 is usually a poor pick.
-- **Blackwell** adds **FP4** and microscaling formats. It's the new gold standard.
-- **Rubin** (2026) brings **HBM4** and the prefill-focused **CPX**. **Grace/Vera** CPUs have a 900 GB/s link to the GPU.
+- GPU name = **architecture letter** (very meaningful) + **model number** (bigger = larger, more powerful, pricier).
+  H100 replaced A100; H200 is a bigger Hopper; B200 supplanted it.
+- New architecture every **1–2 years**, named after scientists; work within the **3–5 newest**. Newer is often cheaper
+  per request, even though it costs more per hour.
+- **Hopper** (H100/H200): **FP8** (2× compute, half the bytes, but not a clean 2× speedup), 4th-gen Tensor Cores,
+  async features (FlashAttention 3). The workhorse: fast, mature, right-sized. H200 = H100 compute + more memory.
+- **Lovelace** (L4/L40): FP8 but **no NVLink**. L4 for small models; L40 usually beaten by an H100 MIG slice.
+- **Blackwell** (B200/B300): **FP4** + **MXFP8/MXFP4/NVFP4**, more async features (FlashAttention 4). The **new gold
+  standard**.
+- **Rubin** (2026): **HBM4** for decode, **CPX** chip for prefill. **Feynman** (2028). Judge new hardware only by real
+  benchmarks; software takes about a year to catch up.
+- **Grace/Vera** CPUs: **NVLink-C2C at 900 GB/s** to the GPU, several times PCIe, which makes offloading LoRAs and KV
+  caches to CPU memory practical.
 </KeyPoints>
 
 <Quiz questions={[
@@ -158,24 +325,68 @@ For Rubin systems, the **Vera** CPU (also named for Vera Rubin) replaces Grace.
     q: "What does the letter in ‘H200’ tell you?",
     options: ["Its memory size", "Its architecture generation (Hopper)", "That it’s a high-end model"],
     answer: 1,
-    why: "The letter is the architecture (H = Hopper, B = Blackwell). The number identifies the model within that generation."
+    why: "The letter is the architecture (H = Hopper, B = Blackwell). The number identifies the model within that generation, with bigger numbers usually meaning bigger GPUs."
   },
   {
-    q: "Why are Ada Lovelace GPUs a poor fit for splitting a big model across 8 GPUs?",
-    options: ["They don’t support FP8", "They lack NVLink, the high-speed GPU-to-GPU connection", "They have too much memory"],
+    q: "The H100 and H200 have identical FP8 compute. For which workload does the H200 pull clearly ahead?",
+    options: ["Compute-bound prefill of long prompts", "Memory-bound decode, and models that need more VRAM", "Neither; they perform the same"],
     answer: 1,
-    why: "Without NVLink, Lovelace GPUs must run alone or use slow methods like pipeline parallelism."
+    why: "The H200’s upgrade is all memory: 141 GB vs. 80 GB and 4.8 vs. 3.35 TB/s. Decode is bandwidth-bound, so it gets faster; compute-bound prefill barely changes."
   },
   {
-    q: "Which new low-precision number format did Blackwell introduce?",
-    options: ["FP8", "FP4 (plus microscaling formats)", "FP32"],
+    q: "Hopper’s FP8 Tensor Cores are 2× as fast as FP16, and FP8 values use half the bandwidth. Why doesn’t switching to FP8 weights make decode exactly 2× faster?",
+    options: [
+      "FP8 is less accurate",
+      "Other traffic, like the KV cache, may still be in higher precision, so total bytes moved don’t halve",
+      "The GPU can’t read FP8 from memory"
+    ],
     answer: 1,
-    why: "Hopper introduced FP8; Blackwell added FP4 and the MXFP8, MXFP4, and NVFP4 microscaling formats."
+    why: "Only the part of the work that changed gets faster. If the KV cache stays 16-bit, total bytes per step fall by less than half, so the speedup is less than 2×."
+  },
+  {
+    q: "Why does the book call Ada Lovelace’s lack of NVLink a major limitation?",
+    options: [
+      "It can’t run FP8",
+      "Without it, Lovelace GPUs must run alone or use inefficient methods like pipeline parallelism instead of splitting models efficiently across a node",
+      "It has too little memory"
+    ],
+    answer: 1,
+    why: "Eight-GPU Hopper and Blackwell nodes rely on NVLink for efficient parallelism. Lovelace GPUs can’t, so big models can’t be split across them efficiently."
+  },
+  {
+    q: "You need about 40 GB of memory for a small model. Why does the book prefer a 3-slice H100 MIG instance over an L40?",
+    options: [
+      "The L40 doesn’t support FP8",
+      "For similar memory, the MIG slice has roughly 2× the compute and bandwidth",
+      "MIG instances are free"
+    ],
+    answer: 1,
+    why: "3/7 of an H100 is ~848 FP8 teraFLOPS vs. the L40’s 362, and about half the H100’s 3.35 TB/s vs. the L40’s 0.864 TB/s, with similar memory."
+  },
+  {
+    q: "Rubin launches with impressive spec sheets. According to the book, when should you trust its performance for your workload?",
+    options: [
+      "Immediately, since specs don’t lie",
+      "Once you can run real-world benchmarks; software support typically takes about a year to saturate",
+      "Only after Feynman ships"
+    ],
+    answer: 1,
+    why: "New architectures need the software ecosystem (kernels, engines) to catch up, which takes around a year. Reserve judgment until you can benchmark real workloads."
   },
   {
     q: "What is the Rubin CPX designed for?",
     options: ["Memory-bound decode", "Compute-bound work like LLM prefill", "Running on phones"],
     answer: 1,
-    why: "The CPX is a separate chip for compute-heavy prefill, while Rubin’s HBM4 memory helps memory-bound decode."
+    why: "The CPX is a separate chip for compute-heavy prefill, while Rubin’s HBM4 memory helps memory-bound decode: hardware built around the two phases of inference."
+  },
+  {
+    q: "Why does a Grace CPU help with offloading KV caches and LoRA weights?",
+    options: [
+      "It has more cores than other CPUs",
+      "Its NVLink-C2C link to the GPU (up to 900 GB/s) is several times faster than PCIe, so offloaded data comes back quickly",
+      "It runs the model instead of the GPU"
+    ],
+    answer: 1,
+    why: "CPU memory is much larger than VRAM, but offloading only pays off if retrieval is fast. Grace’s high-bandwidth chip-to-chip link makes it fast."
   }
 ]} />

@@ -134,6 +134,10 @@ cite {
   margin-top: 2.2em;
   letter-spacing: -0.012em;
 }
+.prose h2,
+.prose h3 {
+  scroll-margin-top: 5rem;
+}
 .prose h2 + * {
   margin-top: 0.7em;
 }

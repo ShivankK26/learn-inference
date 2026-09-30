@@ -171,6 +171,17 @@ export default function SpecDecode() {
         </div>
       </div>
 
+      <div className="mt-4 rounded-lg bg-bg-soft px-4 py-3 text-[13px] leading-relaxed text-ink-soft tabular-nums">
+        <div>
+          Expected tokens per pass = (1 − α<sup>k+1</sup>) ÷ (1 − α) = (1 − {p.toFixed(2)}
+          <sup>{k + 1}</sup>) ÷ {(1 - p).toFixed(2)} = <b className="text-ink">{expectedTokens(k, p).toFixed(2)}</b>
+        </div>
+        <div>
+          Speedup = tokens per pass ÷ (1 + k × (draft cost + verify cost)) = {expectedTokens(k, p).toFixed(2)} ÷ (1 + {k} × (
+          {cost.toFixed(2)} + {verifyCost.toFixed(2)})) = <b className="text-ink">{speedup(k).toFixed(2)}×</b>
+        </div>
+      </div>
+
       <div className="mt-4 flex justify-end gap-2">
         <button onClick={reset} className="rounded-lg border border-line px-3 py-1.5 text-sm hover:border-accent">Reset</button>
         <button onClick={step} disabled={done} className="rounded-lg bg-accent px-4 py-1.5 text-sm font-medium text-bg hover:opacity-90 disabled:opacity-40">

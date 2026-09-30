@@ -1,12 +1,13 @@
 import GuidanceSkip from "@/components/widgets/GuidanceSkip";
 import SelectiveQuant from "@/components/widgets/SelectiveQuant";
 import ContextParallel from "@/components/widgets/ContextParallel";
+import VideoAttentionCost from "@/components/widgets/VideoAttentionCost";
 
 <TLDR>
   Image and video models are **compute-bound pipelines**, not LLMs, so the playbook changes: pick the **right kernels**,
-  **fuse** the small ones, use **FP8** for more FLOPS, and use clever shortcuts like **skipping guidance** in later steps.
-  Video is the hardest modality of all: **attention is 70–80% of the work**, and eight GPUs team up on **one video at a
-  time**.
+  **fuse** the small ones, use **FP8** for twice the FLOPS, and use clever shortcuts like **skipping guidance** in later
+  steps. Video is the hardest modality of all: **attention is 70–80% of the work**, eight GPUs team up on **one video at
+  a time**, and the only way to make it cheaper is to make the model itself faster.
 </TLDR>
 
 <Note kind="tip">
@@ -16,177 +17,392 @@ import ContextParallel from "@/components/widgets/ContextParallel";
 
 ## Why images aren’t like LLMs
 
-Image generation models can take a text prompt and sometimes reference images, and they produce new images (the
-book’s figure shows both inputs). Working with them differs from LLMs in several ways:
+Image generation models can take a text prompt and sometimes **reference images**, and they produce new images. The
+book’s figure shows both kinds of input feeding one model. The book says working with image and video models is
+**entirely different** from working with LLMs on several axes:
 
-- **Architecture.** A few newer models (like HunyuanImage-3.0) look like LLMs, but most are **iterative denoisers**:
-  pipelines of several small models working in latent space, not one uniform decoder.
-- **Tooling.** LLM-style engines for images are brand new (**SGLang Diffusion** and **vLLM Omni** had only just
-  appeared when the book was written). Most image and video inference is built **lower in the stack**, directly on
-  PyTorch or TensorRT.
-- **Constraints.** Image models are **10–20× smaller** than frontier LLMs, and they’re limited by <Compute>compute</Compute>,
-  not memory bandwidth (see [Finding the bottleneck](/learn/bottlenecks)).
-- **Trade-offs.** Most importantly, image and video models offer **more direct quality-versus-speed dials**.
+1. **Architecture.** A few recent models, like **HunyuanImage-3.0**, more closely resemble LLMs. But most image and
+   video models are **iterative denoisers**, not autoregressive token generators. They’re **pipelines of multiple
+   small models** (text encoder, denoiser, VAE) working together in latent space, rather than the single uniform
+   decoder of an LLM.
+2. **Tooling.** Because the architecture differs, so do the tools. When the book was written, **SGLang Diffusion** and
+   **vLLM Omni** were brand new. Most image and video inference is implemented **lower in the stack**, working
+   directly with **PyTorch or TensorRT**.
+3. **Constraints.** Image generation models are **ten to twenty times smaller** than frontier language models, and
+   inference is constrained by <Compute>compute</Compute>, **not** memory bandwidth (see
+   [Finding the bottleneck](/learn/bottlenecks)).
+4. **Trade-offs.** Perhaps the most significant difference: image and video models offer **more direct
+   quality-to-speed trade-offs**, such as the number of steps, the resolution, or the guidance tricks later in this
+   lesson.
 
-That last point comes with a catch: **image quality is hard to measure automatically.** Using a VLM to judge images
-gives a rough signal at best, and it can disagree with what people like. The human eye is mysterious, so most
-image-quality benchmarks come from asking **people to pick between thousands of images** and aggregating their
-preferences.
+<Note kind="beyond">
+  Why compute-bound? An LLM decode step does a tiny bit of math per weight it loads (one token’s worth), so it waits on
+  memory. A denoising step pushes **thousands of latent tokens** through every weight at once, like a giant prefill,
+  so it does a lot of math per byte loaded. On the roofline chart it sits far to the right, under the flat compute
+  ceiling.
+</Note>
+
+### Measuring quality is hard
+
+That last point, direct quality-to-speed trade-offs, comes with a catch: you need to know when you’ve traded away too
+much quality, and **image quality is difficult to evaluate programmatically**. The book is blunt:
+
+- **Automatic pipelines using vision language models** (asking a VLM to grade the images) give **directional signal at
+  best**, and may **diverge from human preferences**.
+- The human eye is mysterious, so most image quality evaluations work by **asking humans to pick among thousands of
+  images**, then aggregating those preferences into quality benchmarks.
+
+<Note kind="beyond">
+  This is the same head-to-head idea as **Elo ratings** in [Choosing a model](/learn/choosing-a-model): show people two
+  images from the same prompt, ask which is better, and rank models by their win rates. For your own optimizations, a
+  practical version is to show reviewers the original model’s image and the optimized model’s image side by side and
+  check they can’t reliably tell them apart.
+</Note>
 
 ## Kernel optimization for image models
 
-The example code on an image model’s page usually uses the **Diffusers** library with **very few optimizations**. In
-fact, even though image generation is *theoretically* compute-bound, you often need memory-efficient kernels and
-[kernel fusion](/learn/cuda-and-kernels) just to *reach* that compute limit. Before that, the GPU is wasting time on
-memory traffic.
+When you read the model card for an image generation model, the inference examples generally use the **Diffusers**
+library with **very few optimizations**. That code is written to be correct and readable, not fast.
 
-High-performance image inference uses one of three routes:
+The book makes a subtle point here: while image generation is *theoretically* compute-bound, you often need to
+**select memory-efficient kernels and use kernel fusion just to reach that bottleneck**. In an unoptimized pipeline,
+the GPU spends much of its time shuttling data between small operations, so it isn’t compute-bound yet. It’s wasting
+time on memory traffic.
+
+<Worked title="Why small kernels waste a compute-bound GPU">
+  Take a normalization step like **RMSNorm** applied to the activations between big matrix multiplies.
+
+  1. It reads the whole activation tensor from GPU memory, does a few operations per value (square, average, divide,
+     scale), and writes the whole tensor back.
+  2. That’s only a handful of FLOPs per value, while each 16-bit value costs 2 bytes to read and 2 bytes to write.
+     Its **arithmetic intensity is around 1–2 FLOPs per byte**.
+  3. An H100’s ops:byte ratio is about **295** ([Finding the bottleneck](/learn/bottlenecks)). At 1–2 FLOPs per byte,
+     RMSNorm is **deeply memory-bound**: the Tensor Cores sit idle while it runs.
+  4. **Fusing** RMSNorm into the neighboring kernel means the data is normalized while it’s already on-chip, so the
+     extra read and write disappear, and the GPU gets back to doing math.
+
+  Multiply that by the dozens of small kernels in every layer and every step, and fusion is the difference between
+  being compute-bound on paper and in practice.
+</Worked>
+
+<Note kind="beyond">
+  The worked example’s FLOP counts are approximate; the point is the ratio. Anything that does only a few operations
+  per value it loads will be memory-bound on a modern GPU.
+</Note>
+
+### Three routes to fast image inference
+
+High-performance image model inference uses one of **three libraries**:
 
 | Option | What you get |
 |---|---|
-| **SGLang Diffusion** | Fast, ready-made engines for popular image and video architectures. |
-| **TensorRT** | High-quality black-box implementations of popular models with NVIDIA’s own kernels. |
-| **PyTorch** | Careful hand-picked kernels and fusion. The most control, flexibility, and top-end performance. |
+| **SGLang Diffusion** | Performant inference engines built for popular image and video generation architectures. |
+| **TensorRT** | High-quality **black-box** implementations of popular models, using NVIDIA’s in-house kernels. |
+| **PyTorch** | Careful **kernel selection and fusion**: control, flexibility, and improved high-end performance. |
 
-If you want something good *now*, use the SGLang Diffusion or TensorRT version. PyTorch is where advanced engineers can
-customize deeply. Where to focus:
+The book’s advice: **if you want something that works well and you want it now**, use the SGLang Diffusion or TensorRT
+implementation of a model. But with PyTorch, there’s room for advanced inference engineers to do **deep
+customization**. Here’s where that customization goes, in order of importance.
 
-1. **The attention kernel matters most.** Many models ship with **FlashAttention 2**, but **FlashAttention 3** is
-   faster on Hopper GPUs and **FlashAttention 4** on Blackwell (see [Making attention faster](/learn/faster-attention)).
-2. **Fuse the small stuff.** There’s a crowd of little kernels, especially normalization functions like **RMSNorm**,
-   that are great candidates for fusion to cut memory traffic.
-3. **GEMM kernels** (the matrix multiplies in linear layers) matter a lot when you’re compute-bound. They’re usually
-   **safe to quantize to FP8**, which unlocks **2× the FLOPS** on Tensor Cores. Kernels from **CuTe, CUTLASS, or
-   DeepGEMM** may win depending on the model, so test them.
+### 1. The attention kernel
 
-**Torch compilation** (`torch.compile`) does automatic kernel fusion, lets you plug in hand-picked kernels, and produces
-an engine you can **cache** so new machines start faster. That matters because compiling takes **several minutes**.
+The **most essential kernel** is attention. Many image models use **FlashAttention 2** out of the box, but
+**FlashAttention 3** performs better on **Hopper** GPUs and **FlashAttention 4** on **Blackwell** GPUs (see
+[Making attention faster](/learn/faster-attention)). Each version is hand-built for its GPU generation, so matching the
+kernel to the hardware is free performance.
+
+### 2. Fuse the small kernels
+
+There’s a whole barrage of smaller kernels, especially **normalization functions like RMSNorm**, that are good
+candidates for **fusion** to ensure efficient memory usage (see [CUDA and kernels](/learn/cuda-and-kernels)). As the
+worked example above shows, these are where a compute-bound model quietly loses time to memory.
+
+### 3. GEMM kernels, in FP8
+
+Then come **GEMM kernels** (general matrix multiplies), which matter for compute-bound inference. GEMM kernels apply to
+**linear layers**, and those are generally **safe to quantize to 8-bit floating point**, which accesses **two times
+higher FLOPS** on Tensor Cores. The book suggests kernels from **CuTe, CUTLASS, or DeepGEMM**, and notes the best choice
+varies **model by model**, so benchmark them.
+
+<Worked title="What FP8 buys a compute-bound model">
+  1. From the [GPU generations](/learn/gpu-generations) spec tables: an H100 does about **989 TFLOPS** of dense FP16
+     math and about **1,979 TFLOPS** in FP8.
+  2. For a memory-bound LLM, FP8’s benefit is **half as many bytes to move**.
+  3. For a compute-bound image model, the benefit is **twice as many operations per second**: 1,979 ÷ 989 ≈ **2×** for
+     the layers you quantize.
+  4. Same technique, different reason. Which reason applies tells you which layers are worth quantizing.
+</Worked>
+
+### Torch compilation
+
+**Torch compilation** (`torch.compile`) ties it together:
+
+- It performs **automatic kernel fusion**.
+- It has a **plugin system** for inserting manually selected kernels (your FlashAttention 3 or DeepGEMM choice).
+- The resulting engine can be **cached** for faster load times on node startup. That matters because **compilation
+  takes several minutes**: without a cache, every new machine spends those minutes before it can serve a request (see
+  cold starts in [Autoscaling](/learn/autoscaling)).
 
 <Note kind="warn">
-  Compiled engines are tuned for the **exact GPU that compiled them**. If you’ll run on a B200, compile on a B200.
+  Like most high-performance engines, Torch compilation **targets the specific GPU model and architecture that
+  performs the compilation**. If you want to run the model on a B200, **do the compilation on a B200**. A cached engine
+  compiled on an H100 isn’t tuned for, and may not run on, different hardware.
 </Note>
 
 ## One weird trick: skip guidance late
 
-Kernel choice and compilation are serious engineering. This one is more of a clever hack.
+Kernel selection and Torch compilation are **bona fide** inference optimization techniques. But the book notes the
+world of inference optimization has **fun hacks** too, and here’s one.
 
-Image generation time grows **in a straight line with the number of steps**. That’s why few-step models are so fast,
-but cutting steps can drop quality below what’s acceptable. Is there a way to do less work *without* fewer steps?
+First, the facts it builds on:
 
-Recall that every step actually runs the model **twice**, at a batch size of two: once *with* your prompt and once
-*without*, blended according to the **guidance** setting. If guidance were zero, the prompt-guided pass wouldn’t be
-needed at all.
+- **Image generation time tracks linearly with step count.** That’s why **few-step models** and **latent consistency
+  models** are so much faster than full 50-step models. But reducing the step count may drop image quality below an
+  acceptable threshold.
+- **Each step runs at batch size two**, because each step includes a pass **with** prompt guidance and a pass
+  **without** it.
+- The **guidance** parameter controls how much the prompt-guided result is weighted when the two are combined. **If
+  guidance is zero, the prompt-guided pass doesn’t need to be generated at all.**
 
-Now the key insight (the book’s figure illustrates it): **the rough outline of the image is decided in the first few
-steps**. The later steps just fill in details. Prompt adherence matters most early on. The model isn’t going to change
-its mind halfway through and paint a dog when it’s already painting a cat.
+Now the insight, illustrated by the book’s figure of diffusion as a step-by-step process: **the general outline of the
+image is established in early steps**. After the first few steps, the basic outline is in place, and the rest of the
+steps fill in details. So **prompt adherence matters more in early steps**, which set the broad strokes. As the book
+puts it, the model isn’t going to change its mind on a later step and generate a dog when it’s in the middle of
+generating a cat.
 
-So **turn guidance off partway through**. If you skip guidance for the **last 20 steps of a 50-step run**, you do
-**80 passes instead of 100**, and quality usually stays high.
+The trick: **turn off guidance partway through**. You save passes through the denoiser **without reducing the step
+count**, and quality generally remains high.
+
+<Worked title="Counting passes with late guidance skipping">
+  Let **S** be the total number of steps and **G** the number of guided steps.
+
+  1. Each guided step costs 2 passes (with and without the prompt). Each unguided step costs 1.
+  2. Total passes = 2 × G + 1 × (S − G) = **S + G**.
+  3. The book’s example: S = 50, and guidance is skipped for the last 20 steps, so G = 30.
+  4. Total passes = 50 + 30 = **80**, instead of 2 × 50 = **100**.
+  5. Generation time tracks passes, so that’s about **20% less work**, with the same 50 steps of refinement.
+
+  Compare with cutting steps instead: a 40-step fully guided run is also 80 passes, but it has 10 fewer steps of
+  refinement, which is exactly what hurts quality.
+</Worked>
 
 <GuidanceSkip />
 
 ## Video generation: the hardest modality
 
-Video models take text prompts, and sometimes keyframes or other image, audio, and video inputs (the book’s figure).
-**Video is the most demanding modality**, so run it on **Blackwell GPUs** (or **Rubin** once available) whenever
-possible. They offer:
+Video generation models take text prompts and **may take keyframes or other image, audio, and video input**, as the
+book’s figure shows. The book calls video generation **the most demanding modality**, and gives a hardware
+recommendation: whenever possible, run these models on **Blackwell GPUs** (or **Rubin**, once available), because they
+offer:
 
-- lots of **memory** for context parallelism (below),
-- fast **Tensor Cores** for attention,
-- **microscaling** number formats for more precise quantization.
+- **high memory capacity** for context parallelism (below),
+- **fast Tensor Cores** for attention computation,
+- **microscaling data formats** for more precise quantization ([Quantization](/learn/quantization)).
 
-Architecturally, video models are image models that render a **whole clip** from latent space, and since bigger scale
-unlocks more techniques, they use **every image trick plus some extra ones**. Like image generation, video is
-**compute-bound** and uses about the **same ~50 denoising steps**, but each step processes vastly more data.
+Architecturally, video generation is similar to image generation, just rendering a **full video** from latent space
+instead of a single frame. Following the principle from [Chapter 5](/learn/quantization) that **greater scale unlocks
+more techniques**, video generation uses **all the same techniques as image generation, plus additional
+optimizations**.
 
-Because it’s compute-bound, **batching doesn’t help** the way it does for text. Video models usually run on a **full
-node of 8 GPUs at batch size 1**: all eight GPUs work together on **one video at a time**. That means there’s no
-latency-versus-throughput dial to turn. **The only way to improve throughput and cost is to make the model itself
-faster.**
+Like image generation, video generation is **compute-bound** and works by **iterative denoising over latent space**.
+Video models take about the **same number of denoising steps (~50)** as image models, but **each step processes much
+more data**.
 
-Early video models generated one frame at a time, which hurt quality and coherence. Today’s models denoise the **entire
-video at once** in a latent space with three dimensions (width, height, **time**) instead of two. That means enormous
-amounts of data go through every attention calculation. **Attention is 70–80% of the compute time** in video models,
-so it’s the thing to optimize.
+### Batch size one, on eight GPUs
+
+Because video generation is compute-bound, **batching isn’t useful** like it is for text generation. Batching helps LLM
+decode because it adds math to a GPU that was waiting on memory; a video model has no idle compute to fill. So video
+generation models usually run on **full nodes of eight GPUs with a batch size of one**: all eight GPUs work together
+to create **one video at a time**.
+
+This removes a lever you’ve relied on all course. With batched workloads, you trade latency for throughput by
+adjusting the batch size. With video, the book says, **the only way to improve throughput and cost is to make the model
+itself faster**.
+
+<Worked title="Why speed is cost for video (illustrative)">
+  1. Suppose an 8-GPU node costs **$40 per hour** and generates one video in **2 minutes**.
+  2. Videos per hour: 60 ÷ 2 = **30**. Cost per video: $40 ÷ 30 ≈ **$1.33**.
+  3. Make the model twice as fast (1 minute per video): 60 videos per hour, **$0.67 per video**.
+  4. There’s no batch-size dial to turn instead, so every optimization in the rest of this lesson translates directly
+     into cost per video.
+
+  The dollar and time figures are illustrative; the proportionality is the point.
+</Worked>
+
+### Why attention takes over
+
+Early video generation models were **framewise**: they generated frames one at a time, which reduced quality and
+coherence. Today, video models run denoising steps on **the video as a whole** in latent space. Where the latent space
+for images has **two dimensions** (width, height), for video it has **three**: width, height, and **time**.
+
+That means passing **huge amounts of data** through each attention calculation. The book states that for video
+models, **attention is 70 to 80 percent of the compute time**, which makes attention **the most important thing to
+optimize**.
+
+Why so lopsided? Because the two kinds of work grow at different rates as the latent gets bigger:
+
+- The **linear layers** process each token independently, so their work grows **in proportion to the number of
+  tokens**.
+- **Attention** compares every token with every other token, so its work grows with **the number of tokens squared**
+  ([Attention and the KV cache](/learn/attention-and-kv-cache)).
+
+<Worked title="From a picture to a clip: tokens and attention">
+  These latent sizes are typical of current open models (illustrative, not from the book): the VAE shrinks width and
+  height 8× and time 4×, then the transformer takes 2×2 patches.
+
+  1. **Image, 1024×1024**: 1024 ÷ 16 = 64 per side → 64 × 64 = **4,096 tokens**.
+  2. **Video, 720p (1280×720), 5 seconds at 24 fps**: 120 frames → about **30 latent frames** after 4× time
+     compression. Each latent frame is (1280 ÷ 16) × (720 ÷ 16) = 80 × 45 = 3,600 tokens. Total: 30 × 3,600 =
+     **108,000 tokens**.
+  3. **Token ratio**: 108,000 ÷ 4,096 ≈ **26×** more tokens than the image.
+  4. **Linear-layer work** grows 26×. **Attention work** grows 26² ≈ **700×**.
+  5. In the widget below’s idealized model, attention goes from about **15%** of the compute for the image to about
+     **80%** for the clip, in line with the book’s 70–80%.
+</Worked>
+
+<VideoAttentionCost />
 
 ### Faster attention: kernels and caching
 
-Start with **kernel selection**: benchmark **FlashAttention, DeepGEMM, CuTe, and CUTLASS** kernels on your model.
+Attention optimization **starts with kernel selection**. The book says to test **FlashAttention, DeepGEMM, CuTe, and
+CUTLASS** kernels to see which perform best for your model.
 
-LLMs speed up attention with the KV cache. Video models use **other caching patterns** to reuse earlier outputs, and
-reusing parts of the attention work can make generation **30–40% faster** in practice. The research changes quickly,
-but there are two basic approaches:
+Next is **caching**. Where language models use the KV cache to accelerate attention, video models use **other caching
+patterns** that try to reuse model outputs. Reusing parts of the attention computation can make video generation
+**30–40% faster** in practice. The precise methods change constantly with new research, but there are **two fundamental
+approaches**:
 
-- **Timestep-based caching**: reuse the outputs of certain denoising steps to **skip whole steps**.
-- **Transformer-based caching**: reuse hidden states to **skip layers** inside the transformer.
+- **Timestep-based caching**: cache and reuse the outputs of certain **timesteps** (denoising steps) to **skip entire
+  steps**.
+- **Transformer-based caching**: cache and reuse **hidden states** to **skip layers** within the transformer itself.
+
+<Note kind="beyond">
+  Why can you reuse anything at all? In later denoising steps the latent changes only a little from one step to the
+  next, so a step’s intermediate results often look very similar to the previous step’s. Caching methods measure that
+  similarity and reuse the old result when the difference is small enough. The book’s reading list includes examples
+  such as **TeaCache** and **Cache-DiT** (see [Further reading](/reading)).
+</Note>
 
 <Note kind="warn">
-  Results range from **no visible quality loss** to **unusable output**, depending on the algorithm. Test caching
-  strategies carefully before production.
+  The book warns that caching algorithms and implementations range from **negligible quality degradation to unusable
+  output**. Test these strategies carefully, with human review, before using them in production.
 </Note>
 
 ### Faster attention: quantization
 
-Beyond kernels and caching, the main tool is [quantization](/learn/quantization), but it helps video for a
-**different reason** than LLMs:
+Beyond kernels and caching, the **main tool for speeding up attention is quantization**, but it helps video models for
+a **different reason** than language models:
 
-- For memory-bound LLMs, quantization means **less data to move**.
-- For compute-bound video models, it means **2× the FLOPS** by switching to lower-precision Tensor Cores.
+- For **bandwidth-constrained** language model inference, the benefit of quantization is **less data to load**
+  through memory.
+- For **compute-bound** video models, it means **double the FLOPS** by switching to lower-precision Tensor Cores.
 
-And the target is different. LLM quantization focuses on **weights**: the big linear layers, where quantization barely
-hurts quality. Those layers dominate memory traffic in LLMs, but in video models they’re only a **small slice of compute
-time**. So video quantization focuses on **attention**, which is the **riskiest part of any model to quantize**,
-because errors pile up. Video has only ~50 steps instead of thousands of token-by-token iterations, so the risk is a
-little lower, but it’s still real.
+And the **target** is different. Language model quantization focuses on **weights**: the large linear layers, where
+quantization’s quality impact is negligible. For video models, quantizing weights still helps, but those linear layers,
+which take most of the *memory bandwidth* and so constrain language models, are only **a small fraction of the compute
+time** for video models. Instead, **quantization on video models focuses on attention**.
 
-Two ways to limit the damage:
+<Worked title="Why quantize attention? A speedup budget">
+  Suppose FP8 makes whatever it touches **2× faster**, and in your video model attention is **75%** of compute time and
+  linear layers are the remaining **25%**.
 
-1. **Blockwise quantization with a microscaling format** (**MXFP8**, available on Hopper and Blackwell). Microscaling
-   keeps **outlier values** more accurate, and outliers have a big effect on attention accuracy.
-2. **Selective quantization**: only quantize the less important parts.
-   - **By step:** keep the **early steps in FP16** and quantize the later ones. It’s the same insight as the guidance
-     trick: early steps set the composition, later steps refine details.
-   - **By layer:** keep the **first and last layers** in higher precision, since they take in the input and produce
-     the final output. The hidden layers in between handle approximation better.
+  1. **Quantize only the linear layers**: time = 75% + 25% ÷ 2 = 87.5% of the original → **1.14× faster**.
+  2. **Quantize only attention**: time = 75% ÷ 2 + 25% = 62.5% → **1.6× faster**.
+  3. **Quantize both**: time = 50% → **2× faster**.
+
+  The part of the work that takes the most time is the part worth speeding up.
+</Worked>
+
+<Note kind="beyond">
+  The rule in that worked example is often called **Amdahl’s law**: the overall speedup from improving one part of a
+  job is limited by how much of the total time that part takes.
+</Note>
+
+But attention is **the riskiest part of any model to quantize**, because errors **accumulate over the course of
+inference**. For video models, with **~50 steps** instead of the **thousands of autoregressive iterations** in token
+generation, the risk is **slightly lower but still important**.
+
+The book gives two methods for reducing the quality impact:
+
+**1. Blockwise quantization with a microscaling format.** Use **blockwise quantization** and a **microscaling data
+format (MXFP8)**, both available on Hopper and Blackwell. Microscaling formats do a better job of preserving **outlier
+values**, which have a **major impact on attention accuracy** (see block scaling in
+[Quantization](/learn/quantization)). Each small block gets its own scale factor, so one huge value only distorts its
+own block, not the whole tensor.
+
+**2. Selective quantization.** The most sophisticated approach is to quantize only the **less important parts** of the
+model:
+
+- **By step: keep early steps in FP16 and quantize later steps.** This follows the same insight as the guidance trick:
+  early steps establish the outline, later steps refine the details. Early steps matter more for **prompt adherence
+  and accuracy**.
+- **By layer: keep the first and last layers and quantize the hidden layers.** The first and last layers are more
+  important because they **take the input and produce the final output**. The hidden layers perform intermediate
+  calculations, which don’t suffer as much from approximation.
 
 <SelectiveQuant />
 
-These tactics are packaged in kernels like **SageAttention**, an **8-bit attention kernel** designed for good-quality,
-low-precision attention in video models.
+By quantizing only the less important parts of the process, **quality is preserved**. These tactics are found in
+kernels like **SageAttention**, an **8-bit attention kernel** you can use for good-quality low-precision attention on
+video generation models.
 
 ### Context parallelism
 
-Video models run across a full 8-GPU node, but they use **context parallelism**, not the
-[tensor parallelism](/learn/parallelism) common for LLMs.
+Video generation models generally run on a **full node of eight GPUs**, but they use **context parallelism**, not the
+[tensor parallelism](/learn/parallelism) common for LLMs. The book’s figure shows the difference: the model weights are
+**replicated** on every GPU, while the **latent space is shared** out to compute attention.
 
-- **Copy the weights onto every GPU.** Video models are small enough that eight copies use a meaningful chunk of memory
-  but still fit on B200s.
-- **Split the attention work instead of the model.** Each GPU holds a **slice of the video’s latent** (its context).
-  Using a scheme like <Term def="Each GPU holds part of the sequence and passes its keys and values to the next GPU in a loop, until every piece has been compared with every other piece.">ring attention</Term>,
-  each GPU passes intermediate results to the next GPU in a ring until all slices have been compared with each other.
-  (The book’s figure shows the weights replicated while the latent is shared.)
+- **Copy the weights onto every GPU.** Video models are small enough that replicating the weights eight times takes a
+  **meaningful amount of memory but is feasible on B200**.
+- **Split the attention calculation, not the model.** Each GPU holds **a piece of the context** (a slice of the video’s
+  latent tokens). This is coordinated by a mechanism like <Term def="Each GPU holds part of the sequence and passes its keys and values to the next GPU in a loop, until every piece has been compared with every other piece.">ring attention</Term>:
+  each GPU holds a piece of the context and **passes intermediate results to the next GPU in the ring**.
+
+<Worked title="Can eight copies of the weights fit? (illustrative)">
+  1. Take a video model with **14B parameters** stored in BF16 (2 bytes each): 14 × 10⁹ × 2 = **28 GB** of weights.
+  2. Context parallelism puts a full copy on each of 8 GPUs: 8 × 28 GB = **224 GB** across the node. That’s the
+     “meaningful amount of memory”.
+  3. But per GPU it’s only 28 GB of a B200’s **192 GB**, leaving about **164 GB** on each GPU for activations and
+     attention work. Feasible, as the book says.
+  4. With tensor parallelism instead, each GPU would hold 1/8 of the weights, but every layer would need GPUs to
+     exchange partial results, and for video the heavy part is attention over the huge latent, not the weights.
+</Worked>
+
+<Note kind="beyond">
+  How ring attention works, step by step: split the 108,000 latent tokens across 8 GPUs, about 13,500 each. Every GPU
+  keeps its own queries and starts with its own slice of keys and values.
+
+  1. Each GPU computes attention between its queries and the key/value slice it currently holds.
+  2. It passes that key/value slice to the next GPU in the ring and receives one from the previous GPU.
+  3. Repeat. After 8 rounds, every GPU’s queries have met every slice of keys and values.
+
+  Partial results are combined as they arrive (the same running-softmax trick FlashAttention uses), and passing the
+  next slice can overlap with computing on the current one, which hides much of the communication cost.
+</Note>
 
 <ContextParallel />
 
-Two more things can run in parallel:
+The book notes two more ways to parallelize:
 
-- **Attention heads**: attention has several heads (usually eight or more) that are **independent**, so they can be
-  computed separately and combined afterward.
-- **The VAE decode step**, which turns the finished latent into pixels and takes **3–5% of total time**, can also be
-  spread across GPUs.
+- **Attention heads.** Attention in transformers is **multi-head**, usually with **eight or more heads**. Heads are
+  **independent**, so they can be computed separately on different GPUs and the results combined afterward.
+- **VAE decoding.** Attention isn’t the only thing that parallelizes. The **latent decoding step**, where the VAE turns
+  the finished latent into pixels, takes **3–5% of total inference time** and can also be run across GPUs.
 
-These parallelism techniques are what make AI video feasible. As videos get longer and models grow, parallelism will
-stay **the most critical technique** for video inference.
+The book closes the chapter by stating that these parallelism techniques are what **make AI video feasible**. As video
+sequences get longer and video models get larger, parallelism will remain **the most critical technique** for video
+generation inference.
 
 <KeyPoints>
-- Image models: **denoising pipelines**, 10–20× smaller than frontier LLMs, **compute-bound**, with hard-to-automate quality evaluation.
-- Use **SGLang Diffusion** or **TensorRT** for quick wins, or **PyTorch** for deep control. Prioritize the **attention kernel** (FA3 on Hopper, FA4 on Blackwell), **fuse** small kernels like RMSNorm, and use **FP8 GEMMs** for 2× FLOPS.
-- `torch.compile` fuses kernels and can be cached, but **compile on the same GPU you’ll run on**.
-- **Skip guidance** in later steps: 50 steps with the last 20 unguided = 80 passes instead of 100.
-- Video: Blackwell GPUs, **batch size 1 on 8 GPUs**, and **attention is 70–80% of compute**.
-- Speed it up with kernel choice, **timestep/transformer caching** (30–40%), and **attention quantization** (MXFP8, selective by step and layer, e.g. SageAttention).
-- **Context parallelism**: replicate the weights, split the latent, and combine with **ring attention**. Heads and VAE decoding parallelize too.
+- Image and video models are **denoising pipelines**, 10–20× smaller than frontier LLMs, **compute-bound**, served lower in the stack (PyTorch/TensorRT), with **direct quality-to-speed trade-offs**, and quality is best judged by **human preference**.
+- Diffusers examples are unoptimized. You often need **memory-efficient kernels and fusion just to reach** the compute bound, because small ops like RMSNorm are memory-bound.
+- Routes: **SGLang Diffusion** or **TensorRT** for quick wins, **PyTorch** for deep control. Priorities: the **attention kernel** (FA3 on Hopper, FA4 on Blackwell), **fuse** small kernels, **FP8 GEMMs** for 2× FLOPS (CuTe, CUTLASS, DeepGEMM, per model).
+- `torch.compile` fuses and plugs in kernels, can be **cached** (compiles take minutes), and must be **compiled on the GPU you’ll run on**.
+- **Skip guidance late**: passes = steps + guided steps; 50 steps with the last 20 unguided = **80 passes instead of 100**.
+- Video: Blackwell (or Rubin), **~50 steps** like images but far more data per step, **batch size 1 on 8 GPUs**, so only a faster model improves cost.
+- Attention is **70–80%** of video compute because it grows with **tokens²** while linear layers grow with tokens.
+- Speed up attention with **kernel selection**, **timestep/transformer caching** (30–40%, test carefully), and **attention quantization**: MXFP8 blockwise, plus **selective** quantization by step (early steps FP16) and layer (first/last layers kept), as in **SageAttention**.
+- **Context parallelism**: replicate weights (feasible on B200), split the latent, combine with **ring attention**. Heads and the VAE decode (3–5% of time) parallelize too.
 </KeyPoints>
 
 <Quiz questions={[
@@ -194,7 +410,23 @@ stay **the most critical technique** for video inference.
     q: "A 50-step image generation turns off guidance for the last 20 steps. How many passes through the denoiser is that?",
     options: ["100", "80", "50"],
     answer: 1,
-    why: "30 guided steps × 2 passes + 20 unguided steps × 1 pass = 80 passes, instead of 100."
+    why: "Passes = steps + guided steps = 50 + 30 = 80. The 30 guided steps cost 2 passes each (60) and the 20 unguided steps cost 1 each (20)."
+  },
+  {
+    q: "You want to cut a 50-step, fully guided image generation from 100 passes to 70 without reducing the number of steps. How many steps should stay guided?",
+    options: ["35", "20", "30"],
+    answer: 1,
+    why: "Passes = S + G, so 70 = 50 + G gives G = 20: guide the first 20 steps and skip guidance for the last 30."
+  },
+  {
+    q: "An image model’s pipeline is ‘compute-bound in theory’, but profiling shows the Tensor Cores idle much of the time. What’s the book’s explanation?",
+    options: [
+      "The model is actually memory-bound like an LLM decode, so nothing can be done",
+      "Unfused small kernels (like RMSNorm) spend time on memory traffic; memory-efficient kernels and fusion are needed to reach the compute bound",
+      "It needs a larger batch size"
+    ],
+    answer: 1,
+    why: "The book notes you often need memory-efficient kernels and kernel fusion just to reach the compute bottleneck. Small operations with few FLOPs per byte leave the math units waiting."
   },
   {
     q: "Why does quantization speed up video models?",
@@ -207,6 +439,12 @@ stay **the most critical technique** for video inference.
     why: "Video models are compute-bound, so the win is more math per second from FP8 Tensor Cores, not less memory traffic."
   },
   {
+    q: "In a video model where attention is 80% of compute time, FP8 doubles the speed of whatever it’s applied to. Roughly how much faster is the model if you quantize only attention?",
+    options: ["About 1.1×", "About 1.67×", "Exactly 2×"],
+    answer: 1,
+    why: "New time = 80% ÷ 2 + 20% = 60% of the original, so about 1 ÷ 0.6 ≈ 1.67× faster. Quantizing only the 20% of linear layers would give 1 ÷ 0.9 ≈ 1.1×. That’s why video quantization focuses on attention."
+  },
+  {
     q: "Which parts of a video model does selective quantization keep in higher precision?",
     options: [
       "The late steps and the hidden layers",
@@ -214,16 +452,26 @@ stay **the most critical technique** for video inference.
       "Only the VAE"
     ],
     answer: 1,
-    why: "Early steps set the composition, and the first and last layers handle input and output. The rest tolerates approximation better."
+    why: "Early steps set the composition and matter most for prompt adherence; the first and last layers take in the input and produce the output. The hidden layers and later steps tolerate approximation better."
   },
   {
-    q: "How does context parallelism split work across 8 GPUs?",
+    q: "A video’s latent grows from 20,000 to 40,000 tokens. Roughly how does the work change?",
+    options: [
+      "Linear layers 2×, attention 2×",
+      "Linear layers 2×, attention 4×",
+      "Linear layers 4×, attention 2×"
+    ],
+    answer: 1,
+    why: "Linear layers process each token independently, so they double. Attention compares every token with every token, so it grows with the square: 2² = 4×. That’s why attention dominates as videos get longer or larger."
+  },
+  {
+    q: "How does context parallelism split a video model across 8 GPUs?",
     options: [
       "Each GPU holds 1/8 of the model weights",
-      "Each GPU holds the full weights and a slice of the video, and they share attention via a ring",
+      "Each GPU holds the full weights and a slice of the latent, and they share attention via a ring",
       "Each GPU generates a different video"
     ],
     answer: 1,
-    why: "Weights are replicated and the latent is split. Ring attention passes keys and values around so every slice attends to every other."
+    why: "Weights are replicated (feasible on B200) and the latent is split. Ring attention passes intermediate results around so every slice attends to every other; heads and the VAE decode can also be split."
   }
 ]} />

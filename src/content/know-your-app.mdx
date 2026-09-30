@@ -2,156 +2,297 @@ import CostBreakeven from "@/components/widgets/CostBreakeven";
 
 <TLDR>
   “Optimizing” only means something once you know what *best* means for **your** product. Before touching a GPU, pin
-  down your model, your latency budget, your costs, and your traffic. Then decide whether to rent intelligence from an
-  API or run your own deployment.
+  down your model, interface, latency budget, unit economics, and traffic. Then decide whether to rent intelligence from
+  a shared API or run your own dedicated deployment, and shape everything around your use case: online or offline,
+  consumer or business, and what compliance allows.
 </TLDR>
 
 ## Optimization means trade-offs
 
-To optimize is to pick the best option from a range of options. In inference that almost always means **trading off**
-three things against each other: **latency** (how fast), **throughput** (how much, and so how cheap), and **quality**
-(how smart). You rarely get to max out all three. The work is finding the right balance.
+Inference engineering adds **speed and scale** to AI products by optimizing how generative models are served in
+production. And **optimization** has a precise meaning: *identifying the best solution out of a range of options*.
+
+That raises the obvious question: best at *what*? Before you optimize model performance or build robust
+infrastructure, you need to know what “best” means for your product. The book’s key observation is that **many
+performance improvements come from making trade-offs** among three things:
+
+- **Latency**: how fast each individual user gets a response.
+- **Throughput**: how much total work the system does per second, which decides how many GPUs (and dollars) you need.
+- **Quality**: how smart and accurate the model’s outputs are.
+
+These pull against each other. A technique that raises throughput (like bigger batches) can slow each user down; a
+technique that lowers latency or cost (like aggressive quantization) can cost some quality. So, in the book’s words,
+**optimization is often about finding the right balance rather than maximizing a single factor.**
 
 <Analogy title="Think of it like athletes">
-  American football players are big, fast, and strong, but not as big as sumo wrestlers, as fast as Olympic sprinters,
-  or as strong as champion powerlifters. Their bodies are tuned for the specific demands of their position over a
-  whole season. The book’s first figure makes the same point: an inference system should be specialized for the demands
-  of *its* workload, not be the best at everything.
+  American football players are big, fast, and strong, but they’re not as big as sumo wrestlers, as fast as Olympic
+  sprinters, or as strong as champion powerlifters. Their bodies and skills are optimized for the specific demands of
+  their position over the course of a full season. The chapter’s first figure makes the same point: just like elite
+  athletes, **inference services must be specialized for the demands of their workloads**, not be the best at
+  everything.
 </Analogy>
 
-The more **constraints** you can pin down, the better you can do. Before optimizing, you should know your:
+Your inference system must be optimized for the specific demands of **your model, your product, and your traffic**. And
+here’s the counterintuitive part: **the more constraints you can introduce, the better outcomes you can achieve.** A
+system that only has to do one thing, in one way, can be tuned much harder than one that has to handle anything.
 
-- **Model requirements**: which model (or models) you need to run.
-- **Application interface**: how inputs reach the model, and what format the output needs to be in.
-- **Latency budget**: end to end, how fast your product has to respond to a user action.
-- **Unit economics**: what it makes sense to spend per request, per user, or per month.
-- **Usage patterns**: how many people use it at the same time, and whether there are patterns (e.g. busier during
-  business hours).
+### What to know before you optimize
 
-<Note kind="tip">
-  Early on, you often won’t know these answers yet, and that’s fine. At that stage, just use **off-the-shelf APIs**.
-  Inference engineering becomes worth it once the product is growing and the requirements become clear.
+The book lists five things you should know:
+
+| Requirement | The question to answer |
+|---|---|
+| **Model requirements** | Which model (or models) do you need to run inference on? |
+| **Application interface** | How will inputs be delivered to the model, and how is the output expected to be formatted? |
+| **Latency budget** | End to end, how fast does your product need to respond to a user action? |
+| **Unit economics** | What does it make sense to spend per request, per user, or per month? |
+| **Usage patterns** | How many concurrent users are you serving, and is there a pattern (e.g. more activity during business hours)? |
+
+<Note kind="beyond">
+  Why each one matters later in the course:
+  - **Model** decides the hardware (does it even fit on one GPU?) and which optimizations are available (Chapters 2–4).
+  - **Interface** decides things like whether you stream tokens, whether output must be valid JSON, and which protocol
+    you use (Chapters 2 and 7).
+  - **Latency budget** decides how big your batches can be and whether you need latency techniques like speculation
+    and tensor parallelism (Chapter 5).
+  - **Unit economics** decides how much GPU capacity you can afford per user, and therefore how hard you must push
+    throughput.
+  - **Usage patterns** drive autoscaling: how many replicas to keep warm and when to add more (Chapter 7).
 </Note>
 
-## Shared vs. dedicated inference
+<Note kind="tip">
+  Early in building an AI product, the answers to these questions often **aren’t clear yet**, and that’s fine. At that
+  stage, the book says it’s usually better to **use off-the-shelf APIs** whenever possible rather than investing in
+  dedicated inference. As the product scales, the requirements become clear, and *then* inference engineering becomes
+  a worthwhile pursuit.
+</Note>
 
-There are two ways to put an AI model into your product:
+## Scale and specialization: shared vs. dedicated inference
 
-- **Shared inference**: send requests to a public API that many customers use, and pay per million tokens (or some
-  other usage-based price).
-- **Dedicated deployment**: rent GPUs (or buy them and install them yourself, called *on-premises*) and run an
-  inference service only for your app, paying per hour of GPU time.
+There are two ways to add AI models to your product:
 
-This isn’t quite the same question as closed vs. open models. Plenty of shared APIs serve open models, and big
-customers can often get some kind of dedicated setup for closed models. But one big reason people adopt open models is
-that they make **unrestricted dedicated inference** possible.
+- **Shared inference**: send your traffic to a **public API endpoint** for a given model, and pay per million tokens
+  (or some other consumption-based metric). Many customers share the same servers.
+- **Dedicated deployments**: **rent GPUs** and set up an inference service **exclusively for your application**, paying
+  per hour of GPU time. (Or purchase GPUs and install them yourself, called *on-premises*.)
 
-Most AI products start on pay-per-token APIs, because the trade-offs suit a product that’s still finding its market:
+### This isn’t the same as open vs. closed
+
+It’s tempting to equate “shared” with closed models and “dedicated” with open ones, but the book points out they’re
+separate questions:
+
+- There are **plenty of shared endpoints for open models** (you can pay per token for Llama or DeepSeek from many
+  providers).
+- **Many model labs offer large customers some kind of dedicated setup** for their closed models.
+
+Still, one of the key motivations for adopting open models is that they **unlock unrestricted dedicated inference**:
+with the weights in hand, you can run them however and wherever you want.
+
+### Why most products start shared
+
+Most AI products start with pay-per-token APIs, because the trade-offs make sense while you’re **looking for
+product-market fit** or in the **early stages of growth**:
 
 | Shared inference: pros | Shared inference: cons |
 |---|---|
-| Nothing to manage; you only pay for what you use | Cost grows in a straight line with usage |
-| No <Term def="The delay while a new copy of a model starts up and loads its weights before it can serve requests.">cold starts</Term>: the model is always ready | Your uptime can’t beat the provider’s, and other customers’ traffic (“noisy neighbors”) can slow you down |
-| Almost no engineering; you just need an API key | No control over latency, model quality, or rate limits |
+| **Zero overhead**: you only pay for consumption | **Cost scales linearly** with usage |
+| **No cold start times**: the model is always available | **Provider uptime caps your product’s uptime**, and you suffer **noisy neighbors** |
+| **Minimal engineering work**: you just need an API key | **No control** over latency, model quality, or rate limits |
 
-Over time, moving to dedicated deployments becomes essential for three reasons:
+Each of these deserves a closer look:
 
-1. **Scale**: you have enough traffic that paying per GPU-hour is cheaper than paying per token.
-2. **Specialization**: you run a custom or fine-tuned model, or you have strict latency or uptime needs.
-3. **Orchestration**: your product chains several models into multi-step pipelines, and you need to cut the network
-   delays and complexity of calling them all separately.
+- **Zero overhead vs. linear cost.** With an API you pay nothing when nobody uses your product, which is perfect when
+  traffic is tiny or unpredictable. But every extra token costs exactly the same as the last one, forever. There’s no
+  volume point where your marginal cost falls.
+- **No cold starts.** A
+  <Term def="The delay while a new copy of a model starts up and loads its weights before it can serve requests.">cold start</Term>
+  happens when a new copy of a model has to boot up and load its weights before serving. A big shared API is always
+  warm, so you never wait for that.
+- **Uptime and noisy neighbors.** Your product can never be *more* available than the provider behind it. And because
+  other customers share the same servers, their traffic spikes (“noisy neighbors”) can slow your requests down.
+- **No control.** You get the provider’s latency, the provider’s version of the model, and the provider’s
+  <Term def="Limits on how many requests or tokens you’re allowed to send per minute.">rate limits</Term>.
+
+### Why products eventually go dedicated
+
+Over time, the book says shifting to dedicated deployments becomes essential, for three reasons:
+
+1. **Scale**: you process enough traffic that it’s **more economical to pay per GPU than per million tokens**.
+2. **Specialization**: you’re running a **custom or fine-tuned model**, or you have **specific latency or uptime
+   requirements** that a shared API can’t guarantee.
+3. **Orchestration**: your product relies on **multiple models and multi-step pipelines**, and you need to
+   **minimize network latency and deployment complexity** between them.
+
+The first reason is simple arithmetic. Try it:
 
 <CostBreakeven />
 
+<Worked title="Where the break-even point comes from">
+  Using the widget’s illustrative defaults: an API price of **$1 per million tokens**, a GPU rented at **$3 per hour**,
+  and a GPU that can serve about **2,500 tokens per second** when well batched, busy about **50%** of the time.
+
+  1. **Cost of one dedicated GPU per month**: 730 hours × $3 = **$2,190**, whether it’s busy or idle.
+  2. **What that GPU can serve per month**: 2,500 tokens/s × 3,600 s/hour × 730 hours × 50% ≈ **3.3 billion tokens**.
+  3. **What $2,190 buys on the shared API**: $2,190 ÷ $1 per million = **2.19 billion tokens**.
+  4. So below about **2.2 billion tokens a month**, the API is cheaper (you’d be paying for an underused GPU). Above
+     it, the dedicated GPU wins, and it keeps winning more as traffic grows, because each additional GPU serves billions
+     more tokens for the same flat price.
+</Worked>
+
+<Note kind="beyond">
+  These prices and throughputs are illustrative, not from the book; real numbers vary widely by model, provider, and GPU.
+  The *shape* is the point: shared cost is a straight line that starts at zero, while dedicated cost is a staircase that
+  starts high but rises slowly. Utilization matters enormously. A GPU that sits idle half the day doubles your
+  effective cost per token, which is why autoscaling (Chapter 7) is so important.
+</Note>
+
+### The cost of going dedicated
+
 <Note kind="warn">
-  Going dedicated makes you responsible for your own inference engineering. You get flexibility and control, but you
-  also get more systems to run and a **higher minimum monthly bill**, since you pay for GPUs even when they’re idle.
-  Only switch when there’s a clear, immediate business need.
+  Switching to dedicated deployments **puts you in charge of your own inference engineering**. That gives you
+  flexibility and control, but it **adds to your engineering surface area** (more systems to build, monitor, and fix)
+  and **increases the floor of your monthly spend** (you pay for GPUs even when they’re idle). The book’s advice: **only
+  switch once there is a clear and immediate business need.**
 </Note>
 
 ## Everything starts from your use case
 
-Every inference decision comes downstream of what your app actually does.
+**Every inference engineering decision is downstream of your use case.**
 
 <Analogy title="Think of it like a coach recruiting">
-  Which students should a coach talk to? It depends entirely on the sport. The basketball coach wants the tallest kids
-  in the class, and the gymnastics coach picks among the shortest. There’s no single “best” recruit, and there’s no
-  single best inference setup.
+  Imagine a sports coach recruiting at a school. Which students would they want to talk to? It depends entirely on
+  which sport they coach: the basketball coach wants the tallest kids in the class, but the gymnastics coach selects
+  among the shortest. There’s no single “best” recruit, and there’s no single best inference setup.
 </Analogy>
 
-There are only two situations where you have to build for **every** possible use:
+### When you must build for everything
 
-- **Foundation models**: you trained your own model and sell access through a public API, so you must handle all kinds
-  of usage.
-- **Inference platforms**: you’re building a platform (for your company or as a product) that has to run any model for
-  any use case.
+The book identifies only **two cases** where inference engineers need to build at the **highest level of generality**:
 
-Most AI products aren’t like that. They’re **vertical** apps (a code editor, a customer-support agent) that use AI to
-create a new experience. For those, you want to add **as many constraints as possible** by being specific about your
-use case.
+- **Foundation models**: you’ve trained your own model and will sell consumption directly through a **public shared
+  API**, so you need to support **many different usage patterns**.
+- **Inference platforms**: you’re building an inference platform, either internally or as a product, that needs to
+  support **any model and any use case**.
 
-### Different apps, different priorities
+### Everyone else: add constraints
 
-Generative AI has created whole new categories of apps, and each one needs inference tuned differently:
+Most AI-native applications are **vertical apps**, like code editors or customer service agents, where AI creates some
+novel user experience. When building inference for these, the book’s advice is to **add as many constraints as
+possible by getting specific with your use case.** You don’t need to be good at everything; you need to be excellent
+at *your* workload.
 
-| Category | Example | What matters most |
+### AI-native applications: different apps, different priorities
+
+Generative models have unlocked a new class of applications across industries, and each category relies on different
+models and modalities and needs **tailored inference**. The book’s table:
+
+| Category | Example | Key consideration |
 |---|---|---|
-| **Agents** | A prospecting agent for sales teams | One user action triggers *many* model calls |
-| **Chat** | Customer-support chat that looks up documents (<Term def="Retrieval-augmented generation: fetching relevant documents and adding them to the prompt so the model can answer from them.">RAG</Term>) | Fast time to first token makes chat *feel* fast |
-| **Voice** | Real-time translation between languages | End-to-end latency, so conversation feels natural |
-| **Media** | Virtual try-on for clothes, shoes, jewelry | Balancing output quality against speed |
-| **Search** | Legal document discovery | Bulk indexing of documents (offline) vs. live user searches (online) |
-| **RecSys** | E-commerce product recommendations | Consistent latency at very high request volume |
-| **Completion** | Tab completion while coding | A full chunk of suggestion, delivered at typing speed |
-| **Moderation** | Scanning user posts for safety | High throughput, so every check is cheap |
+| **Agents** | Prospecting agent for sales teams | **One user action triggers many inference calls** |
+| **Chat** | Front-line customer support chat with <Term def="Retrieval-augmented generation: fetching relevant documents and adding them to the prompt so the model can answer from them.">RAG</Term> | **Time to first token** makes chat feel fast |
+| **Voice** | Real-time translation between languages | **End-to-end latency** for natural conversation |
+| **Media** | Virtual try-on for clothes, shoes, and jewelry | Balancing **output quality vs. speed** |
+| **Search** | Legal document discovery | **Offline** corpus filling vs. **online** user requests |
+| **RecSys** | E-commerce product recommendations | **Consistent latency** with high request volume |
+| **Completion** | Tab completion for coding in an IDE | A **full completion chunk at the user’s typing speed** |
+| **Moderation** | Scanning user-generated content for safety | **High throughput** for cost-effective checks |
 
-That’s a tiny sample, and as models get faster, cheaper, and smarter, entirely new use cases will appear.
+<Note kind="beyond">
+  The reasoning behind a few of these:
+  - **Agents**: if one click triggers ten model calls in sequence, each call’s latency adds up, so a delay that’s
+    fine for a single chat reply becomes painful. Agents also multiply cost per user action.
+  - **Chat**: people judge chat speed mostly by how quickly text *starts* appearing, which is time to first token
+    (next lesson).
+  - **Voice**: speech has no “loading” indicator. The whole pipeline (hearing, thinking, speaking) must finish fast
+    enough to feel like a conversation, so end-to-end latency is what counts.
+  - **Completion**: a code suggestion is only useful if it arrives, complete, before the user types the next
+    character, so the whole chunk must land at typing speed.
+  - **Moderation**: every piece of content must be checked, but nobody is waiting on any single check, so cost per
+    check (throughput) dominates.
+</Note>
+
+The book stresses this is a **tiny sample** of the applications being built today, but it shows the breadth of
+considerations inference engineers face. As models get faster, cheaper, and smarter, **new use cases that haven’t even
+been imagined yet will emerge**.
 
 ## Online vs. offline
 
-One of the most basic trade-offs is **latency vs. throughput**. Lower latency makes your app faster. Higher throughput
-makes it cheaper at scale, because the same GPUs can serve more requests.
+One of the primary trade-offs in inference engineering is **latency versus throughput**:
 
-- **Online** apps run in real time with an impatient person waiting on every request: code completion, chat, voice
-  agents. Optimize for **latency**.
-- **Offline** (batch) jobs have nobody waiting on any single request. Optimize for **throughput**: each request may be
-  too slow for a live user, but the system chews through far more work per hour. Examples:
-  - **Catalog transcription**: transcribing a back catalog of podcasts or interviews so it’s searchable.
-  - **Document processing**: embedding, converting, or analyzing batches of documents on a schedule.
-  - **Corpus preparation**: cleaning or embedding huge datasets for training models.
+- **Lower latency** makes your application **faster**.
+- **Higher throughput** makes it **cheaper at scale**, because you can use **fewer GPUs for the same number of users**.
 
-The same model can do both jobs. Whisper (speech-to-text) could power a live dictation app *and* a bulk transcription
-job. If both get enough traffic, it’s cheaper to run **two separate deployments** of the same model: one tuned for
-latency, one tuned for throughput.
+### Online: optimize for latency
+
+Most AI applications (code completion, chat, voice agents) are **online** applications that run in **real time**. With
+an impatient user waiting on the other end of every API call, online applications should be **optimized for latency**.
+
+### Offline: optimize for throughput
+
+Some applications have **offline batch inference** needs. These jobs are better served by **high-throughput**
+deployments: each individual request might be **too slow for a good user experience**, but the system as a whole
+**processes far more requests per hour in parallel**. The book’s examples:
+
+- **Catalog transcription**: transcribing a back catalog of podcasts, interviews, or other audio to make it searchable.
+- **Document processing**: embedding, converting, or analyzing a set of documents on a regular schedule.
+- **Corpus preparation**: cleaning, embedding, or otherwise preparing massive datasets for model training.
+
+### One model, two deployments
+
+A single model can serve both kinds of jobs. The book’s example is **Whisper**, a speech-to-text model: it could power
+both a **real-time dictation app** and a **batch transcription job**. Assuming both use cases have **enough volume**,
+it’s more cost-effective to run **two separate deployments of the same model**: one optimized for latency, the other
+optimized for throughput.
+
+<Note kind="beyond">
+  Why not one deployment for both? The settings that make a deployment fast for one user (small batches, spare
+  capacity, sometimes extra GPUs per request) are the opposite of the settings that make it cheap per request (large
+  batches, GPUs kept near 100% busy). Chapter 2’s bottlenecks lesson explains why batch size creates this trade-off.
+  Mixing both workloads on one deployment means either the live users get slow, or the batch job pays latency-level
+  prices.
+</Note>
 
 ## Consumer vs. business (B2B)
 
+Apps for consumers and apps for businesses have different inference needs:
+
 | | Consumer apps | Business apps (B2B) |
 |---|---|---|
-| **Money** | Very cost-sensitive | Better margins |
-| **Traffic** | Unpredictable; one viral launch can spike usage overnight | More stable |
-| **Top priorities** | Low marginal cost and flexibility, with “decent” latency and uptime | High uptime and consistently low latency (it’s often in the customer’s revenue path) |
+| **Money** | Much more **cost-sensitive** | Often **better margins** |
+| **Traffic** | **Less predictable**. Many are built for virality, so one launch or marketing campaign can spike usage overnight | **More stable** usage |
+| **Performance bar** | Latency and availability at a **decent standard** | Mission-critical software in the **revenue path**, held to a high standard of performance and reliability |
+| **Prioritize** | **Marginal cost and flexibility** | **Latency and uptime** |
 | **Secondary** | Latency and availability | Cost and scale |
+
+<Note kind="beyond">
+  “Marginal cost” is the cost of serving *one more* request or user. For a consumer app with millions of free users,
+  even a fraction of a cent per request decides whether the business works. “Flexibility” means being able to scale up
+  and down fast when a viral moment hits and fades.
+</Note>
 
 ### Compliance
 
-For both kinds of apps, and especially in regulated industries, rules can limit where and how you run inference:
+In both consumer and business applications, and especially in **regulated industries**, compliance can **limit your
+infrastructure options**. The essential questions:
 
-- **Data sovereignty**: are your GPUs in a region where you’re legally allowed to send your users’ data?
-- **User privacy**: are the model’s inputs and outputs kept private and secure?
-- **Regulatory compliance**: are you, and every provider you rely on, compliant with the relevant regulations?
+- **Data sovereignty**: are your GPUs in a **geographic region where you’re allowed to send user data**?
+- **User privacy**: are the inputs and outputs of your model **kept private and secure**?
+- **Regulatory compliance**: are **you and your underlying providers** compliant with all relevant regulations?
 
-Inference engineers need to work closely with security and legal experts to get this right.
+Inference engineers must **work closely with security and legal experts** to make sure the infrastructure they operate
+is compliant. (Compliance comes back in Chapter 7, where it shapes multi-cloud decisions.)
 
 <KeyPoints>
-- Optimization is about **balancing latency, throughput, and quality** for *your* product. More constraints means
-  better results.
-- Know your model, interface, latency budget, unit economics, and usage patterns before optimizing.
-- Start on **shared APIs**. Move to **dedicated deployments** for scale, specialization, or orchestration, and only
-  when there’s a clear business need.
-- **Online** apps optimize for latency; **offline** jobs optimize for throughput. One model can have two deployments.
-- **Consumer** apps prioritize cost and flexibility; **B2B** apps prioritize uptime and consistent latency. Compliance
-  applies to both.
+- Optimization is about **balancing latency, throughput, and quality** for *your* product, not maximizing one factor.
+  More constraints means better results.
+- Know your **model, interface, latency budget, unit economics, and usage patterns** before optimizing.
+- **Shared** inference: no overhead or cold starts, minimal engineering, but linear cost, capped uptime, noisy
+  neighbors, no control. **Dedicated**: control and lower cost at scale, but a higher spend floor and more engineering.
+- Go dedicated for **scale, specialization, or orchestration**, and only with a clear business need.
+- Build for generality only for **foundation models** or **inference platforms**; vertical apps should add constraints.
+- **Online** apps optimize for latency; **offline** jobs for throughput. One model can justify two deployments.
+- **Consumer**: marginal cost and flexibility. **B2B**: latency and uptime. **Compliance** (data sovereignty, privacy,
+  regulation) applies to both.
 </KeyPoints>
 
 <Quiz questions={[
@@ -159,24 +300,60 @@ Inference engineers need to work closely with security and legal experts to get 
     q: "You’re an early-stage startup still figuring out what users want. How should you run your models?",
     options: ["Rent a cluster of GPUs and optimize them", "Use a shared pay-per-token API", "Buy GPUs for on-premises serving"],
     answer: 1,
-    why: "Before requirements are clear, shared APIs cost nothing to maintain and need almost no engineering. Dedicated inference only pays off at scale."
+    why: "Before requirements are clear, shared APIs have zero overhead and need almost no engineering. The book says dedicated inference only becomes worthwhile once the product scales and requirements are clear."
   },
   {
     q: "Which of these is NOT one of the book’s three reasons to move to a dedicated deployment?",
     options: ["Scale", "Specialization", "Orchestration", "Getting a smarter model for free"],
     answer: 3,
-    why: "The three reasons are scale (cheaper per GPU), specialization (custom models or strict latency/uptime), and orchestration (multi-model pipelines)."
+    why: "The three reasons are scale (paying per GPU beats paying per token), specialization (custom models, strict latency or uptime), and orchestration (multi-model pipelines with minimal network hops)."
   },
   {
-    q: "A company transcribes 10 years of podcast archives overnight. What should that deployment optimize for?",
-    options: ["Latency", "Throughput", "Time to first token"],
+    q: "A shared API charges $2 per million tokens. A dedicated GPU costs $2,920 per month and can comfortably serve your traffic. Roughly how many tokens per month must you process before dedicated is cheaper?",
+    options: ["About 146 million", "About 1.46 billion", "About 14.6 billion"],
     answer: 1,
-    why: "It’s an offline batch job with nobody waiting on any single request, so total work per hour (and cost) matters most."
+    why: "$2,920 buys $2,920 ÷ $2 = 1,460 million tokens on the API. Above about 1.46 billion tokens a month, the flat-priced GPU becomes the cheaper option."
+  },
+  {
+    q: "Your product’s uptime target is 99.99%, but your shared API provider averages 99%. What can you do while staying on that API?",
+    options: [
+      "Nothing: provider uptime caps your product’s uptime",
+      "Increase your rate limit",
+      "Stream tokens to users"
+    ],
+    answer: 0,
+    why: "One of the listed cons of shared inference is that provider uptime caps product uptime. Hitting a higher target requires dedicated deployments, which is the ‘specialization’ reason to switch."
+  },
+  {
+    q: "A company transcribes 10 years of podcast archives, and also offers live dictation with the same Whisper model. Both have high volume. What does the book recommend?",
+    options: [
+      "One deployment tuned for latency, since it’s fast for everyone",
+      "Two separate deployments of the same model: one tuned for latency, one for throughput",
+      "Move the archive job to a bigger model"
+    ],
+    answer: 1,
+    why: "Online and offline workloads want opposite tuning. With enough volume in both, two deployments of the same model (latency-optimized and throughput-optimized) is more cost-effective."
   },
   {
     q: "Compared with a consumer app, a B2B app should usually prioritize…",
     options: ["The lowest possible marginal cost", "High uptime and consistently low latency", "Handling viral traffic spikes"],
     answer: 1,
-    why: "Business software is often in the customer’s revenue path, so reliability and consistent speed come first, with cost second."
+    why: "Business software is often in the customer’s revenue path, so reliability and consistent speed come first, with cost and scale as secondary concerns."
+  },
+  {
+    q: "You’re building a coding assistant that only needs to serve your own product. Should you design the inference system to support any model and any use case?",
+    options: [
+      "Yes, generality is always safer",
+      "No: only foundation-model sellers and inference platforms need that. A vertical app should add as many constraints as possible",
+      "Yes, because code completion is an offline workload"
+    ],
+    answer: 1,
+    why: "The book names only two cases that need maximum generality. For vertical apps, being specific about the use case lets you optimize much harder."
+  },
+  {
+    q: "A European healthcare app wants to use a GPU provider whose cheapest capacity is on another continent. Which consideration comes first?",
+    options: ["Marginal cost", "Data sovereignty and regulatory compliance", "Time to first token"],
+    answer: 1,
+    why: "Compliance can limit infrastructure options, especially in regulated industries. If user data can’t legally be sent to that region, the cheaper capacity isn’t an option, so work with security and legal experts first."
   }
 ]} />
