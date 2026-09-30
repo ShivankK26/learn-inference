@@ -1,0 +1,144 @@
+<TLDR>
+  A GPU can be held back by two things: <Compute>compute</Compute>, how fast it can **do math**, or <Memory>memory bandwidth</Memory>,
+  how fast it can **move data**. LLM **prefill hits the math limit**; LLM **decode hits the memory limit**. Almost every optimization in this book is a way to push on whichever limit you're stuck against.
+</TLDR>
+
+<Note kind="tip">
+  If you only fully understand one lesson in this course, make it this one. Everything in Chapters 3–5 will click much
+  faster afterwards.
+</Note>
+
+## A GPU's two resources
+
+- <Compute>Compute</Compute>: how many math operations per second the GPU can do, measured in **FLOPS**. An H100 does
+  roughly **989 trillion** 16-bit operations per second.
+- <Memory>Memory bandwidth</Memory>: how many bytes per second it can move from its memory to its math units. An H100
+  moves about **3.35 terabytes per second**.
+
+In a perfect world both would be busy 100% of the time. In reality, one is always waiting on the other. Whichever one
+is maxed out is the **bottleneck**, and here's the crucial part: **speeding up the other one does nothing.** If you're
+stuck waiting for data, faster math is useless, and vice versa.
+
+<Analogy title="Think of it like a kitchen">
+  The **chef** is compute. The **waiter** carrying ingredients from the storeroom is memory bandwidth. If the chef is
+  a genius but the waiter is slow, the chef stands around waiting. Hiring a faster chef won't help. You need a faster
+  waiter, or you need to get more cooking out of every trip the waiter makes.
+</Analogy>
+
+## The magic ratio: ops per byte
+
+Divide a GPU's compute by its bandwidth and you get its **ops:byte ratio**:
+
+```
+H100:  989 TFLOPS ÷ 3.35 TB/s ≈ 295 operations per byte
+```
+
+This means that to keep an H100 perfectly balanced, your work needs to do **~295 math operations for every byte it
+loads from memory**.
+
+Every piece of work has its own version of that ratio, called **arithmetic intensity**: *how much math you do per byte
+you move*.
+
+- Arithmetic intensity **below** the GPU's ratio (not much math per byte) means you're **memory-bound**. The chef is
+  waiting on the waiter.
+- Arithmetic intensity **above** the GPU's ratio (lots of math per byte) means you're **compute-bound**. The chef is
+  the busy one.
+
+## Why prefill and decode are opposites
+
+<Compute>Prefill</Compute> loads the model's weights once and uses them on *every* prompt token at once. That's
+thousands of tokens' worth of math for a single trip through memory: **very high arithmetic intensity → compute-bound.**
+
+<Memory>Decode</Memory> produces **one token per step**, but to produce that one token it has to read **every single
+weight in the model**. That's a mountain of data moved for a tiny bit of math: **low arithmetic intensity →
+memory-bound.**
+
+The book works through the exact numbers for one attention calculation during decode and gets an arithmetic intensity
+of about **62**, far below the H100's 295. The GPU spends most of its time waiting for data.
+
+| Workload | Bottleneck |
+|---|---|
+| LLM **prefill** | <Compute>Compute</Compute> |
+| LLM **decode** | <Memory>Memory bandwidth</Memory> |
+| **Image & video** generation | <Compute>Compute</Compute> (like prefill, it works on everything at once) |
+
+## Feel it: the decode speed limit
+
+Because decode must read all the weights for every token, there's a simple back-of-the-envelope ceiling for how fast
+**one user** can ever get tokens:
+
+```
+max tokens/sec ≈ memory bandwidth ÷ model size in bytes
+```
+
+<SpeedLimit />
+
+Notice what moves the number: a **smaller model**, **smaller numbers** (FP8 instead of FP16, called *quantization*), or
+a **GPU with more bandwidth**. Faster compute doesn't appear anywhere in that formula, because decode isn't
+limited by compute.
+
+## The roofline: seeing the bottleneck
+
+Engineers draw this as a **roofline chart**. The horizontal axis is arithmetic intensity. The "roof" has a slanted part
+(limited by memory bandwidth) and a flat part (limited by compute). Wherever your workload sits tells you what's holding
+it back.
+
+<Roofline />
+
+Play with it and notice three things:
+
+1. **At batch size 1, decode sits deep in memory-bound territory.** The GPU's math units are mostly idle.
+2. **Increasing the batch pushes the dot to the right.** The weights are loaded once and shared by the whole batch, so
+   you get more math per byte. **Total throughput shoots up**, and per-user speed barely changes at first. This is
+   why batching is the #1 trick in inference.
+3. **Now raise the conversation length.** Every user's KV cache has to be read too, so memory traffic grows again,
+   per-user speed drops, and eventually you **run out of GPU memory**. That tension (batch size vs. KV cache) is
+   something you'll run into again and again.
+
+<Note kind="deeper">
+  The chart is a simplified model (an 8B model in FP16, ignoring overheads). Calculating arithmetic intensity by hand
+  isn't something inference engineers do every day, but doing it once builds the intuition you'll use constantly.
+</Note>
+
+<KeyPoints>
+- GPUs have two limits: <Compute>compute</Compute> (math/sec) and <Memory>memory bandwidth</Memory> (bytes/sec).
+- **Ops:byte ratio** = compute ÷ bandwidth (~295 for an H100). **Arithmetic intensity** = math ÷ bytes for your work.
+- Below the ratio → memory-bound. Above → compute-bound. Only fixing the actual bottleneck helps.
+- **Prefill** and **image/video** are compute-bound. **Decode** is memory-bound.
+- **Batching** raises decode's arithmetic intensity, massively improving throughput. The KV cache pushes back.
+</KeyPoints>
+
+<Quiz questions={[
+  {
+    q: "Your LLM’s tokens-per-second is too low for a single user. Which upgrade is most likely to help?",
+    options: [
+      "A GPU with much more compute but the same memory bandwidth",
+      "A GPU with higher memory bandwidth",
+      "A longer prompt"
+    ],
+    answer: 1,
+    why: "Tokens per second is decided by decode, and decode is memory-bound. More bandwidth moves the weights faster."
+  },
+  {
+    q: "A 70B model in FP16 is about 140 GB. On a GPU with 4.8 TB/s bandwidth, roughly what’s the max decode speed for one user?",
+    options: ["~3 tok/s", "~34 tok/s", "~340 tok/s"],
+    answer: 1,
+    why: "4,800 GB/s ÷ 140 GB ≈ 34 tokens per second, at the very best, because every token requires reading all the weights once."
+  },
+  {
+    q: "Why does batching make decode more efficient?",
+    options: [
+      "It makes each user’s answer shorter",
+      "The weights are read once and reused for every request in the batch, so there’s more math per byte",
+      "It skips the prefill phase"
+    ],
+    answer: 1,
+    why: "One trip through the weights now serves many users, raising arithmetic intensity and total throughput."
+  },
+  {
+    q: "Image generation is usually bottlenecked on…",
+    options: ["Memory bandwidth", "Compute", "The tokenizer"],
+    answer: 1,
+    why: "Like prefill, image and video models process the whole latent at once, which is a lot of math per byte, so they’re compute-bound."
+  }
+]} />

@@ -1,26 +1,245 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
+/* ---------- Design tokens ----------
+   Two semantic colors run through the whole site:
+   --compute (amber)  = compute / prefill / "doing math"
+   --memory  (blue)   = memory / decode / "moving data"            */
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+:root {
+  --bg: #faf8f3;
+  --bg-soft: #f2eee4;
+  --card: #ffffff;
+  --ink: #1d1b16;
+  --ink-soft: #57524a;
+  --ink-faint: #8c8579;
+  --line: #e4ded1;
+  --accent: #2f5d50;
+  --accent-soft: #e3eee9;
+  --compute: #c46a12;
+  --compute-soft: #fbecd9;
+  --memory: #2c64b5;
+  --memory-soft: #e1ebf9;
+  --good: #2e7d4f;
+  --good-soft: #e2f3e8;
+  --bad: #b3372f;
+  --bad-soft: #f9e3e1;
 }
 
 @media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+  :root:not([data-theme="light"]) {
+    --bg: #15140f;
+    --bg-soft: #1d1c16;
+    --card: #211f19;
+    --ink: #ece7dc;
+    --ink-soft: #b7b0a2;
+    --ink-faint: #837c6f;
+    --line: #34312a;
+    --accent: #7fc4ae;
+    --accent-soft: #1f2f2a;
+    --compute: #f0a24f;
+    --compute-soft: #3a2a17;
+    --memory: #7eaaf0;
+    --memory-soft: #1b2638;
+    --good: #6fce94;
+    --good-soft: #193223;
+    --bad: #f0877f;
+    --bad-soft: #3a1d1b;
   }
 }
 
+:root[data-theme="dark"] {
+  --bg: #15140f;
+  --bg-soft: #1d1c16;
+  --card: #211f19;
+  --ink: #ece7dc;
+  --ink-soft: #b7b0a2;
+  --ink-faint: #837c6f;
+  --line: #34312a;
+  --accent: #7fc4ae;
+  --accent-soft: #1f2f2a;
+  --compute: #f0a24f;
+  --compute-soft: #3a2a17;
+  --memory: #7eaaf0;
+  --memory-soft: #1b2638;
+  --good: #6fce94;
+  --good-soft: #193223;
+  --bad: #f0877f;
+  --bad-soft: #3a1d1b;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-bg-soft: var(--bg-soft);
+  --color-card: var(--card);
+  --color-ink: var(--ink);
+  --color-ink-soft: var(--ink-soft);
+  --color-ink-faint: var(--ink-faint);
+  --color-line: var(--line);
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-compute: var(--compute);
+  --color-compute-soft: var(--compute-soft);
+  --color-memory: var(--memory);
+  --color-memory-soft: var(--memory-soft);
+  --color-good: var(--good);
+  --color-good-soft: var(--good-soft);
+  --color-bad: var(--bad);
+  --color-bad-soft: var(--bad-soft);
+  --font-sans: var(--font-sans-var);
+  --font-serif: var(--font-serif-var);
+  --font-mono: var(--font-mono-var);
+}
+
+html {
+  background: var(--bg);
+  overflow-x: clip;
+}
+
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  overflow-x: clip;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-sans-var), system-ui, sans-serif;
+  font-optical-sizing: auto;
+  text-rendering: optimizeLegibility;
+}
+
+h1,
+h2,
+h3 {
+  text-wrap: balance;
+}
+
+cite {
+  font-style: italic;
+}
+
+/* ---------- Lesson prose: set like a book ---------- */
+
+.prose {
+  font-family: var(--font-serif-var), Georgia, serif;
+  font-size: 1.1875rem; /* 19px */
+  line-height: 1.65;
+  color: var(--ink);
+  text-wrap: pretty;
+  hanging-punctuation: first;
+}
+.prose > * + * {
+  margin-top: 1.05em;
+}
+.prose h2 {
+  font-size: 1.85rem;
+  line-height: 1.2;
+  font-weight: 600;
+  margin-top: 2.2em;
+  letter-spacing: -0.012em;
+}
+.prose h2 + * {
+  margin-top: 0.7em;
+}
+.prose h3 {
+  font-size: 1.3rem;
+  line-height: 1.3;
+  font-weight: 600;
+  margin-top: 1.8em;
+}
+.prose strong {
+  font-weight: 600;
+}
+.prose em {
+  font-style: italic;
+}
+.prose a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+.prose ul,
+.prose ol {
+  padding-left: 1.3em;
+}
+.prose ul {
+  list-style: disc;
+}
+.prose ol {
+  list-style: decimal;
+}
+.prose li {
+  padding-left: 0.2em;
+}
+.prose li + li {
+  margin-top: 0.4em;
+}
+.prose li::marker {
+  color: var(--ink-faint);
+}
+.prose code {
+  font-family: var(--font-mono-var), ui-monospace, monospace;
+  font-size: 0.8em;
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+.prose pre {
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 1em 1.2em;
+  overflow-x: auto;
+  font-size: 0.82rem;
+  line-height: 1.6;
+}
+.prose pre code {
+  background: none;
+  border: 0;
+  padding: 0;
+  font-size: inherit;
+}
+/* Tables are reference material: set them in the sans with even figures */
+.prose table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-sans-var), system-ui, sans-serif;
+  font-size: 0.93rem;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+  display: block;
+  overflow-x: auto;
+}
+.prose th,
+.prose td {
+  text-align: left;
+  padding: 0.65em 1em 0.65em 0;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+.prose th {
+  font-weight: 600;
+  color: var(--ink-soft);
+  border-bottom-color: var(--ink-faint);
+}
+.prose hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: 2.5em 0;
+}
+.prose blockquote {
+  border-left: 2px solid var(--accent);
+  padding-left: 1.1em;
+  font-style: italic;
+  color: var(--ink-soft);
+}
+
+/* Interactive widgets are interface, not prose */
+.widget {
+  font-family: var(--font-sans-var), system-ui, sans-serif;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.5;
+}
+
+/* Inputs */
+input[type="range"] {
+  accent-color: var(--accent);
 }

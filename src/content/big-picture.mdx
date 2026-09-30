@@ -1,0 +1,109 @@
+<TLDR>
+  A trained AI model is just a big file of numbers. **Inference** is everything it takes to turn that file into a fast,
+  cheap, reliable service that answers millions of people. That's what this whole course is about.
+</TLDR>
+
+## Two stages in every model's life
+
+Every AI model goes through two stages:
+
+1. **Training**: the model learns. You show it a mountain of data and it slowly adjusts billions of internal numbers
+   (called <Term def="The numbers inside a model that were learned during training. A ‘70B’ model has 70 billion of them.">weights</Term>)
+   until it gets good at its task. This happens once (or a few times) and costs a fortune.
+2. **Inference**: the model *works*. Someone sends a question, and the model uses its weights to produce an answer. This
+   happens every time anyone uses the model: millions of times a day, forever.
+
+<Analogy>
+  Training is like **going to culinary school**: years of expensive learning, done once. Inference is like **running
+  the restaurant**: every night, every order, every table. The skills came from school, but the business lives or dies
+  on how well the kitchen runs.
+</Analogy>
+
+Old-school machine learning models were small enough that inference was easy: put them on a regular computer and you
+were done. Generative AI (chatbots, image generators, voice models) is different. The models are enormous, they need
+GPUs, and doing it *well* is a whole engineering discipline. That discipline is **inference engineering**.
+
+## Why anyone cares
+
+The book makes a simple argument: a few years ago it looked like only a handful of labs (OpenAI, Anthropic, Google)
+would ever run big models, and everyone else would just rent them through an API. That's not what happened.
+
+There are now **millions of open models** (models whose weights anyone can download), and the best ones are close to
+the best closed models. That means any company can run its own model, and once you run your own, you can make it better
+in three ways that matter a lot:
+
+| What you can improve | Why it matters |
+|---|---|
+| **Speed** (latency) | Voice agents and coding tools feel broken if they're slow. |
+| **Uptime** (availability) | Your own deployment can stay up far more reliably than a shared public API. |
+| **Cost** | Running open models yourself can be dramatically cheaper at scale. |
+
+Getting those wins takes skill, which is why inference engineering is a young, fast-growing field.
+
+## The three layers
+
+The book organizes everything into three layers that stack on top of each other. Click through them:
+
+<ThreeLayers />
+
+A few things worth noticing:
+
+- **Runtime** is about *one* machine. It's the most technical layer, full of GPU tricks. Chapters 2–6 are mostly about this.
+- **Infrastructure** is about *many* machines. No matter how fast one server is, enough traffic will swamp it, so you
+  need more copies of the model and a smart way to spread the work. As you grow, the problem changes: first it's
+  "add servers fast enough", then it's "find enough GPUs at all", and eventually it's "treat GPUs in many clouds as one
+  big pool".
+- **Tooling** is about *people*. The best systems give engineers enough control to fix things without drowning them in
+  details.
+
+## The six big tricks
+
+Inside the runtime layer, six techniques come up again and again. You don't need to understand them yet. Just get
+familiar with the names, because the whole course builds toward them:
+
+<SixTricks />
+
+<Note kind="tip">
+  If a term ever feels fuzzy, check the <a href="/glossary">Glossary</a>. You'll also see <Term def="Like this! Hover or tap on dotted words to see a quick definition.">dotted words</Term> throughout the lessons.
+  Hover or tap them for a quick definition.
+</Note>
+
+## The map of this course
+
+Here's how the chapters fit together, in plain words:
+
+- **Ch 1 · Before you optimize**: figure out what your app actually needs (speed? cost? quality?) and pick a model.
+- **Ch 2 · How models work**: what's happening inside the model, and *where it gets slow*. (The most important chapter.)
+- **Ch 3 · Hardware**: what's inside a GPU and how to choose one.
+- **Ch 4 · Software**: the layers of software that run the model, from CUDA up to inference engines like vLLM.
+- **Ch 5 · Techniques**: the big speed-up tricks, in depth.
+- **Ch 6 · Beyond text**: how images, speech, and video models differ.
+- **Ch 7 · Production**: running all of this for real users, reliably.
+
+<KeyPoints>
+- **Training** = learning (once, expensive). **Inference** = using the model to answer (constantly, forever).
+- Inference engineering makes models **faster, cheaper, and more reliable** without making them dumber.
+- Three layers: **runtime** (one machine), **infrastructure** (many machines), **tooling** (the people using it).
+- Six recurring tricks: batching, caching, quantization, speculation, parallelism, disaggregation.
+</KeyPoints>
+
+<Quiz questions={[
+  {
+    q: "You ask a chatbot a question and get an answer. Which stage of the model’s life is that?",
+    options: ["Training", "Inference", "Fine-tuning"],
+    answer: 1,
+    why: "Using an already-trained model to produce an answer is inference. Training happened long before you showed up."
+  },
+  {
+    q: "Your single GPU server is perfectly optimized, but traffic doubles and requests start timing out. Which layer’s problem is this?",
+    options: ["Runtime", "Infrastructure", "Tooling"],
+    answer: 1,
+    why: "Once one machine can’t keep up, it’s a systems problem: you need more copies and a way to spread the load. That’s infrastructure."
+  },
+  {
+    q: "Which of these is NOT one of the three main reasons companies switch to running their own open models?",
+    options: ["Lower latency", "Higher uptime", "Lower cost", "Models that never make mistakes"],
+    answer: 3,
+    why: "The book’s three reasons are latency, availability, and cost. Running a model yourself doesn’t make it smarter by itself."
+  }
+]} />

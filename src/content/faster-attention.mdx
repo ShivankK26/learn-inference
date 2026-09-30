@@ -1,0 +1,113 @@
+<TLDR>
+  Attention is one of the most expensive parts of any model. There are two ways to make it cheaper: **implement the
+  same math more cleverly** (FlashAttention, PagedAttention; no quality loss) or **use a cheaper kind of attention**
+  (sliding windows, linear attention, and friends; small quality trade-offs).
+</TLDR>
+
+## Why attention needs special care
+
+Even with the KV cache, attention stays expensive, especially as prompts get long. It's also **delicate**: every
+token depends on every earlier token, so small errors in attention can snowball through the whole output. Optimizing
+it is both valuable and risky, which is why so much research goes into it.
+
+There are two families of fixes:
+
+| Approach | Example | Quality impact |
+|---|---|---|
+| **Better implementation** of the same math | FlashAttention, PagedAttention | None (exact same result) |
+| **A different, cheaper algorithm** | Sliding window, linear attention | Small, and reduced if the model is trained for it |
+
+## Fix #1: FlashAttention (fewer trips to memory)
+
+Recall from the last lesson that moving data is often the real bottleneck. The straightforward way of computing
+attention creates big in-between tables (called S and P), **writes them out to slow GPU memory, then immediately reads
+them back in**. That's a lot of pointless trips for the waiter.
+
+<FlashCompare />
+
+**FlashAttention** reorganizes the work into small tiles that fit in the GPU's tiny-but-fast on-chip memory, and does
+all the steps there before writing only the final answer out. Same math, same answer, far less memory traffic. It's
+hand-written for each GPU generation (the H100 version differs from the B200 version) and runs to tens of thousands of
+lines of code. It helps most with **compute-heavy** work like LLM prefill and video generation.
+
+<Analogy>
+  Instead of carrying each ingredient to the counter, walking it back to the fridge, then fetching it again for the
+  next step, the chef keeps a small tray of everything needed **right at the stove** and finishes the whole dish
+  before putting anything away.
+</Analogy>
+
+## Fix #2: PagedAttention (smarter memory layout)
+
+KV caches get big, and they grow unpredictably, because you don't know how long an answer will be. Reserving one big
+continuous chunk of memory per request wastes a lot of space.
+
+**PagedAttention** splits the KV cache into small fixed-size **pages** and keeps a lookup table of where each page
+lives, so the cache can be scattered around GPU memory wherever there's room. It's the same trick your computer's
+operating system uses for RAM, and it lets many more requests fit on one GPU. It's a big reason the **vLLM** engine
+became popular.
+
+<Analogy title="Think of it like a parking lot">
+  Without paging, every group of cars must park in one continuous row, so you end up with lots of gaps that are too
+  small for anyone. With paging, each car just takes any free spot, and a list at the gate says where everyone is.
+</Analogy>
+
+## Fix #3: cheaper kinds of attention
+
+FlashAttention and PagedAttention make attention *faster*, but it's still fundamentally **quadratic**: double the
+length, roughly 4× the work. The other approach is to change the algorithm itself:
+
+<AttentionPatterns />
+
+- **Sliding window attention**: each token only looks at the last *w* tokens (often 8K–32K), so work grows linearly.
+- **Linear attention**: replaces the expensive core formula with a cheaper approximation.
+- **Compressed attention**: periodically squashes older context into a summary, then attends to the summary plus the
+  recent tokens.
+- **Multi-latent attention**: does the attention work in a smaller compressed space (used by DeepSeek models).
+- **Gated attention**: special layers that approximate attention over chunks of context in linear time.
+
+The intuition is that **nearby words usually matter more than distant ones**. The sentence you're reading depends a
+lot on the previous sentence and much less on the first line of this page. When models are *trained* with these
+tricks, they learn to cope, and quality stays high.
+
+## Beyond transformers
+
+Some researchers skip attention entirely. **Mamba** is a *state-space model* that keeps a running summary instead of
+comparing against every past token, so it scales linearly. Pure versions are still rare, but **hybrid** models that mix
+Mamba-style blocks with regular transformer blocks are catching on (for example, NVIDIA's Nemotron 3 Nano).
+
+<KeyPoints>
+- Attention is expensive *and* delicate, so it's a top optimization target.
+- **FlashAttention**: same math, done in fast on-chip memory, with far fewer slow memory trips. Lossless.
+- **PagedAttention**: stores the KV cache in small pages so memory isn't wasted. Lossless.
+- **Sliding window / linear / compressed / multi-latent**: cheaper algorithms that trade a bit of quality for scaling.
+- **State-space models** like Mamba avoid attention altogether, often in hybrids.
+</KeyPoints>
+
+<Quiz questions={[
+  {
+    q: "Does FlashAttention change the model’s output?",
+    options: ["Yes, it’s an approximation", "No, it computes exactly the same result, just with fewer memory trips"],
+    answer: 1,
+    why: "It’s an implementation improvement: identical math, reorganized to avoid writing and re-reading the big intermediate matrices."
+  },
+  {
+    q: "What problem does PagedAttention solve?",
+    options: [
+      "Wasted GPU memory from storing each KV cache in one big continuous block",
+      "Slow tokenization",
+      "Choosing the next token"
+    ],
+    answer: 0,
+    why: "By splitting the KV cache into pages that can live anywhere, far less memory is wasted and more requests fit."
+  },
+  {
+    q: "With sliding window attention and a window of 4,096 tokens, what happens as a document gets very long?",
+    options: [
+      "Work grows quadratically",
+      "Work grows linearly, because each token only looks at the last 4,096",
+      "The model refuses long inputs"
+    ],
+    answer: 1,
+    why: "Each token compares against a fixed-size window, so total work grows in proportion to the length instead of its square."
+  }
+]} />

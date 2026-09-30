@@ -1,0 +1,122 @@
+<TLDR>
+  An LLM never writes a whole answer at once. It first **reads your entire prompt in one go** (*prefill*), then
+  **writes the reply one token at a time** (*decode*), each time predicting the most likely next token. Those two
+  phases behave completely differently, and that difference shapes the whole field.
+</TLDR>
+
+## Step 0: text becomes tokens
+
+Models don't see letters or words. They see **tokens**: chunks of text, each mapped to a number. Common words are
+usually one token, while rarer or longer words get split into pieces. This is called *subword tokenization*.
+
+<Tokenizer />
+
+A few facts about tokens:
+
+- The translation between text and tokens is done by a **tokenizer**. It's a simple lookup table, not a neural network.
+- The full list of tokens a model knows is its **vocabulary**, usually **100,000+** entries.
+- **Fewer tokens = faster.** A more efficient tokenizer needs fewer tokens for the same text, so there's less work to do.
+
+## The three sequences in a request
+
+Every request involves up to three strings of tokens:
+
+1. **Input**: your prompt, plus chat history, instructions, tool definitions, and so on.
+2. **Reasoning** (optional): for "thinking" models, the private scratchpad they write before answering.
+3. **Output**: the reply you see.
+
+All three together have to fit in the model's **context window**, the maximum number of tokens it can handle in one
+request. You can also cap the output length with a `max_tokens` setting.
+
+<Note kind="deeper">
+  Chats have roles (system, user, assistant) and sometimes tool definitions or images. Before anything else, all of it
+  is flattened into one single sequence using a **chat template**. Each model has its own template, and getting it
+  slightly wrong quietly makes the model worse, which is one of those details inference engineers have to get right.
+</Note>
+
+## The two phases: prefill and decode
+
+Once the input is tokenized, inference happens in two phases:
+
+- <Compute>Prefill</Compute>: the model processes **every input token at the same time**, in parallel. Along the way it
+  saves its notes about each token into something called the **KV cache** (next lesson).
+- <Memory>Decode</Memory>: the model generates the answer **one token per step**. Each step is a full pass through the
+  model (a *forward pass*) that produces exactly one new token. Then that token is added and it goes again.
+
+Run a request and watch both happen:
+
+<PrefillDecode />
+
+This gives us the two most important speed numbers in inference:
+
+| Metric | What it measures | Mainly set by |
+|---|---|---|
+| **TTFT** (time to first token) | How long you stare at a blank screen | <Compute>Prefill</Compute> |
+| **TPS** (tokens per second) | How fast the text streams once it starts | <Memory>Decode</Memory> |
+
+<Analogy>
+  Think of a **simultaneous interpreter** reading a speech handed to them on paper. First they read the whole page
+  quickly and take notes (prefill: fast, all at once). Then they speak the translation word by word, and each word
+  depends on what they've already said (decode: slow, one at a time). A longer page means a longer pause before they
+  start. A longer translation means more time speaking.
+</Analogy>
+
+## How each next token is chosen
+
+At the end of each decode step, the model doesn't output a word. It outputs a **score for every token in its
+vocabulary** (these scores are called <Term def="The raw scores a model gives to every possible next token, before they're turned into probabilities.">logits</Term>).
+Those scores get turned into probabilities, and then a token is **picked at random, weighted by probability**.
+
+You can nudge that picking with a few settings. Try them:
+
+<NextToken />
+
+- **Temperature** reshapes the probabilities before picking. Low means the likely words dominate. High means the
+  distribution flattens and surprises become more likely. **Temperature 0 = always pick the top token.**
+- **Top-k** says to only consider the *k* most likely tokens.
+- **Top-p** says to only consider the smallest group of tokens whose probabilities add up to *p*.
+
+For things like JSON output or tool calls, engines can also push the scores directly (e.g. **logit biasing**) to force
+valid output. This loop keeps going until the model produces a special **stop token** (or hits the length limit).
+
+## Reading a model's name
+
+Every open model on Hugging Face ships with a `config.json` describing its architecture. The architecture name alone
+tells you a lot. For example, `Qwen3MoeForCausalLM`:
+
+- **Qwen**: the model family
+- **3**: the version
+- **Moe**: it's a *Mixture of Experts* model (next lesson)
+- **CausalLM**: it predicts the *next* token from the previous ones (every modern chatbot does)
+
+One architecture can come in several **sizes** (e.g. 8B and 70B), **variants** ("base" vs. "instruct"), and endless
+**fine-tunes**. That's handy for inference engineers: if you've optimized one architecture, the same optimizations
+carry over to every model that shares it.
+
+<KeyPoints>
+- Text → **tokens** via a tokenizer. Fewer tokens = less work.
+- <Compute>Prefill</Compute> reads the whole prompt at once and decides **time to first token**.
+- <Memory>Decode</Memory> writes one token per forward pass and decides **tokens per second**.
+- Each token is picked from a probability list, shaped by **temperature, top-k, and top-p**.
+</KeyPoints>
+
+<Quiz questions={[
+  {
+    q: "You paste a 50-page document into a chatbot. Which number gets noticeably worse?",
+    options: ["Time to first token (TTFT)", "Tokens per second once it starts", "Neither"],
+    answer: 0,
+    why: "A huge input means a lot more prefill work before the first token can appear, so TTFT goes up."
+  },
+  {
+    q: "During decode, how many new tokens does one forward pass produce (without any special tricks)?",
+    options: ["One", "One per word in the prompt", "The whole answer"],
+    answer: 0,
+    why: "Plain decode produces exactly one token per forward pass. (Speculative decoding, in Chapter 5, is a trick to beat that.)"
+  },
+  {
+    q: "You want the model to give the same answer every time. What should you set?",
+    options: ["Temperature = 2", "Temperature = 0", "Top-p = 1"],
+    answer: 1,
+    why: "Temperature 0 (or top-k = 1) always picks the single most likely token, so the choice becomes deterministic."
+  }
+]} />

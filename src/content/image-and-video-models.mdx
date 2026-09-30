@@ -1,0 +1,116 @@
+<TLDR>
+  Image generators don't write pixels one at a time. They start with **pure static** and clean the *whole* image up a
+  little on each of ~30–50 steps. Video models do the same thing, but for a whole clip at once, which makes them
+  enormously expensive.
+</TLDR>
+
+## Not one model, a pipeline
+
+An LLM is basically one big model. An image generator is a **team of models** working in sequence:
+
+1. **Text encoder**: turns your prompt into something the image model can understand.
+2. **Denoising model**: the heart of it. It turns noise into an image, guided by the prompt.
+3. **VAE** (<Term def="Variational Autoencoder: converts between the compact ‘latent’ version of an image and actual pixels.">variational autoencoder</Term>):
+   converts the finished result from the model's compact internal format into real pixels.
+
+On top of that, people often bolt on extras: **LoRAs** (small add-ons that change the style) and **ControlNets**
+(outlines or poses that steer the composition). Tools like ComfyUI exist just for wiring these pipelines together.
+
+## Working in "latent space"
+
+A 1024×1024 image has over a million pixels. Attention over every pixel would be impossibly expensive. So image
+models work on a **compressed version** of the image called **latent space**, something like a 128×128 grid, about
+**1% the size** of the real image. Only at the very end does the VAE blow it back up into pixels.
+
+<Analogy>
+  Like an artist working on a **small thumbnail sketch** instead of a giant canvas. All the real decisions happen on
+  the thumbnail, then it gets enlarged at the end.
+</Analogy>
+
+## From noise to picture
+
+The latent starts as random noise. On each **step**, the denoising model looks at the whole latent and nudges it to
+look a bit more like "a sunset over hills" (or whatever you asked for).
+
+<Denoise />
+
+Some important details:
+
+- Most models use **30 to 50 steps**.
+- Each step actually runs the model **twice**: once *with* your prompt and once *without*. The two results are blended,
+  and how strongly depends on the **guidance scale**. So a 50-step image is really **100 forward passes**.
+- Unlike an LLM, every step updates the **entire image**, not one piece.
+
+The main knobs you pass with a request:
+
+| Setting | What it does |
+|---|---|
+| **Prompt** | What the image should show |
+| **Negative prompt** | What it should *not* show |
+| **Steps** | More = better quality but slower (usually 30–50) |
+| **Guidance scale** | Creativity vs. sticking to the prompt (often around 4) |
+| **Image size** | Picked from a fixed menu of resolutions |
+
+## How the models have evolved
+
+Modern image models are built on **diffusion transformers**: the same transformer idea as LLMs, but working on patches
+of image instead of tokens of text. The pipeline shape has stayed similar, but every component has grown:
+
+| Part | SDXL (2023) | Qwen Image (2025) |
+|---|---|---|
+| Text encoder | Small CLIP model | A full 7B vision-language model |
+| Denoiser | Under 4B parameters | 20B parameters |
+
+Using a real LLM as the text encoder is a big reason modern models can render legible text and follow detailed prompts.
+The newest research even builds image models *like* LLMs, generating image tokens one at a time.
+
+## Fewer steps = faster
+
+Since the steps are the slow part, one obvious trick is to **use fewer of them**. **Few-step models** are trained to
+produce an image in **8 or fewer steps**, making them roughly **80–90% faster**, at some cost in quality. They're usually
+made by *distillation* (training a small, fast model to imitate a big one). They're great for things like real-time
+filters where speed beats perfection. (Tick the checkbox in the demo above.)
+
+## Video: images, but much bigger
+
+Video models are like image models with an extra dimension: **time**. Early approaches generated one frame, then the
+next, and so on, but small errors piled up until the video fell apart. Modern models hold the **entire clip** in
+latent space and refine all frames together, with every frame attending to every other frame.
+
+The cost is brutal. Video models have 3–5× more parameters than image models, 10–100× more data in latent space, and
+typically need **a whole machine of 8 GPUs working on one video**, taking several seconds per second of footage. The
+book compares today's video models to where LLMs were a couple of years ago: slow, sometimes unrealistic, and limited
+to short outputs.
+
+<KeyPoints>
+- Image generation is a **pipeline**: text encoder → denoiser → VAE.
+- It works in compressed **latent space** (~1% of the pixels).
+- It starts from noise and refines the **whole image** over ~30–50 steps, with 2 forward passes per step.
+- **Few-step** models trade some quality for ~80–90% speedups.
+- Video = the same idea across time, and it's extremely compute-hungry.
+</KeyPoints>
+
+<Quiz questions={[
+  {
+    q: "A model generates an image in 40 steps with guidance. How many forward passes of the denoiser is that?",
+    options: ["40", "80", "20"],
+    answer: 1,
+    why: "Each step runs once with the prompt and once without, then blends them. So 40 steps × 2 = 80 passes."
+  },
+  {
+    q: "Why do image models work in latent space instead of on pixels?",
+    options: [
+      "Pixels can’t be stored on GPUs",
+      "Latent space is far smaller (~1%), which makes attention affordable",
+      "It makes images more colorful"
+    ],
+    answer: 1,
+    why: "Attention over a million pixels would be infeasible. The compressed latent is about 1% the size."
+  },
+  {
+    q: "Why did early frame-by-frame video generation go 'off the rails'?",
+    options: ["Too few GPUs", "Small errors accumulated with every new frame", "The prompt was too long"],
+    answer: 1,
+    why: "Each frame was built on the last, so mistakes compounded. Modern models refine the entire clip together instead."
+  }
+]} />

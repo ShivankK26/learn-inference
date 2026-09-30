@@ -1,0 +1,137 @@
+<TLDR>
+  **Attention** is how each word figures out which earlier words matter to it. Done naively it gets much more expensive
+  as text gets longer, so models keep a **KV cache**: a memo pad of their work on earlier tokens, so they never redo
+  it. The cache saves huge amounts of compute, but it eats GPU memory.
+</TLDR>
+
+## What's inside an LLM
+
+An LLM is a long stack of identical-looking units called **transformer blocks**, sandwiched between an entry and an
+exit:
+
+1. **Embedding layer** (entry): turns each token ID into a long list of numbers that captures its meaning.
+2. **Transformer blocks** (the middle, dozens to hundreds of them): where the "thinking" happens.
+3. **Output layer / LM head** (exit): turns the final result into a score for every token in the vocabulary.
+
+Each transformer block has two main parts:
+
+- An **attention** part, where tokens look at each other.
+- A **feed-forward** part, which is plain layers of matmul. This holds *most of the model's weights*.
+
+The feed-forward part is the biggest by size, but **attention is the trickiest part for inference**. So let's look
+at it.
+
+## Attention: words looking at other words
+
+Read this sentence (it's the example the book uses):
+
+> *"I decided to write a book because I thought it would be easy, but **it** was actually hard."*
+
+What does the second "it" refer to? You instantly know it means *writing the book*. Attention is the mechanism that
+gives models that same ability: for each token, it works out **how much every earlier token matters**.
+
+<Attention />
+
+Under the hood, attention uses three things for each token. You'll see the letters **Q, K, V** everywhere:
+
+- **Q (query)**: "What am I looking for?" (from the token being worked on right now)
+- **K (key)**: "What do I contain?" (one per earlier token)
+- **V (value)**: "Here's my actual information." (one per earlier token)
+
+The model compares the current token's **query** with every earlier **key** to get relevance scores, then blends the
+**values** according to those scores.
+
+<Analogy title="Think of it like searching a library">
+  Your **query** is what you type into the search box. Every book's **key** is its title and tags. You compare your
+  query against every key to find what's relevant, then read the **values** (the actual pages) of the best matches.
+</Analogy>
+
+A few more details:
+
+- Models run many attention "searches" side by side, called **heads**. Each head tends to learn a different kind of
+  relationship (e.g. one tracks grammar, another tracks what "it" refers to).
+- LLMs use **self-attention** with a *causal mask*: a token can only look **backward**, never ahead.
+- Image models also use **cross-attention**, where the picture being generated looks at the *text prompt*.
+
+## The problem: attention gets expensive fast
+
+Every token compares itself to every token before it. So for a sequence of N tokens, the total number of comparisons
+grows like **N²** (*quadratic*). Double the text and you do roughly four times the work.
+
+But look closely at *decode*. When generating token #1,001, the keys and values for tokens #1 to #1,000 are exactly the
+same as they were one step earlier. Recomputing them would be pure waste.
+
+## The fix: the KV cache
+
+So models **save the K and V for every token** the first time they're computed, and simply look them up afterwards.
+That saved store is the **KV cache**.
+
+<KVCache />
+
+- It's **built during prefill** (for all the prompt tokens at once).
+- It's **read and extended during decode** (one new entry per generated token).
+- It lives in **GPU memory** by default.
+
+With the cache, each new token only needs its *own* K and V computed, and attention during decode becomes linear
+instead of quadratic.
+
+<Note kind="warn">
+  There's no free lunch. The KV cache **grows with every token, for every user**. With long conversations and many
+  users, it can take up more GPU memory than the model itself. Managing it (where to store it, when to reuse it, how
+  to share it) is one of the biggest topics in inference. Chapter 5 is all about it.
+</Note>
+
+## Mixture of Experts (MoE)
+
+One more architecture you'll hear constantly. In a normal (**dense**) model, every weight is used for every token. A
+**Mixture of Experts** model instead splits the big feed-forward layers into many smaller pieces called **experts**,
+and a tiny **router** picks just a few experts per token, per layer.
+
+For example, *Qwen3-235B-A22B* has **235B** parameters in total, but only **22B** are *active* for any given token. At
+each of its 94 layers, the router picks 8 of 128 experts.
+
+<MoE />
+
+That sounds like a free 10× speedup, and for a **single user** on a laptop, it nearly is. But notice what happens when
+you press *Show whole batch*: on a busy server, different tokens want different experts, so **almost all the experts
+end up in use anyway**. Getting the savings back at scale takes a special technique called *expert parallelism*
+(Chapter 5).
+
+MoE is popular for very large models (100B+). Small models (especially under ~30B) usually stay dense.
+
+<KeyPoints>
+- LLM = embedding layer → many **transformer blocks** (attention + feed-forward) → output layer.
+- **Attention** lets each token weigh every earlier token using **queries, keys, and values**.
+- Naive attention is **quadratic** in sequence length. The **KV cache** saves past K/V so decode doesn't redo work.
+- The KV cache trades compute for **GPU memory**, and that memory is often the scarce resource.
+- **MoE** models activate only a few experts per token. Great for one user, less so in big batches.
+</KeyPoints>
+
+<Quiz questions={[
+  {
+    q: "Where does most of an LLM’s weight (size) live?",
+    options: ["The attention layers", "The feed-forward layers", "The tokenizer"],
+    answer: 1,
+    why: "The feed-forward (plain matmul) layers hold most of the weights. Attention is second, and the tokenizer isn’t even a neural network."
+  },
+  {
+    q: "What does the KV cache store?",
+    options: [
+      "The user’s chat history as text",
+      "The keys and values computed for previous tokens",
+      "A copy of the model weights"
+    ],
+    answer: 1,
+    why: "It stores each earlier token’s K and V so that decode steps can look them up instead of recomputing them."
+  },
+  {
+    q: "An MoE model activates 10% of its parameters per token. On a busy server with large batches, what usually happens?",
+    options: [
+      "It runs 10× faster than a dense model of the same total size",
+      "Different requests use different experts, so most of the model ends up active anyway",
+      "The router stops working"
+    ],
+    answer: 1,
+    why: "In a batch, each token picks its own experts, so together they tend to wake up nearly all of them. Big savings need expert parallelism."
+  }
+]} />

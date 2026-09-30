@@ -1,36 +1,33 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Inference, Simplified
 
-## Getting Started
+A plain-English, interactive study companion to *Inference Engineering* by Philip Kiely.
+Built with Next.js 16 + MDX + Tailwind. Fully static, so it deploys to Vercel with zero config.
 
-First, run the development server:
+## Run it
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm install
+npm run dev     # http://localhost:3000
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## How it's organized
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+| Path | What it is |
+|---|---|
+| `src/lib/course.ts` | The course map: every chapter and lesson. `ready: true` makes a lesson live. |
+| `src/content/<slug>.mdx` | One file per lesson, written in Markdown + components. |
+| `src/components/Blocks.tsx` | Lesson building blocks: `<TLDR>`, `<Analogy>`, `<KeyPoints>`, `<Note>`, `<Term>`, `<Compute>`, `<Memory>` |
+| `src/components/Quiz.tsx` | End-of-lesson quiz |
+| `src/components/widgets/` | Interactive demos (roofline, KV cache, sampler, …) |
+| `src/mdx-components.tsx` | Registers components so lessons can use them without imports |
+| `src/lib/glossary.ts` | Glossary entries |
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Add a lesson
 
-## Learn More
+1. Write `src/content/<slug>.mdx` (copy an existing lesson for the structure: TL;DR → explanation + analogy → widget → key points → quiz).
+2. Set `ready: true` for that slug in `src/lib/course.ts`.
+3. If you built a new widget, register it in `src/mdx-components.tsx`.
 
-To learn more about Next.js, take a look at the following resources:
+## Deploy
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Push to GitHub, then import the repo in Vercel. No settings needed.
